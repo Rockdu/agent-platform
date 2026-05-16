@@ -232,6 +232,15 @@ pub enum CodegenError {
         manifest: PathBuf,
         command_name: String,
     },
+
+    #[error(
+        "PLUGIN_CONTRACT_ERROR command_type_missing: plugin `{plugin_id}` command `{command_name}` (at {manifest}) must declare both `args_type` and `result_type`. Empty-shape commands should declare a named DTO (e.g. `args_type = \"PingArgs\"`, `result_type = \"PingResult\"`) — `unknown` is not permitted."
+    )]
+    CommandTypeMissing {
+        plugin_id: String,
+        manifest: PathBuf,
+        command_name: String,
+    },
 }
 
 /// Top-level entry point: scan + validate + emit.
@@ -431,14 +440,26 @@ fn validate_manifest(m: &PluginManifest) -> Result<(), CodegenError> {
                 });
             }
         }
-        // args_type and result_type are optional but co-required: if you ship
-        // one, ship both, so the wrapper signature is well-formed.
-        if cmd.args_type.is_some() != cmd.result_type.is_some() {
-            return Err(CodegenError::CommandTypePartial {
-                plugin_id: m.plugin_id.clone(),
-                manifest: m.manifest_path.clone(),
-                command_name: cmd.name.clone(),
-            });
+        // args_type and result_type are MANDATORY for every command (round 4):
+        // without them, the emitter would have to fall back to `unknown` and
+        // AC-1.2's "tsc catches wrong arg types" guarantee would be unverifiable
+        // for that command. Empty-shape commands must declare a named DTO.
+        match (&cmd.args_type, &cmd.result_type) {
+            (Some(_), Some(_)) => {}
+            (None, None) => {
+                return Err(CodegenError::CommandTypeMissing {
+                    plugin_id: m.plugin_id.clone(),
+                    manifest: m.manifest_path.clone(),
+                    command_name: cmd.name.clone(),
+                });
+            }
+            _ => {
+                return Err(CodegenError::CommandTypePartial {
+                    plugin_id: m.plugin_id.clone(),
+                    manifest: m.manifest_path.clone(),
+                    command_name: cmd.name.clone(),
+                });
+            }
         }
     }
     // Frontend path validation that does not require filesystem access (string
@@ -965,10 +986,17 @@ fn emit_ts_per_plugin_wrappers(
             } else {
                 format!("// permissions: {}", cmd.permissions.join(", "))
             };
-            let (args_ty, result_ty) = (
-                cmd.args_type.as_deref().unwrap_or("unknown"),
-                cmd.result_type.as_deref().unwrap_or("unknown"),
-            );
+            // validate_manifest guarantees both type names are present; if
+            // this expect fires, validation was bypassed (would be a logic bug
+            // in the codegen pipeline, not a manifest authoring error).
+            let args_ty = cmd
+                .args_type
+                .as_deref()
+                .expect("validate_manifest must reject commands without args_type");
+            let result_ty = cmd
+                .result_type
+                .as_deref()
+                .expect("validate_manifest must reject commands without result_type");
             commands_block.push_str(&format!(
                 "  {perms_doc}\n  async {name}(args: {args_ty}, capability: PluginCapability): Promise<{result_ty}> {{\n    return platformInvoke<{args_ty}, {result_ty}>(\"plugin.{plugin_id}.{name}\", args, capability);\n  }},\n",
                 perms_doc = perms_doc,
@@ -1092,8 +1120,8 @@ mod tests {
                     CommandDecl {
                         name: "ping".into(),
                         permissions: vec!["notify".into()],
-                        args_type: None,
-                        result_type: None,
+                        args_type: Some("PingArgs".into()),
+                        result_type: Some("PingResult".into()),
                     },
                 ]),
             ),
@@ -1226,8 +1254,8 @@ mod tests {
                 vec![CommandDecl {
                     name: "do_stuff".into(),
                     permissions: vec!["user.email".into()],
-                    args_type: None,
-                    result_type: None,
+                    args_type: Some("DoStuffArgs".into()),
+                    result_type: Some("DoStuffResult".into()),
                 }],
             ),
         )];
@@ -1385,6 +1413,116 @@ migrations_path = "migrations/"
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn command_without_typed_args_or_result_fails() {
+        // Round 4 closure: commands MUST declare both args_type and
+        // result_type. Codex round-3 review caught that the previous round
+        // accepted `args_type: None, result_type: None` and emitted
+        // `args: unknown, Promise<unknown>` — the typed-wrapper guarantee
+        // bypass. This negative test pins the new behavior.
+        let (_tmp, out) = tmp_out();
+        let manifests = vec![mk_manifest(
+            "alpha",
+            mk_file(
+                "Alpha",
+                "alpha-bin",
+                "alpha",
+                &[],
+                &["invoke"],
+                vec![CommandDecl {
+                    name: "untyped_thing".into(),
+                    permissions: vec![],
+                    args_type: None,
+                    result_type: None,
+                }],
+            ),
+        )];
+        match generate_from_manifests(&manifests, &out).unwrap_err() {
+            CodegenError::CommandTypeMissing { command_name, .. } => {
+                assert_eq!(command_name, "untyped_thing");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn generated_wrappers_never_use_unknown() {
+        // Walks every emitted per-plugin wrapper file and asserts neither
+        // `args: unknown` nor `Promise<unknown>` appears, even with multiple
+        // plugins and multiple commands. Regression guard against accidental
+        // reintroduction of the `unknown` fallback.
+        let (_tmp, out) = tmp_out();
+        let manifests = vec![
+            mk_manifest(
+                "alpha",
+                mk_file(
+                    "Alpha",
+                    "alpha-bin",
+                    "alpha",
+                    &["notify"],
+                    &["invoke"],
+                    vec![
+                        CommandDecl {
+                            name: "ping".into(),
+                            permissions: vec!["notify".into()],
+                            args_type: Some("PingArgs".into()),
+                            result_type: Some("PingResult".into()),
+                        },
+                        CommandDecl {
+                            name: "ack".into(),
+                            permissions: vec![],
+                            args_type: Some("AckArgs".into()),
+                            result_type: Some("AckResult".into()),
+                        },
+                    ],
+                ),
+            ),
+            mk_manifest(
+                "beta",
+                mk_file(
+                    "Beta",
+                    "beta-bin",
+                    "beta",
+                    &[],
+                    &["invoke", "listen"],
+                    vec![CommandDecl {
+                        name: "hop".into(),
+                        permissions: vec![],
+                        args_type: Some("HopArgs".into()),
+                        result_type: Some("HopResult".into()),
+                    }],
+                ),
+            ),
+        ];
+        generate_from_manifests(&manifests, &out).expect("typed multi-plugin generates");
+
+        let plugins_dir = out.ts_generated_dir.join("plugins");
+        let entries =
+            fs::read_dir(&plugins_dir).expect("plugins generated dir exists after happy path");
+        let mut wrapper_files = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("ts") {
+                continue;
+            }
+            wrapper_files += 1;
+            let body = fs::read_to_string(&path).expect("read wrapper file");
+            assert!(
+                !body.contains("args: unknown"),
+                "{} must not emit `args: unknown`, found in:\n{}",
+                path.display(),
+                body
+            );
+            assert!(
+                !body.contains("Promise<unknown>"),
+                "{} must not emit `Promise<unknown>`, found in:\n{}",
+                path.display(),
+                body
+            );
+        }
+        assert_eq!(wrapper_files, 2, "expected one wrapper per plugin");
     }
 
     #[test]
