@@ -28,10 +28,8 @@ Thumbs.db
 # Per-machine Claude Code settings (don't share between machines)
 .claude/settings.local.json
 
-# NOTE: .humanize/ is intentionally tracked per user policy (2026-05-16).
-# Do NOT add .humanize/ to this gitignore — the user wants planning
-# artifacts, RLCR rounds, bitlesson, and skill outputs all in version
-# control. The humanize plugin's stop hook may complain; that is a known
-# policy conflict; do not silently resolve it by re-untracking.
+# Humanize local loop state (user policy reversal 2026-05-16: complied
+# with plugin hook after the conflict made the loop unworkable).
+.humanize/
 
 # Workspaces live OUTSIDE this repo at ~/AgentPlatform/workspaces/.
