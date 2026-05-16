@@ -8,14 +8,18 @@ mod dispatcher;
 mod generated;
 mod logging;
 mod plugin_sqlite;
+mod secrets;
 
 use bootstrap::{BootstrapError, BootstrapPaths};
 use dispatcher::MountRegistry;
 use plugin_sqlite::{run_all_plugin_migrations_at_bootstrap, PluginMigrationState};
+use secrets::{AccessTokenCache, SecretsErrorDto, SetupMarker, SetupStatus};
 use serde::Serialize;
-use tauri::Manager;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use tauri::Manager;
+
+const STRONGHOLD_DIRNAME: &str = "stronghold-state";
 
 /// Cached result of the first-run bootstrap. Populated by the setup hook;
 /// consumed by the `bootstrap_status` Tauri command.
@@ -66,6 +70,80 @@ pub(crate) fn bootstrap_status_plugins_root() -> Option<PathBuf> {
         .map(|p| p.plugins_root.clone())
 }
 
+/// Stronghold state lives at `${APP_DATA}/stronghold-state/` per the plugin
+/// contract spec. Derived from the bootstrap-cached app-data root so the
+/// secrets module + stronghold Tauri commands share one source of truth.
+fn stronghold_root() -> Option<PathBuf> {
+    BOOTSTRAP_RESULT
+        .get()
+        .and_then(|r| r.as_ref().ok())
+        .map(|paths| {
+            paths
+                .plugins_root
+                .parent()
+                .map(|app_data| app_data.join(STRONGHOLD_DIRNAME))
+                .unwrap_or_else(|| PathBuf::from(STRONGHOLD_DIRNAME))
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Stronghold setup Tauri commands (AC-5.4 host)
+// ---------------------------------------------------------------------------
+
+fn require_stronghold_root() -> Result<PathBuf, SecretsErrorDto> {
+    stronghold_root().ok_or_else(|| SecretsErrorDto {
+        kind: "io".into(),
+        message: "bootstrap paths not available; stronghold root cannot be resolved".into(),
+        plugin_id: None,
+        account_id: None,
+        secret_name: None,
+        setup_status: None,
+    })
+}
+
+#[tauri::command]
+fn stronghold_setup_status() -> Result<SetupStatus, SecretsErrorDto> {
+    let root = require_stronghold_root()?;
+    secrets::read_setup_status(&root).map_err(|err| SecretsErrorDto::from(&err))
+}
+
+#[tauri::command]
+fn stronghold_setup_start() -> Result<SetupMarker, SecretsErrorDto> {
+    let root = require_stronghold_root()?;
+    secrets::start_setup(&root).map_err(|err| SecretsErrorDto::from(&err))
+}
+
+#[tauri::command]
+fn stronghold_setup_complete() -> Result<SetupMarker, SecretsErrorDto> {
+    let root = require_stronghold_root()?;
+    secrets::complete_setup(&root).map_err(|err| SecretsErrorDto::from(&err))
+}
+
+#[tauri::command]
+fn stronghold_setup_reset() -> Result<(), SecretsErrorDto> {
+    let root = require_stronghold_root()?;
+    secrets::reset_setup(&root).map_err(|err| SecretsErrorDto::from(&err))
+}
+
+/// Argon2id-based KDF that derives the Stronghold vault key from a user
+/// password. `tauri-plugin-stronghold`'s `Builder::new` requires a function
+/// that turns the user's password into 32 raw bytes.
+fn hash_password(password: &str) -> Vec<u8> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    // Fixed salt is acceptable here because the host has exactly one
+    // Stronghold vault per OS user; the salt is not protecting against
+    // rainbow tables across multiple users. A future round will switch to a
+    // per-install random salt persisted next to setup.marker.
+    let salt = b"agentplatform-stronghold-salt-v1";
+    let params = Params::new(32 * 1024, 3, 1, Some(32)).expect("argon2 params");
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = vec![0u8; 32];
+    argon2
+        .hash_password_into(password.as_bytes(), salt, &mut out)
+        .expect("argon2 hash_password_into");
+    out
+}
+
 #[tauri::command]
 fn bootstrap_status() -> Result<BootstrapPaths, BootstrapErrorDto> {
     // OnceLock guarantees the setup hook ran before the frontend mounts and
@@ -90,8 +168,10 @@ pub fn run() {
     logging::init_subscriber();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_stronghold::Builder::new(hash_password).build())
         .manage(MountRegistry::new())
         .manage(PluginMigrationState::new())
+        .manage(AccessTokenCache::new())
         .setup(|app| {
             let result = bootstrap::ensure_dirs().and_then(|paths| {
                 // Now that the generated plugin registry is available, create
@@ -115,6 +195,19 @@ pub fn run() {
                     tracing::info!(?paths, "bootstrap ok");
                     let state = app.state::<PluginMigrationState>();
                     run_all_plugin_migrations_at_bootstrap(&paths.plugins_root, &state);
+
+                    // Stronghold state directory (AC-5.4 host): ensure
+                    // `${APP_DATA}/stronghold-state/` exists so the marker +
+                    // snapshot have a place to land. The actual Stronghold
+                    // plugin handles snapshot creation when the frontend
+                    // calls its `initialize` / `load` commands.
+                    if let Some(app_data) = paths.plugins_root.parent() {
+                        let sg_root = app_data.join(STRONGHOLD_DIRNAME);
+                        match secrets::ensure_stronghold_root(&sg_root) {
+                            Ok(()) => tracing::info!(stronghold_root = %sg_root.display(), "stronghold-state dir ready"),
+                            Err(err) => tracing::error!(%err, "stronghold-state dir create failed"),
+                        }
+                    }
                 }
                 Err(err) => tracing::error!(%err, "bootstrap failed"),
             }
@@ -128,6 +221,10 @@ pub fn run() {
             dispatcher::dispatch_plugin_command,
             plugin_sqlite::plugin_migration_status,
             plugin_sqlite::retry_plugin_migration,
+            stronghold_setup_status,
+            stronghold_setup_start,
+            stronghold_setup_complete,
+            stronghold_setup_reset,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
