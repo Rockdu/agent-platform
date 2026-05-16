@@ -1,7 +1,7 @@
-# Example plugin manifest used to exercise the build.rs codegen pipeline.
-# Round 1 only requires the manifest to parse + appear in generated output.
-# The Rust adapter crate + frontend directory land in later rounds when this
-# plugin becomes a real implementation (or is replaced by an MVP plugin).
+# Example plugin manifest used by plugin-codegen as a regression probe.
+# Has no Rust adapter crate or frontend directory yet; it exists only so the
+# scanner has a non-empty input set and the generated artifacts contain real
+# values that downstream consumers can grep.
 
 name = "Notes"
 version = "0.0.1"
@@ -12,3 +12,11 @@ permissions = ["notify"]
 required_apis = ["invoke", "listen"]
 db_namespace = "notes"
 migrations_path = "migrations/"
+
+[[commands]]
+name = "list_notes"
+permissions = []
+
+[[commands]]
+name = "create_note"
+permissions = ["notify"]

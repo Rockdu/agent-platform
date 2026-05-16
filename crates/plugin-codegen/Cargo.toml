@@ -1,0 +1,25 @@
+[package]
+name = "plugin-codegen"
+version = "0.0.1"
+description = "Scans plugins/*/plugin.toml; emits Rust + TypeScript registries for the host crate and the frontend"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "plugin_codegen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "plugin-codegen"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+walkdir = "2"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

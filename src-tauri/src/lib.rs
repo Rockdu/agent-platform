@@ -80,7 +80,19 @@ pub fn run() {
 
     tauri::Builder::default()
         .setup(|_app| {
-            let result = bootstrap::ensure_dirs();
+            let result = bootstrap::ensure_dirs().and_then(|paths| {
+                // Now that the generated plugin registry is available, create
+                // ${APP_DATA}/plugins/<id>/ for each bundled plugin. Reporting
+                // an error here surfaces via the same BootstrapErrorDto path
+                // as the top-level dirs (preserves AC-9.1 negative-test
+                // structural inspection).
+                let plugin_ids = generated::plugin_registry::PLUGINS
+                    .iter()
+                    .map(|p| p.plugin_id);
+                let created = bootstrap::ensure_plugin_dirs(&paths.plugins_root, plugin_ids)?;
+                tracing::info!(per_plugin = created.len(), "per-plugin dirs ready");
+                Ok(paths)
+            });
             match &result {
                 Ok(paths) => tracing::info!(?paths, "bootstrap ok"),
                 Err(err) => tracing::error!(%err, "bootstrap failed"),

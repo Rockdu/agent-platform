@@ -18,10 +18,7 @@ path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-toml = "0.8"
-serde = { version = "1", features = ["derive"] }
-walkdir = "2"
-heck = "0.5"
+plugin-codegen = { path = "../crates/plugin-codegen" }
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -31,3 +28,6 @@ thiserror = "2"
 directories = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"

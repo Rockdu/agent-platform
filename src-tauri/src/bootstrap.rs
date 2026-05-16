@@ -3,10 +3,13 @@
 //! Creates the directory layout that the rest of the platform assumes exists.
 //! Idempotent: re-running on a populated layout is a no-op.
 //!
-//! Layout (per docs/plan.md AC-9.1):
+//! Layout:
 //!   - ~/AgentPlatform/                       user-visible workspaces root
 //!   - ~/AgentPlatform/workspaces/            per-tab workspace dirs
-//!   - ${APP_DATA}/plugins/                   per-plugin SQLite + state
+//!   - ${APP_DATA}/plugins/                   per-plugin SQLite + state root
+//!   - ${APP_DATA}/plugins/<plugin_id>/       per-plugin subdir for each
+//!                                            bundled plugin (the host
+//!                                            iterates the generated registry)
 //!   - ${APP_DATA}/logs/                      per-process sidecar logs
 //!   - ${APP_DATA}/claude-mcp-configs/        per-tab MCP config files
 //!
@@ -14,7 +17,7 @@
 //! `~/Library/Application Support/com.agentplatform.app/` via the
 //! `directories::ProjectDirs` lookup keyed by qualifier/organization/app.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use directories::{BaseDirs, ProjectDirs};
 use serde::Serialize;
@@ -95,6 +98,25 @@ pub fn ensure_dirs() -> Result<BootstrapPaths, BootstrapError> {
     Ok(paths)
 }
 
+/// Create `${APP_DATA}/plugins/<plugin_id>/` for each bundled plugin id.
+///
+/// Designed to be called after [`ensure_dirs`] succeeds, iterating the
+/// `plugin_codegen`-generated `PLUGINS` registry. Returns the per-plugin paths
+/// on success; reports the first failure with the offending path so the
+/// frontend can render it via `BootstrapErrorDto`.
+pub fn ensure_plugin_dirs(
+    plugins_root: &Path,
+    plugin_ids: impl IntoIterator<Item = &'static str>,
+) -> Result<Vec<PathBuf>, BootstrapError> {
+    let mut paths = Vec::new();
+    for id in plugin_ids {
+        let dir = plugins_root.join(id);
+        ensure_dir(&dir)?;
+        paths.push(dir);
+    }
+    Ok(paths)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +129,32 @@ mod tests {
         assert!(paths.plugins_root.ends_with("plugins"));
         assert!(paths.logs.ends_with("logs"));
         assert!(paths.claude_mcp_configs.ends_with("claude-mcp-configs"));
+    }
+
+    #[test]
+    fn ensure_plugin_dirs_creates_subdirs_under_temp_root() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let plugins_root = tmp.path().join("plugins");
+        std::fs::create_dir_all(&plugins_root).unwrap();
+
+        let created = ensure_plugin_dirs(&plugins_root, ["alpha", "beta"]).expect("create plugin dirs");
+        assert_eq!(created.len(), 2);
+        assert!(plugins_root.join("alpha").is_dir());
+        assert!(plugins_root.join("beta").is_dir());
+    }
+
+    #[test]
+    fn ensure_plugin_dirs_reports_offending_path_on_failure() {
+        // Pointing the plugin-root at a path whose parent doesn't exist is the
+        // most reliable cross-platform way to force CreateDir to fail.
+        let unwritable_root = PathBuf::from("/nonexistent-root-for-test-9b3e7f/plugins");
+        let err = ensure_plugin_dirs(&unwritable_root, ["alpha"])
+            .expect_err("creation must fail with no parent dir");
+        match err {
+            BootstrapError::CreateDir { path, .. } => {
+                assert!(path.ends_with("alpha"));
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
     }
 }

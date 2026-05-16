@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "predev": "cargo run --quiet -p plugin-codegen",
     "build": "tsc -b && vite build",
+    "prebuild": "cargo run --quiet -p plugin-codegen",
     "preview": "vite preview",
     "tauri": "tauri"
   },
