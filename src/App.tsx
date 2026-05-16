@@ -6,6 +6,7 @@ import type {
   PluginMigrationStatusMap,
 } from "./migration-status";
 import { PluginRoot } from "./plugin-lifecycle";
+import type { SidecarBinaryDiagnostic } from "./dev-diagnostics";
 import "./App.css";
 
 // Mirrors src-tauri/src/bootstrap.rs::BootstrapPaths
@@ -66,6 +67,7 @@ export default function App() {
   const [active, setActive] = useState<ActiveTab>({ kind: "host", id: "orchestrator" });
   const [bootstrap, setBootstrap] = useState<BootstrapState>({ kind: "loading" });
   const [migrationStatus, setMigrationStatus] = useState<PluginMigrationStatusMap>({});
+  const [diagnostics, setDiagnostics] = useState<SidecarBinaryDiagnostic[]>([]);
 
   const refreshMigrationStatus = useCallback(async () => {
     try {
@@ -75,6 +77,18 @@ export default function App() {
       // First-launch race: bootstrap may not have set the state yet; the
       // map stays empty and plugin tabs render normally.
       setMigrationStatus({});
+    }
+  }, []);
+
+  const refreshDevDiagnostics = useCallback(async () => {
+    try {
+      const list = await invoke<SidecarBinaryDiagnostic[]>("dev_diagnostics_status");
+      setDiagnostics(list);
+    } catch {
+      // Diagnostics are read-only inspection; an error here just hides
+      // the dev card (production won't have the command at all if it's
+      // ever feature-gated; today it always exists).
+      setDiagnostics([]);
     }
   }, []);
 
@@ -113,8 +127,11 @@ export default function App() {
       .then((paths) => {
         setBootstrap({ kind: "ok", paths });
         // Bootstrap success means the setup hook has already kicked off
-        // per-plugin migrations; fetch the resulting status map.
-        return refreshMigrationStatus();
+        // per-plugin migrations; fetch the resulting status map AND the
+        // dev-diagnostics report. Diagnostics is independent of migration
+        // status — a plugin can have a healthy migration but a missing
+        // sidecar binary, or vice versa.
+        return Promise.all([refreshMigrationStatus(), refreshDevDiagnostics()]);
       })
       .catch((err: unknown) => {
         if (isBootstrapErrorDto(err)) {
@@ -130,7 +147,12 @@ export default function App() {
           });
         }
       });
-  }, [refreshMigrationStatus]);
+  }, [refreshMigrationStatus, refreshDevDiagnostics]);
+
+  const missingSidecars = useMemo(
+    () => diagnostics.filter((d) => d.status === "missing"),
+    [diagnostics],
+  );
 
   return (
     <div className="app">
@@ -176,8 +198,58 @@ export default function App() {
         )}
       </main>
 
+      {missingSidecars.length > 0 && (
+        <DevDiagnosticsCard missing={missingSidecars} />
+      )}
       <BootstrapDebugCard state={bootstrap} />
     </div>
+  );
+}
+
+function DevDiagnosticsCard({ missing }: { missing: SidecarBinaryDiagnostic[] }) {
+  // AC-9.2 positive-test phrase: the literal "缺失 plugin 二进制：" MUST
+  // appear so the dev-diagnostics page is identifiable by string search
+  // in tests and onboarding screenshots.
+  const list = missing.map((d) => d.commandBin).join(", ");
+  return (
+    <aside
+      className="bootstrap-card bootstrap-card--error"
+      role="status"
+      data-dev-diagnostics="missing-sidecars"
+    >
+      <h3>开发诊断 · 插件二进制未就绪</h3>
+      <p>
+        缺失 plugin 二进制：<code>{list}</code>
+      </p>
+      <p>请在 host 项目根目录执行以下命令构建对应 sidecar 后重启应用：</p>
+      <pre className="bootstrap-card__cmd">
+        {missing.map((d) => `cargo build --bin ${d.commandBin}`).join("\n")}
+      </pre>
+      <details>
+        <summary>查看每个插件期望的二进制路径</summary>
+        <dl>
+          {missing.map((d) => (
+            <div key={d.pluginId}>
+              <dt>
+                <code>{d.pluginId}</code>
+              </dt>
+              <dd>
+                <ul>
+                  {d.expectedPaths.map((p) => (
+                    <li key={p}>
+                      <code>{p}</code>
+                    </li>
+                  ))}
+                </ul>
+              </dd>
+            </div>
+          ))}
+        </dl>
+      </details>
+      <p className="bootstrap-card__hint">
+        正式构建（bundle）会包含所有 sidecar，该提示仅在 dev checkout 中出现。
+      </p>
+    </aside>
   );
 }
 

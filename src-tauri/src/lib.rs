@@ -4,6 +4,7 @@
 //! the mobile entry point both call `run()`.
 
 mod bootstrap;
+mod dev_diagnostics;
 mod dispatcher;
 mod generated;
 mod logging;
@@ -225,6 +226,7 @@ pub fn run() {
             stronghold_setup_start,
             stronghold_setup_complete,
             stronghold_setup_reset,
+            dev_diagnostics::dev_diagnostics_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
