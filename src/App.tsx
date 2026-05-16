@@ -5,6 +5,7 @@ import type {
   PluginMigrationStatus,
   PluginMigrationStatusMap,
 } from "./migration-status";
+import { PluginRoot } from "./plugin-lifecycle";
 import "./App.css";
 
 // Mirrors src-tauri/src/bootstrap.rs::BootstrapPaths
@@ -277,17 +278,28 @@ function PluginBody({
     );
   }
   const LazyComponent = lazyForPlugin(registryEntry);
+  // Round 10 (task7): wrap the plugin component in PluginRoot so it
+  // mounts a capability on render and unmounts it when the tab closes /
+  // remounts on tab change. tabId defaults to `tab-${pluginId}` — one
+  // singleton tab per plugin in the MVP shell; task17 (workspace storage)
+  // will replace this with real workspace tab IDs.
   return (
-    <Suspense
-      fallback={
-        <section className="placeholder placeholder--loading">
-          <h2>{registryEntry.label}</h2>
-          <p>加载插件组件中…</p>
-        </section>
-      }
+    <PluginRoot
+      pluginId={registryEntry.pluginId}
+      label={registryEntry.label}
+      tabId={`tab-${registryEntry.pluginId}`}
     >
-      <LazyComponent />
-    </Suspense>
+      <Suspense
+        fallback={
+          <section className="placeholder placeholder--loading">
+            <h2>{registryEntry.label}</h2>
+            <p>加载插件组件中…</p>
+          </section>
+        }
+      >
+        <LazyComponent />
+      </Suspense>
+    </PluginRoot>
   );
 }
 
