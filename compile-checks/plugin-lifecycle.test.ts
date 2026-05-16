@@ -53,6 +53,16 @@ export function _probe_use_plugin_capability_requires_plugin_id(): void {
   usePluginCapability("example-notes");
   // tabId is optional.
   usePluginCapability("example-notes", "tab-example-notes");
+  // lifecycleKey is the host-owned retry knob; optional, defaults to 0.
+  usePluginCapability("example-notes", "tab-example-notes", 0);
+  usePluginCapability("example-notes", undefined, 7);
+}
+
+export function _probe_lifecycle_key_must_be_number(): void {
+  // @ts-expect-error lifecycleKey must be a number
+  usePluginCapability("example-notes", "tab", "not-a-number");
+  // @ts-expect-error lifecycleKey must be a number
+  usePluginCapability("example-notes", undefined, { nonce: 1 });
 }
 
 export function _probe_loading_state_has_no_value(): void {

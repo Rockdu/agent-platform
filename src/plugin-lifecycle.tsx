@@ -75,9 +75,15 @@ export function usePluginCapabilityValue(): PluginCapabilityValue {
 // Low-level hook owning the mount lifecycle. Returns the discriminated
 // loading/ready/error state matching docs/specs/plugin-contract.md's
 // canonical hook flow.
+//
+// `lifecycleKey` is the host-owned retry knob: bumping it (e.g. on a retry
+// click) triggers the same cleanup → loading → mountPlugin sequence as a
+// `pluginId`/`tabId` change. The default of `0` is fine for callers that
+// don't need retry control.
 export function usePluginCapability(
   pluginId: string,
   tabId?: string,
+  lifecycleKey: number = 0,
 ): PluginCapabilityState {
   const [state, setState] = useState<PluginCapabilityState>({ status: "loading" });
   const generationRef = useRef(0);
@@ -121,7 +127,7 @@ export function usePluginCapability(
         void unmountPlugin(mintedHandle, tabId).catch(() => {});
       }
     };
-  }, [pluginId, tabId]);
+  }, [pluginId, tabId, lifecycleKey]);
 
   return state;
 }
@@ -161,13 +167,15 @@ export function PluginRoot({
   tabId?: string;
   children: ReactNode;
 }) {
-  const state = usePluginCapability(pluginId, tabId);
+  // `retryNonce` is the lifecycle-retry knob. Bumping it is observed by
+  // usePluginCapability via its third arg, which triggers the full
+  // lifecycle: cleanup (best-effort unmountPlugin of the old handle if
+  // any) → loading → fresh mountPlugin → new (mountId, capability,
+  // generation). Both the mount-error retry and the runtime-error
+  // boundary retry use the same handler.
   const [retryNonce, setRetryNonce] = useState(0);
-
-  // Retry handler bumps a nonce included in the key prop below; React
-  // unmounts the inner subtree (triggering unmount of the failed
-  // capability if any) and re-runs the effect.
   const handleRetry = useCallback(() => setRetryNonce((n) => n + 1), []);
+  const state = usePluginCapability(pluginId, tabId, retryNonce);
 
   if (state.status === "loading") {
     return <LoadingPanel label={label} />;
@@ -177,6 +185,9 @@ export function PluginRoot({
       <MountErrorPanel label={label} error={state.error} onRetry={handleRetry} />
     );
   }
+  // The error boundary is keyed by the current mountId. After a runtime
+  // retry click rotates the capability, the new mountId becomes the key
+  // and React mounts a fresh boundary with cleared error state.
   return (
     <PluginCapabilityContext.Provider value={state.value}>
       <PluginErrorBoundary
@@ -184,7 +195,7 @@ export function PluginRoot({
         mountId={state.value.mountId}
         label={label}
         onRetry={handleRetry}
-        key={`${state.value.mountId}-${retryNonce}`}
+        key={state.value.mountId}
       >
         {children}
       </PluginErrorBoundary>

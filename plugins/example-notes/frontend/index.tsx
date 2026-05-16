@@ -28,10 +28,15 @@ export default function NotesPanel() {
     setDraft("");
   }
 
-  // The mount UUID and the cap_v1.<mount_uuid> envelope prefix are safe to
-  // display (mount identity, not the nonce). The nonce body sits after the
-  // second `.` separator and is never rendered here.
-  const handleEnvelopePrefix = capability.capability.split(".").slice(0, 2).join(".");
+  // Show only `cap_v1.<first-8-of-mount-uuid>…` from the envelope.
+  // The full mount UUID is reachable via `mount_id` (the non-secret mount
+  // identity) below; this prefix is just human-recognizable proof that the
+  // handle is a real cap_v1.* envelope. Nonce body is never displayed.
+  const handleEnvelopePrefix = (() => {
+    const parts = capability.capability.split(".");
+    if (parts.length < 2 || parts[0] !== "cap_v1") return "cap_v1.…";
+    return `cap_v1.${parts[1].slice(0, 8)}…`;
+  })();
 
   return (
     <section className="placeholder" data-fixture={FIXTURE_BANNER}>
