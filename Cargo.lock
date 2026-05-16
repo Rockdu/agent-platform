@@ -14,6 +14,7 @@ version = "0.0.1"
 dependencies = [
  "directories",
  "plugin-codegen",
+ "regex",
  "serde",
  "serde_json",
  "tauri",
@@ -22,6 +23,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -28,6 +28,8 @@ thiserror = "2"
 directories = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3"

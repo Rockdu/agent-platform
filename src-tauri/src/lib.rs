@@ -4,9 +4,12 @@
 //! the mobile entry point both call `run()`.
 
 mod bootstrap;
+mod dispatcher;
 mod generated;
+mod logging;
 
 use bootstrap::{BootstrapError, BootstrapPaths};
+use dispatcher::MountRegistry;
 use serde::Serialize;
 use std::sync::OnceLock;
 
@@ -67,18 +70,13 @@ fn bootstrap_status() -> Result<BootstrapPaths, BootstrapErrorDto> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Initialize structured JSON logging early so bootstrap errors are visible
-    // in stderr/log streams (the actual file-based per-plugin logs land later).
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // Structured JSON logging with sensitive-value redaction (AC-9.5). The
+    // RedactingMakeWriter masks `refresh_token`, `access_token`, `password`,
+    // `bearer`, and `email_body` field values before they reach stderr.
+    logging::init_subscriber();
 
     tauri::Builder::default()
+        .manage(MountRegistry::new())
         .setup(|_app| {
             let result = bootstrap::ensure_dirs().and_then(|paths| {
                 // Now that the generated plugin registry is available, create
@@ -100,7 +98,12 @@ pub fn run() {
             BOOTSTRAP_RESULT.set(result).ok();
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![bootstrap_status])
+        .invoke_handler(tauri::generate_handler![
+            bootstrap_status,
+            dispatcher::mount_plugin,
+            dispatcher::unmount_plugin,
+            dispatcher::dispatch_plugin_command,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
