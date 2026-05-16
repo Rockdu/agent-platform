@@ -1,7 +1,7 @@
 # Example plugin manifest used by plugin-codegen as a regression probe.
-# Has no Rust adapter crate or frontend directory yet; it exists only so the
-# scanner has a non-empty input set and the generated artifacts contain real
-# values that downstream consumers can grep.
+# Round 3: now ships with a real `frontend/index.tsx` + `types.ts` so it
+# exercises the full plugin-contract path (manifest + frontend file +
+# typed-wrapper generation), not just the scanner.
 
 name = "Notes"
 version = "0.0.1"
@@ -16,7 +16,11 @@ migrations_path = "migrations/"
 [[commands]]
 name = "list_notes"
 permissions = []
+args_type = "ListNotesArgs"
+result_type = "ListNotesResult"
 
 [[commands]]
 name = "create_note"
 permissions = ["notify"]
+args_type = "CreateNoteArgs"
+result_type = "CreateNoteResult"

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useState, type ComponentType, type LazyExoticComponent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { PLUGIN_TABS, type PluginTabEntry } from "./generated/plugin-tabs";
 import "./App.css";
@@ -24,8 +24,9 @@ type BootstrapState =
   | { kind: "ok"; paths: BootstrapPaths }
   | { kind: "error"; error: BootstrapErrorDto };
 
-// Host-owned tab identifiers. The orchestrator is host-owned and fixed leftmost
-// (not a plugin per the contract). Regular plugin tabs come from PLUGIN_TABS.
+// Host-owned tab identifiers. The orchestrator is host-owned and fixed
+// leftmost (not a plugin per the contract). Regular plugin tabs come from
+// PLUGIN_TABS (generated from plugins/*/plugin.toml).
 type HostTabId = "orchestrator";
 type ActiveTab = { kind: "host"; id: HostTabId } | { kind: "plugin"; pluginId: string };
 
@@ -35,8 +36,8 @@ const ORCHESTRATOR: { id: HostTabId; label: string; icon: string } = {
   icon: "✦",
 };
 
-// Static placeholders for MVP plugins not yet packaged as plugin.toml entries.
-// These disappear when their real manifests land under plugins/.
+// MVP plugins not yet packaged as plugin.toml entries. These vanish when the
+// matching real manifest lands under plugins/.
 type StaticPlaceholder = { id: string; label: string; icon: string };
 const STATIC_PLACEHOLDERS: StaticPlaceholder[] = [
   { id: "static-terminal", label: "终端", icon: "▤" },
@@ -44,13 +45,25 @@ const STATIC_PLACEHOLDERS: StaticPlaceholder[] = [
   { id: "static-papers", label: "论文", icon: "❡" },
 ];
 
+// Cache React.lazy components per pluginId so toggling between tabs doesn't
+// retrigger module evaluation.
+const lazyComponentCache = new Map<string, LazyExoticComponent<ComponentType>>();
+function lazyForPlugin(entry: PluginTabEntry): LazyExoticComponent<ComponentType> {
+  let cached = lazyComponentCache.get(entry.pluginId);
+  if (!cached) {
+    cached = lazy(entry.loadComponent);
+    lazyComponentCache.set(entry.pluginId, cached);
+  }
+  return cached;
+}
+
 export default function App() {
   const [active, setActive] = useState<ActiveTab>({ kind: "host", id: "orchestrator" });
   const [bootstrap, setBootstrap] = useState<BootstrapState>({ kind: "loading" });
 
-  // Suppress placeholder if a real plugin with the same conceptual slot has registered.
-  // For now, simple heuristic: hide a placeholder when any plugin label contains
-  // its keyword. (Will be replaced cleanly when MVP plugins ship as manifests.)
+  // Hide a placeholder if a real plugin label contains the placeholder's
+  // keyword (suppress duplicates when MVP plugins start shipping as
+  // manifests). Round-3 expedient; cleaner deletion once MVP plugins land.
   const visiblePlaceholders = useMemo(() => {
     const lower = PLUGIN_TABS.map((p) => p.label.toLowerCase());
     return STATIC_PLACEHOLDERS.filter((p) => {
@@ -167,7 +180,7 @@ function OrchestratorPlaceholder() {
       <p>
         特权单实例 tab。后续会自动启动 <code>claude</code> 并预配所有平台 MCP 服务器。
       </p>
-      <p className="placeholder__hint">本轮仅渲染占位；PTY + claude 接入留待后续实现。</p>
+      <p className="placeholder__hint">当前仅渲染占位；PTY + claude 接入留待后续实现。</p>
     </section>
   );
 }
@@ -189,25 +202,18 @@ function PluginBody({
       </section>
     );
   }
+  const LazyComponent = lazyForPlugin(registryEntry);
   return (
-    <section className="placeholder">
-      <h2>{registryEntry.label}</h2>
-      <dl className="plugin-meta">
-        <dt>plugin id</dt>
-        <dd>
-          <code>{registryEntry.pluginId}</code>
-        </dd>
-        <dt>version</dt>
-        <dd>{registryEntry.version}</dd>
-        <dt>permissions</dt>
-        <dd>{registryEntry.permissions.join(", ") || "—"}</dd>
-        <dt>required APIs</dt>
-        <dd>{registryEntry.requiredApis.join(", ") || "—"}</dd>
-      </dl>
-      <p className="placeholder__hint">
-        加载组件的实际渲染由后续 wrapper codegen + dispatcher 接入；当前仅显示注册表内容证明 codegen 流水线打通。
-      </p>
-    </section>
+    <Suspense
+      fallback={
+        <section className="placeholder placeholder--loading">
+          <h2>{registryEntry.label}</h2>
+          <p>加载插件组件中…</p>
+        </section>
+      }
+    >
+      <LazyComponent />
+    </Suspense>
   );
 }
 
@@ -262,7 +268,7 @@ function BootstrapDebugCard({ state }: { state: BootstrapState }) {
         <dt>claude-mcp-configs</dt>
         <dd>{state.paths.claude_mcp_configs}</dd>
       </dl>
-      <p className="bootstrap-card__hint">调试卡，后续被插件健康面板替换。</p>
+      <p className="bootstrap-card__hint">调试卡，后续由插件健康面板替换。</p>
     </aside>
   );
 }

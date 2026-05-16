@@ -70,12 +70,19 @@ pub struct ManifestFile {
 }
 
 /// One command exposed by a plugin's sidecar; permissions must be a subset of
-/// the plugin's declared `permissions`.
+/// the plugin's declared `permissions`. The optional `args_type` and
+/// `result_type` fields point at TypeScript type names exported from
+/// `plugins/<plugin_id>/types.ts`; the codegen emits typed wrappers that
+/// import those names.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CommandDecl {
     pub name: String,
     #[serde(default)]
     pub permissions: Vec<String>,
+    #[serde(default)]
+    pub args_type: Option<String>,
+    #[serde(default)]
+    pub result_type: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -196,14 +203,59 @@ pub enum CodegenError {
         "PLUGIN_CONTRACT_ERROR raw_invoke_violation: frontend file `{file}` line {line} contains raw `invoke('plugin.…')` string. Use generated typed wrappers from src/generated/plugins/<id>.ts."
     )]
     RawInvokeUsage { file: PathBuf, line: usize },
+
+    #[error(
+        "PLUGIN_CONTRACT_ERROR invalid_frontend_path: plugin `{plugin_id}` frontend=`{frontend}` (at {manifest}) {reason}"
+    )]
+    InvalidFrontendPath {
+        plugin_id: String,
+        manifest: PathBuf,
+        frontend: String,
+        reason: &'static str,
+    },
+
+    #[error(
+        "PLUGIN_CONTRACT_ERROR frontend_missing: plugin `{plugin_id}` declares frontend=`{frontend}` but the file does not exist at {expected_path}"
+    )]
+    FrontendMissing {
+        plugin_id: String,
+        manifest: PathBuf,
+        frontend: String,
+        expected_path: PathBuf,
+    },
+
+    #[error(
+        "PLUGIN_CONTRACT_ERROR command_type_partial: plugin `{plugin_id}` command `{command_name}` (at {manifest}) declares only one of `args_type`/`result_type`; both must be set together"
+    )]
+    CommandTypePartial {
+        plugin_id: String,
+        manifest: PathBuf,
+        command_name: String,
+    },
 }
 
 /// Top-level entry point: scan + validate + emit.
 pub fn generate(workspace_root: &Path, out: &OutputPaths) -> Result<(), CodegenError> {
     let plugins_dir = workspace_root.join("plugins");
     let manifests = scan_directory(&plugins_dir)?;
+
+    // Frontend existence is verified relative to the on-disk plugins dir.
+    for m in &manifests {
+        validate_frontend_on_disk(m, &plugins_dir)?;
+    }
+
     generate_from_manifests(&manifests, out)?;
-    check_no_raw_invoke(&workspace_root.join("src"))?;
+
+    // Raw-invoke convention check scans BOTH the root frontend tree AND every
+    // plugin's frontend directory. Codex round-2 review caught that round-1
+    // only scanned src/.
+    let mut roots: Vec<PathBuf> = vec![workspace_root.join("src")];
+    for m in &manifests {
+        if let Some(frontend_dir) = plugin_frontend_dir(m, &plugins_dir) {
+            roots.push(frontend_dir);
+        }
+    }
+    check_no_raw_invoke_multi(&roots)?;
     Ok(())
 }
 
@@ -235,6 +287,7 @@ pub fn generate_from_manifests(
 
     emit_ts_tab_registry(manifests, &out.ts_generated_dir)?;
     emit_ts_command_metadata(manifests, &out.ts_generated_dir)?;
+    emit_ts_dispatch(&out.ts_generated_dir)?;
     emit_ts_per_plugin_wrappers(manifests, &out.ts_generated_dir)?;
 
     Ok(())
@@ -378,8 +431,64 @@ fn validate_manifest(m: &PluginManifest) -> Result<(), CodegenError> {
                 });
             }
         }
+        // args_type and result_type are optional but co-required: if you ship
+        // one, ship both, so the wrapper signature is well-formed.
+        if cmd.args_type.is_some() != cmd.result_type.is_some() {
+            return Err(CodegenError::CommandTypePartial {
+                plugin_id: m.plugin_id.clone(),
+                manifest: m.manifest_path.clone(),
+                command_name: cmd.name.clone(),
+            });
+        }
+    }
+    // Frontend path validation that does not require filesystem access (string
+    // checks only). `validate_frontend_on_disk` performs the existence probe
+    // for production builds; tests skip it.
+    let frontend = m.file.frontend.trim();
+    if frontend.starts_with('/') {
+        return Err(CodegenError::InvalidFrontendPath {
+            plugin_id: m.plugin_id.clone(),
+            manifest: m.manifest_path.clone(),
+            frontend: frontend.to_string(),
+            reason: "must be a relative path (no leading `/`)",
+        });
+    }
+    if frontend.split('/').any(|seg| seg == "..") {
+        return Err(CodegenError::InvalidFrontendPath {
+            plugin_id: m.plugin_id.clone(),
+            manifest: m.manifest_path.clone(),
+            frontend: frontend.to_string(),
+            reason: "must not contain `..` (would escape plugins/<id>/)",
+        });
     }
     Ok(())
+}
+
+/// Filesystem probe: the frontend entry must exist under `plugins/<id>/`.
+/// Separate from string-level `validate_manifest` so unit tests can exercise
+/// schema validation without filesystem fixtures.
+fn validate_frontend_on_disk(m: &PluginManifest, plugins_dir: &Path) -> Result<(), CodegenError> {
+    let expected = plugins_dir.join(&m.plugin_id).join(&m.file.frontend);
+    if !expected.exists() {
+        return Err(CodegenError::FrontendMissing {
+            plugin_id: m.plugin_id.clone(),
+            manifest: m.manifest_path.clone(),
+            frontend: m.file.frontend.clone(),
+            expected_path: expected,
+        });
+    }
+    Ok(())
+}
+
+/// Returns the parent directory of the manifest's `frontend` entry on disk, or
+/// `None` if it cannot be resolved. Used to seed the raw-invoke scanner roots
+/// so each plugin's frontend tree is checked too.
+fn plugin_frontend_dir(m: &PluginManifest, plugins_dir: &Path) -> Option<PathBuf> {
+    plugins_dir
+        .join(&m.plugin_id)
+        .join(&m.file.frontend)
+        .parent()
+        .map(Path::to_path_buf)
 }
 
 fn validate_uniqueness(manifests: &[PluginManifest]) -> Result<(), CodegenError> {
@@ -428,10 +537,17 @@ fn validate_uniqueness(manifests: &[PluginManifest]) -> Result<(), CodegenError>
     Ok(())
 }
 
-/// Walk the human-authored frontend tree looking for `invoke('plugin.…')`
-/// strings that should have gone through generated wrappers. Excludes
-/// `src/generated/` so the generator's own emit can use whatever shape it
-/// pleases.
+/// Walk multiple frontend roots looking for `invoke('plugin.…')` strings that
+/// should have gone through generated wrappers. Skips `generated/` and
+/// `node_modules/` subtrees so the generator's own emit and vendored
+/// dependencies are not flagged.
+fn check_no_raw_invoke_multi(roots: &[PathBuf]) -> Result<(), CodegenError> {
+    for root in roots {
+        check_no_raw_invoke(root)?;
+    }
+    Ok(())
+}
+
 fn check_no_raw_invoke(frontend_src: &Path) -> Result<(), CodegenError> {
     if !frontend_src.exists() {
         return Ok(());
@@ -441,7 +557,10 @@ fn check_no_raw_invoke(frontend_src: &Path) -> Result<(), CodegenError> {
             continue;
         }
         let path = entry.path();
-        if path.components().any(|c| c.as_os_str() == "generated") {
+        if path
+            .components()
+            .any(|c| matches!(c.as_os_str().to_str(), Some("generated" | "node_modules")))
+        {
             continue;
         }
         let ext = match path.extension().and_then(|e| e.to_str()) {
@@ -456,7 +575,6 @@ fn check_no_raw_invoke(frontend_src: &Path) -> Result<(), CodegenError> {
             Err(_) => continue,
         };
         for (idx, line) in contents.lines().enumerate() {
-            // Match invoke('plugin.<id>.<cmd>' or invoke("plugin.<id>.<cmd>"
             let needle_single = "invoke('plugin.";
             let needle_double = "invoke(\"plugin.";
             if line.contains(needle_single) || line.contains(needle_double) {
@@ -659,7 +777,7 @@ fn emit_ts_tab_registry(manifests: &[PluginManifest], out_dir: &Path) -> Result<
     version: {version:?},
     permissions: [{perms}],
     requiredApis: [{apis}],
-    loadComponent: () => import(\"./plugins/{id}.ts\").then((m) => m.default),
+    loadComponent: () => import(\"./plugins/{id}.ts\"),
   }},\n",
             id = m.plugin_id,
             name = m.file.name,
@@ -681,6 +799,8 @@ fn emit_ts_tab_registry(manifests: &[PluginManifest], out_dir: &Path) -> Result<
         ));
     }
 
+    // Shape matches React.lazy's expected `() => Promise<{ default: ComponentType }>`
+    // so plugin tabs can be passed straight to `lazy()` without an adapter.
     let body = format!(
         "// @generated by plugin-codegen from plugins/*/plugin.toml. DO NOT EDIT.
 
@@ -692,7 +812,7 @@ export interface PluginTabEntry {{
   version: string;
   permissions: readonly string[];
   requiredApis: readonly string[];
-  loadComponent: () => Promise<ComponentType>;
+  loadComponent: () => Promise<{{ default: ComponentType }}>;
 }}
 
 export const PLUGIN_TABS: readonly PluginTabEntry[] = [
@@ -749,6 +869,49 @@ export const PLUGIN_COMMANDS: Readonly<
     write_if_changed(&out_dir.join("plugin-command-metadata.ts"), &body)
 }
 
+fn emit_ts_dispatch(out_dir: &Path) -> Result<(), CodegenError> {
+    // Single Tauri `invoke` choke point shared by every generated plugin
+    // wrapper. Plugin frontend code never imports `@tauri-apps/api/core`
+    // directly; the convention check rejects raw `invoke('plugin.…')` calls
+    // outside this generated file.
+    let body = "// @generated by plugin-codegen. DO NOT EDIT.
+
+import { invoke } from \"@tauri-apps/api/core\";
+
+import type { PluginCapability } from \"./capability\";
+
+/// Sole entry point for plugin-mediated IPC. Wrappers under
+/// src/generated/plugins/<id>.ts call this with a pre-composed command id
+/// (`plugin.<plugin_id>.<command_name>`). The Rust dispatcher (task4) will
+/// observe the capability and route to the right plugin.
+export async function platformInvoke<Args, Result>(
+  commandId: string,
+  args: Args,
+  _capability: PluginCapability,
+): Promise<Result> {
+  // The capability is opaque to the frontend; passing it as a hidden argument
+  // keeps wrappers honest even though the actual binding check is done in the
+  // host. The dispatcher infers caller identity at task4 time.
+  return invoke<Result>(commandId, { args });
+}
+";
+    write_if_changed(&out_dir.join("_dispatch.ts"), body)?;
+
+    // PluginCapability brand definition lives next to _dispatch.ts so generated
+    // wrappers can import it without depending on the plugin contract spec.
+    let capability_body = "// @generated by plugin-codegen. DO NOT EDIT.
+
+/// Branded opaque handle issued by the host at plugin mount time. Round 3
+/// emits the type only; task7 will mint actual capability values via a host
+/// IPC and pass them into plugin components via React context.
+export interface PluginCapability {
+  readonly _branded: unique symbol;
+}
+";
+    write_if_changed(&out_dir.join("capability.ts"), capability_body)?;
+    Ok(())
+}
+
 fn emit_ts_per_plugin_wrappers(
     manifests: &[PluginManifest],
     out_dir: &Path,
@@ -760,6 +923,41 @@ fn emit_ts_per_plugin_wrappers(
     })?;
 
     for m in manifests {
+        // Collect type names referenced by commands so we can emit a single
+        // typed import line per plugin.
+        let mut type_imports: Vec<String> = Vec::new();
+        for cmd in &m.file.commands {
+            if let Some(t) = &cmd.args_type {
+                if !type_imports.contains(t) {
+                    type_imports.push(t.clone());
+                }
+            }
+            if let Some(t) = &cmd.result_type {
+                if !type_imports.contains(t) {
+                    type_imports.push(t.clone());
+                }
+            }
+        }
+
+        let import_types = if type_imports.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "import type {{ {types} }} from \"../../../plugins/{id}/types\";\n",
+                types = type_imports.join(", "),
+                id = m.plugin_id,
+            )
+        };
+
+        // Strip the .tsx/.ts extension when emitting the import path; Vite +
+        // bundler-mode TS resolver accept extension-less specifiers.
+        let frontend_no_ext = strip_known_ext(&m.file.frontend);
+        let import_component = format!(
+            "import PluginComponent from \"../../../plugins/{id}/{frontend}\";\n",
+            id = m.plugin_id,
+            frontend = frontend_no_ext,
+        );
+
         let mut commands_block = String::new();
         for cmd in &m.file.commands {
             let perms_doc = if cmd.permissions.is_empty() {
@@ -767,10 +965,16 @@ fn emit_ts_per_plugin_wrappers(
             } else {
                 format!("// permissions: {}", cmd.permissions.join(", "))
             };
+            let (args_ty, result_ty) = (
+                cmd.args_type.as_deref().unwrap_or("unknown"),
+                cmd.result_type.as_deref().unwrap_or("unknown"),
+            );
             commands_block.push_str(&format!(
-                "  {perms_doc}\n  async {name}(args: unknown, _capability: PluginCapability): Promise<unknown> {{\n    void args;\n    void _capability;\n    throw new Error(\"plugin command not yet wired: {plugin_id}.{name}\");\n  }},\n",
+                "  {perms_doc}\n  async {name}(args: {args_ty}, capability: PluginCapability): Promise<{result_ty}> {{\n    return platformInvoke<{args_ty}, {result_ty}>(\"plugin.{plugin_id}.{name}\", args, capability);\n  }},\n",
                 perms_doc = perms_doc,
                 name = cmd.name,
+                args_ty = args_ty,
+                result_ty = result_ty,
                 plugin_id = m.plugin_id,
             ));
         }
@@ -781,15 +985,19 @@ fn emit_ts_per_plugin_wrappers(
         let body = format!(
             "// @generated by plugin-codegen from plugins/{id}/plugin.toml. DO NOT EDIT.
 //
-// Round-2 typed-wrapper stub: real dispatch wiring lands with task4 (Rust IPC
-// dispatcher). For now the wrappers throw so any accidental caller surfaces
-// loudly during integration testing.
+// Per-plugin entry point:
+//   - re-exports the real frontend component declared by plugin.toml.frontend
+//   - exports a typed `commands` namespace routed through src/generated/_dispatch.ts
+//
+// Plugin frontend code never imports Tauri's `invoke` directly; it must call
+// `commands.<name>(args, capability)`. The host's prebuild raw-invoke
+// convention check enforces that rule across both the root frontend tree and
+// each plugin's frontend directory.
 
-import type {{ ComponentType }} from \"react\";
+{import_component}{import_types}import {{ platformInvoke }} from \"../_dispatch\";
+import type {{ PluginCapability }} from \"../capability\";
 
-export interface PluginCapability {{
-  readonly _branded: unique symbol;
-}}
+export type {{ PluginCapability }};
 
 export const pluginMeta = {{
   pluginId: {id:?},
@@ -801,12 +1009,7 @@ export const pluginMeta = {{
 export const commands = {{
 {commands_block}}};
 
-const PluginStub: ComponentType = function PluginStub() {{
-  return null;
-}};
-(PluginStub as {{ displayName?: string }}).displayName = {display_name:?};
-
-export default PluginStub;
+export default PluginComponent;
 ",
             id = m.plugin_id,
             name = m.file.name,
@@ -818,12 +1021,22 @@ export default PluginStub;
                 .map(|p| format!("{:?}", p))
                 .collect::<Vec<_>>()
                 .join(", "),
+            import_component = import_component,
+            import_types = import_types,
             commands_block = commands_block,
-            display_name = format!("Plugin({})", m.plugin_id),
         );
         write_if_changed(&plugins_subdir.join(format!("{}.ts", m.plugin_id)), &body)?;
     }
     Ok(())
+}
+
+fn strip_known_ext(path: &str) -> String {
+    for ext in [".tsx", ".ts", ".jsx", ".js"] {
+        if let Some(stem) = path.strip_suffix(ext) {
+            return stem.to_string();
+        }
+    }
+    path.to_string()
 }
 
 #[cfg(test)]
@@ -876,7 +1089,12 @@ mod tests {
             mk_manifest(
                 "alpha",
                 mk_file("Alpha", "alpha-bin", "alpha", &["notify"], &["invoke"], vec![
-                    CommandDecl { name: "ping".into(), permissions: vec!["notify".into()] },
+                    CommandDecl {
+                        name: "ping".into(),
+                        permissions: vec!["notify".into()],
+                        args_type: None,
+                        result_type: None,
+                    },
                 ]),
             ),
             mk_manifest(
@@ -1008,6 +1226,8 @@ mod tests {
                 vec![CommandDecl {
                     name: "do_stuff".into(),
                     permissions: vec!["user.email".into()],
+                    args_type: None,
+                    result_type: None,
                 }],
             ),
         )];
@@ -1037,14 +1257,12 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let src_root = dir.path().join("src");
         fs::create_dir_all(src_root.join("plugins")).unwrap();
-        // Generated dir is ignored.
         fs::create_dir_all(src_root.join("generated")).unwrap();
         fs::write(
             src_root.join("generated").join("plugin-tabs.ts"),
             "// safe to mention invoke('plugin.foo.bar') inside generated\n",
         )
         .unwrap();
-        // A normal source file with a raw invoke must be flagged.
         fs::write(
             src_root.join("plugins").join("Bad.tsx"),
             "import { invoke } from \"@tauri-apps/api/core\";\nawait invoke('plugin.example-notes.list_notes');\n",
@@ -1054,5 +1272,164 @@ mod tests {
             CodegenError::RawInvokeUsage { line, .. } => assert_eq!(line, 2),
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn raw_invoke_detection_walks_multiple_roots() {
+        // Simulates the production setup where the scanner is called with both
+        // `src/` and each `plugins/<id>/frontend/` root.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let src_root = dir.path().join("src");
+        let plugin_frontend = dir.path().join("plugins").join("probe").join("frontend");
+        fs::create_dir_all(&src_root).unwrap();
+        fs::create_dir_all(&plugin_frontend).unwrap();
+        // The src tree is clean.
+        fs::write(src_root.join("App.tsx"), "// no invoke here\n").unwrap();
+        // The plugin tree contains a raw invoke; multi-root scan must flag it.
+        fs::write(
+            plugin_frontend.join("index.tsx"),
+            "import { invoke } from \"@tauri-apps/api/core\";\nawait invoke('plugin.probe.ping');\n",
+        )
+        .unwrap();
+        let roots = vec![src_root, plugin_frontend.clone()];
+        match check_no_raw_invoke_multi(&roots).unwrap_err() {
+            CodegenError::RawInvokeUsage { file, line } => {
+                assert_eq!(line, 2);
+                assert!(file.starts_with(&plugin_frontend));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn frontend_path_must_be_relative() {
+        let (_tmp, out) = tmp_out();
+        let mut file = mk_file("Alpha", "alpha-bin", "alpha", &[], &["invoke"], vec![]);
+        file.frontend = "/etc/passwd".into();
+        let manifests = vec![mk_manifest("alpha", file)];
+        match generate_from_manifests(&manifests, &out).unwrap_err() {
+            CodegenError::InvalidFrontendPath { reason, .. } => {
+                assert!(reason.contains("relative"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn frontend_path_must_not_escape_plugin_dir() {
+        let (_tmp, out) = tmp_out();
+        let mut file = mk_file("Alpha", "alpha-bin", "alpha", &[], &["invoke"], vec![]);
+        file.frontend = "../../etc/passwd".into();
+        let manifests = vec![mk_manifest("alpha", file)];
+        match generate_from_manifests(&manifests, &out).unwrap_err() {
+            CodegenError::InvalidFrontendPath { reason, .. } => {
+                assert!(reason.contains("escape"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn frontend_missing_on_disk_fails_via_full_generate() {
+        // Exercises the disk-level probe by running the full `generate()`
+        // pipeline against a temp workspace whose manifest declares a frontend
+        // that does not exist.
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let plugin_dir = workspace.path().join("plugins").join("probe");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.toml"),
+            r#"name = "Probe"
+version = "0.0.1"
+type = "tab"
+command_bin = "probe-bin"
+frontend = "frontend/missing.tsx"
+permissions = []
+required_apis = ["invoke"]
+db_namespace = "probe"
+migrations_path = "migrations/"
+"#,
+        )
+        .unwrap();
+        let out = OutputPaths::default(workspace.path());
+        match generate(workspace.path(), &out).unwrap_err() {
+            CodegenError::FrontendMissing { expected_path, .. } => {
+                assert!(expected_path.ends_with("missing.tsx"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn command_args_and_result_types_are_co_required() {
+        let (_tmp, out) = tmp_out();
+        let manifests = vec![mk_manifest(
+            "alpha",
+            mk_file(
+                "Alpha",
+                "alpha-bin",
+                "alpha",
+                &[],
+                &["invoke"],
+                vec![CommandDecl {
+                    name: "lone".into(),
+                    permissions: vec![],
+                    args_type: Some("LoneArgs".into()),
+                    result_type: None,
+                }],
+            ),
+        )];
+        match generate_from_manifests(&manifests, &out).unwrap_err() {
+            CodegenError::CommandTypePartial { command_name, .. } => {
+                assert_eq!(command_name, "lone");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn typed_wrappers_include_args_and_result_type_names() {
+        // Positive: when commands carry args_type and result_type, the emitted
+        // wrapper file imports those types and uses them as the wrapper
+        // signature. Indirectly proves the generator no longer hardcodes
+        // `unknown` for typed commands.
+        let (_tmp, out) = tmp_out();
+        let manifests = vec![mk_manifest(
+            "alpha",
+            mk_file(
+                "Alpha",
+                "alpha-bin",
+                "alpha",
+                &["notify"],
+                &["invoke"],
+                vec![CommandDecl {
+                    name: "create_thing".into(),
+                    permissions: vec!["notify".into()],
+                    args_type: Some("CreateThingArgs".into()),
+                    result_type: Some("CreateThingResult".into()),
+                }],
+            ),
+        )];
+        generate_from_manifests(&manifests, &out).expect("typed commands generate");
+        let wrapper = fs::read_to_string(
+            out.ts_generated_dir.join("plugins").join("alpha.ts"),
+        )
+        .unwrap();
+        assert!(
+            wrapper.contains("import type { CreateThingArgs, CreateThingResult }"),
+            "wrapper must import the declared types: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("args: CreateThingArgs"),
+            "wrapper signature must use the args type: {wrapper}"
+        );
+        assert!(
+            wrapper.contains("Promise<CreateThingResult>"),
+            "wrapper must return the result type: {wrapper}"
+        );
+        assert!(
+            !wrapper.contains("Promise<unknown>"),
+            "typed command must not fall back to unknown: {wrapper}"
+        );
     }
 }
