@@ -89,17 +89,31 @@ pub struct JsonRpcResponse {
     pub error: Option<JsonRpcError>,
 }
 
-/// Unified message shape. `#[serde(untagged)]` lets serde pick the right
-/// variant by structural shape: a request has both `id` and `method`, a
-/// response has `id` but no `method`, a notification has `method` but no
-/// `id`. The variant order matters: Response before Request before
-/// Notification so the most-specific shape matches first.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Unified message shape. Serialize uses `#[serde(untagged)]` to flatten
+/// the variant — fine because we always construct the correct variant
+/// before serializing. Deserialize is **manual** (see the `Deserialize`
+/// impl below) and routes through the same `decode_value` structural
+/// validator the framing helpers use; this prevents a downstream
+/// `serde_json::from_str::<JsonRpcMessage>(...)` call from misrouting
+/// a Request payload to Response (which would happen with the
+/// derived untagged Deserialize because Response's fields are all
+/// optional and serde tolerates unknown fields).
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum JsonRpcMessage {
     Response(JsonRpcResponse),
     Request(JsonRpcRequest),
     Notification(JsonRpcNotification),
+}
+
+impl<'de> Deserialize<'de> for JsonRpcMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = Value::deserialize(deserializer)?;
+        decode_value(v).map_err(serde::de::Error::custom)
+    }
 }
 
 impl JsonRpcMessage {
@@ -174,6 +188,9 @@ pub enum FramingError {
 
     #[error("MCP_FRAMING_ERROR invalid_jsonrpc_version: expected `2.0`, got `{found}`")]
     InvalidJsonRpcVersion { found: String },
+
+    #[error("MCP_FRAMING_ERROR invalid_message_shape: {reason}")]
+    InvalidMessageShape { reason: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -190,10 +207,38 @@ fn assert_no_embedded_newline(serialized: &str) -> Result<(), FramingError> {
     }
 }
 
+/// Per-message structural validator applied before serialization or after
+/// JSON parsing. Currently enforces JSON-RPC response semantics: exactly
+/// one of `result` / `error` set. Notification + Request shapes are
+/// already structurally guaranteed by their field layout (no `Option`
+/// fields whose presence carries semantic meaning).
+fn validate_message_shape(msg: &JsonRpcMessage) -> Result<(), FramingError> {
+    if let JsonRpcMessage::Response(r) = msg {
+        match (r.result.is_some(), r.error.is_some()) {
+            (true, true) => {
+                return Err(FramingError::InvalidMessageShape {
+                    reason: "response carries both result and error; JSON-RPC requires exactly one"
+                        .into(),
+                });
+            }
+            (false, false) => {
+                return Err(FramingError::InvalidMessageShape {
+                    reason: "response carries neither result nor error; JSON-RPC requires exactly one"
+                        .into(),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Serialize a JSON-RPC message and frame it for stdio: `<json>\n`.
-/// Rejects messages whose serialized form contains a literal newline
-/// (defense against future pretty-printers or hand-crafted fragments).
+/// Validates the response shape (exactly one of result/error), serializes,
+/// rejects embedded newlines (defense against future pretty-printers or
+/// hand-crafted fragments), and appends exactly one terminal `\n`.
 pub fn encode_message(msg: &JsonRpcMessage) -> Result<Vec<u8>, FramingError> {
+    validate_message_shape(msg)?;
     let line = serde_json::to_string(msg)?;
     assert_no_embedded_newline(&line)?;
     if line.is_empty() {
@@ -215,27 +260,16 @@ fn check_jsonrpc_field(v: &Value) -> Result<(), FramingError> {
     }
 }
 
-/// Decode a single newline-delimited message. Accepts both a trailing `\n`
-/// and a bare line. Empty / whitespace-only input rejects with `EmptyLine`.
-///
-/// `#[serde(untagged)]` on `JsonRpcMessage` does the right thing for
-/// serialization, but for deserialization the variants are not structurally
-/// distinct (Request and Response both have `id`; Response's `method`-less
-/// shape matches any Request payload via serde's default extra-field
-/// tolerance). We disambiguate here by inspecting the presence of `id` and
-/// `method`:
+/// Shared structural validator. Used by both `decode_line` and the manual
+/// `Deserialize` impl on `JsonRpcMessage`, so every entry point gets the
+/// same protections. Disambiguates the JSON-RPC message variant by
+/// inspecting the presence of `id` and `method`:
 ///   * `id` + `method` → Request
-///   * `id` + no `method` → Response
+///   * `id` + no `method` → Response (subject to result/error shape check)
 ///   * no `id` + `method` → Notification
-pub fn decode_line(bytes: &[u8]) -> Result<JsonRpcMessage, FramingError> {
-    let s = std::str::from_utf8(bytes)?;
-    let trimmed = s.trim_end_matches('\n');
-    if trimmed.trim().is_empty() {
-        return Err(FramingError::EmptyLine);
-    }
-    let v: Value = serde_json::from_str(trimmed)?;
+///   * neither → `InvalidMessageShape`
+fn decode_value(v: Value) -> Result<JsonRpcMessage, FramingError> {
     check_jsonrpc_field(&v)?;
-
     let has_id = v.get("id").is_some();
     let has_method = v.get("method").is_some();
     let msg = match (has_id, has_method) {
@@ -243,14 +277,39 @@ pub fn decode_line(bytes: &[u8]) -> Result<JsonRpcMessage, FramingError> {
         (true, false) => JsonRpcMessage::Response(serde_json::from_value(v)?),
         (false, true) => JsonRpcMessage::Notification(serde_json::from_value(v)?),
         (false, false) => {
-            return Err(FramingError::JsonParse {
-                source: serde::de::Error::custom(
-                    "JSON-RPC payload must include `id` (request/response) or `method` (notification)",
-                ),
+            return Err(FramingError::InvalidMessageShape {
+                reason: "JSON-RPC payload must include `id` (request/response) or `method` (notification)"
+                    .into(),
             });
         }
     };
+    validate_message_shape(&msg)?;
     Ok(msg)
+}
+
+/// Decode a single newline-delimited message. Accepts at most ONE terminal
+/// `\n` and rejects any other embedded `\n` or `\r` as `EmbeddedNewline`
+/// (per `docs/specs/mcp-sidecar.md`: "messages MUST NOT contain embedded
+/// newlines"). Multiple trailing newlines surface as `EmbeddedNewline` —
+/// each frame must contain exactly one message and exactly one delimiter,
+/// so a second `\n` is an empty frame and stream callers must observe it.
+pub fn decode_line(bytes: &[u8]) -> Result<JsonRpcMessage, FramingError> {
+    let s = std::str::from_utf8(bytes)?;
+    // Strip AT MOST one terminal `\n` (not `trim_end_matches` which would
+    // silently swallow any number of trailing newlines and let an "empty
+    // frame" through as if it were part of the previous frame).
+    let body = s.strip_suffix('\n').unwrap_or(s);
+    if body.trim().is_empty() {
+        return Err(FramingError::EmptyLine);
+    }
+    // After stripping the single terminal delimiter, the body must contain
+    // no `\n` or `\r` — serde would otherwise parse them as JSON whitespace
+    // and obscure desync bugs.
+    if body.contains('\n') || body.contains('\r') {
+        return Err(FramingError::EmbeddedNewline);
+    }
+    let v: Value = serde_json::from_str(body)?;
+    decode_value(v)
 }
 
 /// Yield typed messages from a `BufRead` stream of newline-delimited
@@ -669,6 +728,158 @@ mod tests {
             c.log_filename(),
             "claude%3A550e8400-e29b-41d4-a716-446655440000%3Agmail.log"
         );
+    }
+
+    // ----- Strict parser hardening (Round 16 / Codex round-15 review) -----
+
+    #[test]
+    fn decode_rejects_embedded_newline_in_json_whitespace() {
+        // Real \n between `"2.0",` and `"id"` — serde would otherwise parse
+        // it as JSON whitespace. The strict framing layer must reject it.
+        let payload = b"{\"jsonrpc\":\"2.0\",\n\"id\":1,\"method\":\"x\"}";
+        assert!(matches!(
+            decode_line(payload).unwrap_err(),
+            FramingError::EmbeddedNewline
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_embedded_carriage_return() {
+        let payload = b"{\"jsonrpc\":\"2.0\",\r\"id\":1,\"method\":\"x\"}";
+        assert!(matches!(
+            decode_line(payload).unwrap_err(),
+            FramingError::EmbeddedNewline
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_multiple_trailing_newlines() {
+        // Two trailing \n: after stripping ONE terminal delimiter, the
+        // remaining \n is embedded — proves we use strip_suffix not
+        // trim_end_matches.
+        let payload = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"x\"}\n\n";
+        assert!(matches!(
+            decode_line(payload).unwrap_err(),
+            FramingError::EmbeddedNewline
+        ));
+    }
+
+    #[test]
+    fn decode_stream_surfaces_empty_line_after_double_newline() {
+        // Buffer `<line1>\n\n<line2>\n` — BufRead::lines yields:
+        //   line1 -> Ok
+        //   ""    -> Err(EmptyLine)
+        //   line2 -> Ok
+        // The empty middle frame surfaces as an error per the spec contract.
+        let l1 = encode_message(&req(1, "a")).unwrap();
+        let l2 = encode_message(&req(2, "b")).unwrap();
+        let mut combined = Vec::new();
+        combined.extend(&l1[..l1.len() - 1]); // drop terminal \n
+        combined.push(b'\n'); // delimiter
+        combined.push(b'\n'); // empty frame
+        combined.extend(&l2); // includes its own terminal \n
+
+        let cursor = Cursor::new(combined);
+        let mut iter = decode_stream(cursor);
+        let first = iter.next().unwrap();
+        assert!(first.is_ok(), "first ok: {first:?}");
+        let second = iter.next().unwrap();
+        assert!(
+            matches!(second, Err(FramingError::EmptyLine)),
+            "second should be EmptyLine: {second:?}"
+        );
+        let third = iter.next().unwrap();
+        assert!(third.is_ok(), "third ok: {third:?}");
+    }
+
+    #[test]
+    fn decode_rejects_response_with_result_and_error() {
+        let payload =
+            br#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1,"message":"x"}}"#;
+        match decode_line(payload).unwrap_err() {
+            FramingError::InvalidMessageShape { reason } => {
+                assert!(reason.contains("both"), "reason should mention both: {reason}");
+            }
+            other => panic!("expected InvalidMessageShape; got {other}"),
+        }
+    }
+
+    #[test]
+    fn decode_rejects_response_without_result_or_error() {
+        let payload = br#"{"jsonrpc":"2.0","id":1}"#;
+        match decode_line(payload).unwrap_err() {
+            FramingError::InvalidMessageShape { reason } => {
+                assert!(
+                    reason.contains("neither"),
+                    "reason should mention neither: {reason}"
+                );
+            }
+            other => panic!("expected InvalidMessageShape; got {other}"),
+        }
+    }
+
+    #[test]
+    fn encode_rejects_response_with_result_and_error() {
+        let bad = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id: JsonRpcId::Number(1),
+            result: Some(json!({})),
+            error: Some(JsonRpcError {
+                code: -1,
+                message: "x".into(),
+                data: None,
+            }),
+        });
+        match encode_message(&bad).unwrap_err() {
+            FramingError::InvalidMessageShape { reason } => {
+                assert!(reason.contains("both"));
+            }
+            other => panic!("expected InvalidMessageShape; got {other}"),
+        }
+    }
+
+    #[test]
+    fn encode_rejects_response_without_result_or_error() {
+        let bad = JsonRpcMessage::Response(JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id: JsonRpcId::Number(1),
+            result: None,
+            error: None,
+        });
+        match encode_message(&bad).unwrap_err() {
+            FramingError::InvalidMessageShape { reason } => {
+                assert!(reason.contains("neither"));
+            }
+            other => panic!("expected InvalidMessageShape; got {other}"),
+        }
+    }
+
+    #[test]
+    fn serde_deserialize_jsonrpc_message_request_routes_to_request() {
+        // The Round-15 footgun: derived #[serde(untagged)] Deserialize on
+        // JsonRpcMessage was misrouting Request payloads to Response. The
+        // manual Deserialize impl introduced in Round 16 must route via
+        // decode_value so direct serde calls behave identically to
+        // decode_line.
+        let json = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"k":"v"}}"#;
+        let msg: JsonRpcMessage = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(msg, JsonRpcMessage::Request(_)),
+            "expected Request via direct serde; got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn serde_deserialize_jsonrpc_message_response_with_both_fields_fails() {
+        // Direct serde path must also surface the invalid-shape error.
+        let json = r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1,"message":"x"}}"#;
+        assert!(serde_json::from_str::<JsonRpcMessage>(json).is_err());
+    }
+
+    #[test]
+    fn serde_deserialize_jsonrpc_message_response_without_either_field_fails() {
+        let json = r#"{"jsonrpc":"2.0","id":1}"#;
+        assert!(serde_json::from_str::<JsonRpcMessage>(json).is_err());
     }
 
     #[test]
