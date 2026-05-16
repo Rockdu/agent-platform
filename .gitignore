@@ -28,9 +28,9 @@ Thumbs.db
 # Per-machine Claude Code settings (don't share between machines)
 .claude/settings.local.json
 
-# Ephemeral RLCR / skill runtime artifacts (regenerated each run)
-.humanize/skill/
-.humanize/rlcr-state/
+# Humanize local loop state (enforced by humanize plugin hook policy)
+# Plan, ideas, round artifacts, bitlesson all live here as local-only files.
+.humanize/
 
 # Workspaces live OUTSIDE this repo at ~/AgentPlatform/workspaces/
 # (Listed here for clarity even though they're not in the repo tree.)
