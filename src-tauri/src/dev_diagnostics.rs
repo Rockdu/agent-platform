@@ -106,10 +106,48 @@ pub fn workspace_root_for_dev() -> PathBuf {
         .to_path_buf()
 }
 
-/// Tauri command surface — never aborts bootstrap; pure read-only inspection.
+/// Runtime gate that decides whether the dev-diagnostics page applies to
+/// the current build. Per AC-9.2 the negative-test contract is: "production
+/// builds with all sidecars bundled never show this page" — we enforce it
+/// structurally by returning an empty diagnostics list in `Production`,
+/// regardless of what the source-tree paths look like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticRuntime {
+    Dev,
+    Production,
+}
+
+/// Compile-time runtime detection. `cfg!(debug_assertions)` is true for
+/// dev (`cargo build` / `cargo test` / `tauri dev`) and false for
+/// `cargo build --release` / `tauri build` packaged outputs. Acceptable
+/// per Codex's round-13 directive ("if using compile-time gating,
+/// `cfg!(debug_assertions)` is acceptable for this round").
+pub fn current_runtime() -> DiagnosticRuntime {
+    if cfg!(debug_assertions) {
+        DiagnosticRuntime::Dev
+    } else {
+        DiagnosticRuntime::Production
+    }
+}
+
+/// Pure runtime-aware entry point. `Dev` performs the actual scan;
+/// `Production` short-circuits to an empty list so the React shell's
+/// missing-subset filter renders nothing and the dev card disappears.
+pub fn diagnose_for_runtime(
+    workspace_root: &Path,
+    runtime: DiagnosticRuntime,
+) -> Vec<SidecarBinaryDiagnostic> {
+    match runtime {
+        DiagnosticRuntime::Dev => diagnose(workspace_root),
+        DiagnosticRuntime::Production => Vec::new(),
+    }
+}
+
+/// Tauri command surface — never aborts bootstrap; pure read-only inspection
+/// gated by the current runtime mode (no dev card in packaged builds).
 #[tauri::command]
 pub fn dev_diagnostics_status() -> Vec<SidecarBinaryDiagnostic> {
-    diagnose(&workspace_root_for_dev())
+    diagnose_for_runtime(&workspace_root_for_dev(), current_runtime())
 }
 
 #[cfg(test)]
@@ -242,5 +280,73 @@ mod tests {
         assert_eq!(p, serde_json::Value::String("present".into()));
         let m: serde_json::Value = serde_json::to_value(SidecarBinaryStatus::Missing).unwrap();
         assert_eq!(m, serde_json::Value::String("missing".into()));
+    }
+
+    // ----- DiagnosticRuntime gate (AC-9.2 negative path) -----
+
+    #[test]
+    fn current_runtime_in_cargo_test_is_dev() {
+        // `cargo test` always sets debug_assertions, so the gate must
+        // return Dev here. This pins the compile-time signal as the
+        // runtime source of truth.
+        assert_eq!(current_runtime(), DiagnosticRuntime::Dev);
+    }
+
+    #[test]
+    fn diagnose_for_runtime_dev_returns_full_report() {
+        let dir = tmp();
+        let report = diagnose_for_runtime(dir.path(), DiagnosticRuntime::Dev);
+        // Dev mode: same behavior as the unwrapped `diagnose`. Every
+        // registered plugin appears; example-notes is Missing because the
+        // temp dir has no candidate binaries.
+        assert!(!report.is_empty());
+        let example = report
+            .iter()
+            .find(|d| d.plugin_id == REAL_PLUGIN)
+            .expect("example-notes present in Dev report");
+        assert_eq!(example.status, SidecarBinaryStatus::Missing);
+    }
+
+    #[test]
+    fn diagnose_for_runtime_dev_with_present_binary_returns_present() {
+        let dir = tmp();
+        touch(
+            &dir.path()
+                .join("src-tauri/target/debug")
+                .join(REAL_COMMAND_BIN),
+        );
+        let report = diagnose_for_runtime(dir.path(), DiagnosticRuntime::Dev);
+        let example = report
+            .iter()
+            .find(|d| d.plugin_id == REAL_PLUGIN)
+            .unwrap();
+        assert_eq!(example.status, SidecarBinaryStatus::Present);
+    }
+
+    #[test]
+    fn diagnose_for_runtime_production_returns_empty_even_when_files_absent() {
+        let dir = tmp();
+        // Production gate: no dev card no matter what's on disk. This is
+        // AC-9.2's negative test ("production builds with all sidecars
+        // bundled never show this page") — implemented as the simplest
+        // structural guarantee: production yields no diagnostics at all,
+        // so the frontend missing-subset filter renders nothing.
+        let report = diagnose_for_runtime(dir.path(), DiagnosticRuntime::Production);
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn diagnose_for_runtime_production_returns_empty_even_when_files_present() {
+        let dir = tmp();
+        touch(
+            &dir.path()
+                .join("src-tauri/target/debug")
+                .join(REAL_COMMAND_BIN),
+        );
+        // Even with a real binary present at a candidate path, Production
+        // must still return empty — the gate is unconditional, never falls
+        // through to the scan.
+        let report = diagnose_for_runtime(dir.path(), DiagnosticRuntime::Production);
+        assert!(report.is_empty());
     }
 }
