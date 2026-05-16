@@ -11,7 +11,10 @@ mod plugin_sqlite;
 
 use bootstrap::{BootstrapError, BootstrapPaths};
 use dispatcher::MountRegistry;
+use plugin_sqlite::{run_all_plugin_migrations_at_bootstrap, PluginMigrationState};
 use serde::Serialize;
+use tauri::Manager;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// Cached result of the first-run bootstrap. Populated by the setup hook;
@@ -53,6 +56,16 @@ impl From<&BootstrapError> for BootstrapErrorDto {
     }
 }
 
+/// Accessor consumed by `plugin_sqlite::retry_plugin_migration` so it can
+/// reuse the bootstrap-computed `plugins_root` path without re-deriving it.
+/// Returns `None` if bootstrap has not run or failed.
+pub(crate) fn bootstrap_status_plugins_root() -> Option<PathBuf> {
+    BOOTSTRAP_RESULT
+        .get()
+        .and_then(|r| r.as_ref().ok())
+        .map(|p| p.plugins_root.clone())
+}
+
 #[tauri::command]
 fn bootstrap_status() -> Result<BootstrapPaths, BootstrapErrorDto> {
     // OnceLock guarantees the setup hook ran before the frontend mounts and
@@ -78,7 +91,8 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(MountRegistry::new())
-        .setup(|_app| {
+        .manage(PluginMigrationState::new())
+        .setup(|app| {
             let result = bootstrap::ensure_dirs().and_then(|paths| {
                 // Now that the generated plugin registry is available, create
                 // ${APP_DATA}/plugins/<id>/ for each bundled plugin. Reporting
@@ -92,8 +106,16 @@ pub fn run() {
                 tracing::info!(per_plugin = created.len(), "per-plugin dirs ready");
                 Ok(paths)
             });
+            // Per-plugin migrations at startup (AC-9.3): a failing plugin's
+            // migration is recorded in PluginMigrationState; bootstrap itself
+            // never aborts on a per-plugin migration failure. The frontend
+            // gates plugin component mounting on the recorded status.
             match &result {
-                Ok(paths) => tracing::info!(?paths, "bootstrap ok"),
+                Ok(paths) => {
+                    tracing::info!(?paths, "bootstrap ok");
+                    let state = app.state::<PluginMigrationState>();
+                    run_all_plugin_migrations_at_bootstrap(&paths.plugins_root, &state);
+                }
                 Err(err) => tracing::error!(%err, "bootstrap failed"),
             }
             BOOTSTRAP_RESULT.set(result).ok();
@@ -104,6 +126,8 @@ pub fn run() {
             dispatcher::mount_plugin,
             dispatcher::unmount_plugin,
             dispatcher::dispatch_plugin_command,
+            plugin_sqlite::plugin_migration_status,
+            plugin_sqlite::retry_plugin_migration,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -35,10 +35,12 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use fs4::FileExt;
 use regex::Regex;
 use rusqlite::Connection;
+use serde::Serialize;
 
 use crate::generated::plugin_registry::PLUGINS;
 
@@ -74,6 +76,14 @@ pub enum PluginStorageError {
         file: String,
         #[source]
         source: rusqlite::Error,
+    },
+
+    #[error("PLUGIN_STORAGE_ERROR migration_checksum_mismatch: plugin `{plugin_id}` version `{version}` was applied as `{existing_filename}` but the current source is `{new_filename}` or its body changed; refusing to silently skip — fix the file or add a new versioned migration")]
+    MigrationChecksumMismatch {
+        plugin_id: String,
+        version: String,
+        existing_filename: String,
+        new_filename: String,
     },
 }
 
@@ -191,45 +201,73 @@ impl PluginStorage {
         ensure_migrations_table(&conn)?;
 
         let mut applied_now = Vec::new();
-        for (name, path) in discover_migrations(migrations_dir)? {
-            if is_already_applied(&conn, &name)? {
-                continue;
-            }
-            let sql = fs::read_to_string(&path).map_err(|source| PluginStorageError::Io {
+        for (filename, path) in discover_migrations(migrations_dir)? {
+            let version = derive_version(&filename);
+            let bytes = fs::read(&path).map_err(|source| PluginStorageError::Io {
                 context: format!("read migration {}", path.display()),
                 source,
             })?;
-            reject_forbidden_sql(&sql, &self.plugin_id, &name)?;
+            let checksum = checksum_hex(&bytes);
+
+            match lookup_applied(&conn, &version)? {
+                Some(applied) if applied.filename == filename && applied.checksum == checksum => {
+                    // Already applied with identical body — skip silently.
+                    continue;
+                }
+                Some(applied) => {
+                    return Err(PluginStorageError::MigrationChecksumMismatch {
+                        plugin_id: self.plugin_id.clone(),
+                        version,
+                        existing_filename: applied.filename,
+                        new_filename: filename,
+                    });
+                }
+                None => {}
+            }
+
+            let sql = std::str::from_utf8(&bytes).map_err(|err| PluginStorageError::Io {
+                context: format!("decode {} as utf-8", path.display()),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, err),
+            })?;
+            reject_forbidden_sql(sql, &self.plugin_id, &filename)?;
 
             let tx = conn
                 .transaction()
                 .map_err(|source| PluginStorageError::Sqlite {
-                    context: format!("begin tx for {}", name),
+                    context: format!("begin tx for {}", filename),
                     source,
                 })?;
-            if let Err(source) = tx.execute_batch(&sql) {
+            if let Err(source) = tx.execute_batch(sql) {
                 return Err(PluginStorageError::MigrationFailed {
                     plugin_id: self.plugin_id.clone(),
-                    file: name,
+                    file: filename,
                     source,
                 });
             }
             tx.execute(
-                "INSERT INTO _plugin_migrations (name, applied_at) VALUES (?1, datetime('now'))",
-                [&name],
+                "INSERT INTO _plugin_migrations (version, filename, checksum, applied_at) VALUES (?1, ?2, ?3, datetime('now'))",
+                [&version, &filename, &checksum],
             )
             .map_err(|source| PluginStorageError::Sqlite {
-                context: format!("record applied migration {}", name),
+                context: format!("record applied migration {}", filename),
                 source,
             })?;
             tx.commit().map_err(|source| PluginStorageError::Sqlite {
-                context: format!("commit migration {}", name),
+                context: format!("commit migration {}", filename),
                 source,
             })?;
-            applied_now.push(name);
+            applied_now.push(filename);
         }
         Ok(applied_now)
     }
+}
+
+/// Row shape for the `_plugin_migrations` lookup. `version` is the PK; the
+/// dispatcher compares stored `(filename, checksum)` to the on-disk values.
+#[derive(Debug, Clone)]
+struct AppliedMigration {
+    filename: String,
+    checksum: String,
 }
 
 fn lock_path_for(db_path: &Path) -> PathBuf {
@@ -242,9 +280,14 @@ fn lock_path_for(db_path: &Path) -> PathBuf {
 }
 
 fn ensure_migrations_table(conn: &Connection) -> Result<(), PluginStorageError> {
+    // Schema matches `docs/specs/plugin-contract.md` §"Required migration
+    // metadata table" verbatim. `version` is the PK; `(filename, checksum)`
+    // detect mutated files.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS _plugin_migrations (
-            name TEXT PRIMARY KEY,
+            version TEXT PRIMARY KEY,
+            filename TEXT NOT NULL,
+            checksum TEXT NOT NULL,
             applied_at TEXT NOT NULL
         )",
         [],
@@ -256,18 +299,64 @@ fn ensure_migrations_table(conn: &Connection) -> Result<(), PluginStorageError> 
     Ok(())
 }
 
-fn is_already_applied(conn: &Connection, name: &str) -> Result<bool, PluginStorageError> {
-    let count: i64 = conn
+fn lookup_applied(
+    conn: &Connection,
+    version: &str,
+) -> Result<Option<AppliedMigration>, PluginStorageError> {
+    let row = conn
         .query_row(
-            "SELECT COUNT(*) FROM _plugin_migrations WHERE name = ?1",
-            [name],
-            |row| row.get(0),
+            "SELECT filename, checksum FROM _plugin_migrations WHERE version = ?1",
+            [version],
+            |row| {
+                Ok(AppliedMigration {
+                    filename: row.get(0)?,
+                    checksum: row.get(1)?,
+                })
+            },
         )
+        .map(Some)
+        .or_else(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })
         .map_err(|source| PluginStorageError::Sqlite {
-            context: format!("check applied {}", name),
+            context: format!("lookup applied migration version {}", version),
             source,
         })?;
-    Ok(count > 0)
+    Ok(row)
+}
+
+/// Numeric prefix of the filename stem, or the full stem when no numeric
+/// prefix exists. Pure function exposed for tests.
+pub fn derive_version(filename: &str) -> String {
+    let stem = std::path::Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename);
+    let prefix: String = stem.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if prefix.is_empty() {
+        stem.to_string()
+    } else {
+        prefix
+    }
+}
+
+/// SHA-256 hex digest of the migration body bytes. Pure function exposed for
+/// tests.
+pub fn checksum_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    hex_encode(&digest)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(*b >> 4) as usize] as char);
+        out.push(HEX[(*b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn discover_migrations(dir: &Path) -> Result<Vec<(String, PathBuf)>, PluginStorageError> {
@@ -279,7 +368,11 @@ fn discover_migrations(dir: &Path) -> Result<Vec<(String, PathBuf)>, PluginStora
         context: format!("read_dir {}", dir.display()),
         source,
     })?;
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|source| PluginStorageError::Io {
+            context: format!("iterate {}", dir.display()),
+            source,
+        })?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("sql") {
             continue;
@@ -341,6 +434,208 @@ where
         out.insert(plugin.plugin_id.to_string(), result);
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Host-side migration status (AC-9.3)
+// ---------------------------------------------------------------------------
+
+/// Wire shape returned to the frontend for each plugin's most recent
+/// migration outcome. Frontend renders the `Error` arm as a Chinese
+/// retry panel and gates plugin-component mounting on `Ok`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PluginMigrationStatus {
+    #[serde(rename = "ok")]
+    Ok { applied: Vec<String> },
+    #[serde(rename = "error")]
+    Error {
+        error_kind: String,
+        file: Option<String>,
+        message: String,
+    },
+}
+
+impl PluginMigrationStatus {
+    pub fn from_storage_result(result: Result<Vec<String>, PluginStorageError>) -> Self {
+        match result {
+            Ok(applied) => Self::Ok { applied },
+            Err(err) => Self::from_error(&err),
+        }
+    }
+
+    pub fn from_error(err: &PluginStorageError) -> Self {
+        let (kind, file) = match err {
+            PluginStorageError::UnknownPlugin { .. } => ("unknown_plugin", None),
+            PluginStorageError::Io { .. } => ("io", None),
+            PluginStorageError::Sqlite { .. } => ("sqlite", None),
+            PluginStorageError::ForbiddenSql { file, .. } => ("forbidden_sql", Some(file.clone())),
+            PluginStorageError::MigrationFailed { file, .. } => {
+                ("migration_failed", Some(file.clone()))
+            }
+            PluginStorageError::MigrationChecksumMismatch {
+                new_filename, ..
+            } => ("migration_checksum_mismatch", Some(new_filename.clone())),
+        };
+        Self::Error {
+            error_kind: kind.into(),
+            file,
+            message: err.to_string(),
+        }
+    }
+}
+
+/// Tauri-managed host state holding the latest migration status per plugin.
+#[derive(Debug, Default)]
+pub struct PluginMigrationState {
+    by_plugin: Mutex<HashMap<String, PluginMigrationStatus>>,
+}
+
+impl PluginMigrationState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(
+        &self,
+        plugin_id: &str,
+        result: Result<Vec<String>, PluginStorageError>,
+    ) -> PluginMigrationStatus {
+        let status = PluginMigrationStatus::from_storage_result(result);
+        let mut guard = self.by_plugin.lock().expect("PluginMigrationState poisoned");
+        guard.insert(plugin_id.to_string(), status.clone());
+        status
+    }
+
+    pub fn snapshot(&self) -> HashMap<String, PluginMigrationStatus> {
+        self.by_plugin
+            .lock()
+            .expect("PluginMigrationState poisoned")
+            .clone()
+    }
+
+    pub fn status(&self, plugin_id: &str) -> Option<PluginMigrationStatus> {
+        self.by_plugin
+            .lock()
+            .expect("PluginMigrationState poisoned")
+            .get(plugin_id)
+            .cloned()
+    }
+}
+
+/// Resolve a plugin's migrations directory from the dev checkout. The result
+/// is `<workspace>/plugins/<plugin_id>/<manifest_migrations_path>` where
+/// `<workspace>` is the project root inferred from this crate's manifest dir.
+///
+/// Packaged builds will need a different resolver (bundled-resource path);
+/// that lands alongside task11 sidecar wiring.
+pub fn resolve_workspace_migrations_dir(plugin_id: &str, manifest_migrations_path: &str) -> PathBuf {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("src-tauri crate has a parent workspace dir");
+    workspace_root
+        .join("plugins")
+        .join(plugin_id)
+        .join(manifest_migrations_path)
+}
+
+/// Bootstrap-time helper: runs migrations for every registered plugin and
+/// records the per-plugin outcome in `state`. Logs each outcome with
+/// structured fields; never panics, never returns an error.
+pub fn run_all_plugin_migrations_at_bootstrap(
+    plugins_root: &Path,
+    state: &PluginMigrationState,
+) {
+    for plugin in PLUGINS {
+        let storage_result =
+            PluginStorage::open(plugins_root, plugin.plugin_id).and_then(|storage| {
+                let migrations_dir =
+                    resolve_workspace_migrations_dir(plugin.plugin_id, plugin.migrations_path);
+                storage.run_migrations(&migrations_dir)
+            });
+
+        let status = state.record(plugin.plugin_id, storage_result);
+        match &status {
+            PluginMigrationStatus::Ok { applied } => {
+                tracing::info!(
+                    plugin_id = %plugin.plugin_id,
+                    applied_count = applied.len(),
+                    "plugin migrations applied"
+                );
+            }
+            PluginMigrationStatus::Error {
+                error_kind,
+                file,
+                message,
+            } => {
+                tracing::error!(
+                    plugin_id = %plugin.plugin_id,
+                    error_kind = %error_kind,
+                    file = file.as_deref().unwrap_or(""),
+                    message = %message,
+                    "plugin migrations failed"
+                );
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub fn plugin_migration_status(
+    state: tauri::State<'_, PluginMigrationState>,
+) -> HashMap<String, PluginMigrationStatus> {
+    state.snapshot()
+}
+
+#[tauri::command]
+pub fn retry_plugin_migration(
+    plugin_id: String,
+    state: tauri::State<'_, PluginMigrationState>,
+) -> Result<PluginMigrationStatus, PluginMigrationStatus> {
+    let plugin = match PLUGINS.iter().find(|p| p.plugin_id == plugin_id) {
+        Some(p) => p,
+        None => {
+            // Cannot retry an unregistered plugin; surface it via the same
+            // typed wire shape the frontend already handles.
+            let err = PluginStorageError::UnknownPlugin {
+                plugin_id: plugin_id.clone(),
+            };
+            let status = state.record(&plugin_id, Err(err));
+            return Err(status);
+        }
+    };
+
+    // The plugins_root path is the same one bootstrap computed; we recover it
+    // through the bootstrap cache (already stored as a Tauri-managed state in
+    // lib.rs). To keep this module dependency-light we re-derive via the
+    // BootstrapPaths exposed through Tauri state at retry time.
+    //
+    // The lookup is wired in `lib.rs` where both `BootstrapPaths` and
+    // `PluginMigrationState` are managed.
+    let plugins_root = match crate::bootstrap_status_plugins_root() {
+        Some(path) => path,
+        None => {
+            let err = PluginStorageError::Io {
+                context: "bootstrap paths unavailable".into(),
+                source: std::io::Error::other("bootstrap not run"),
+            };
+            let status = PluginMigrationStatus::from_error(&err);
+            state.record(&plugin_id, Err(err));
+            return Err(status);
+        }
+    };
+
+    let storage_result = PluginStorage::open(&plugins_root, plugin.plugin_id).and_then(|storage| {
+        let migrations_dir =
+            resolve_workspace_migrations_dir(plugin.plugin_id, plugin.migrations_path);
+        storage.run_migrations(&migrations_dir)
+    });
+
+    let status = state.record(plugin.plugin_id, storage_result);
+    match status {
+        PluginMigrationStatus::Ok { .. } => Ok(status),
+        PluginMigrationStatus::Error { .. } => Err(status),
+    }
 }
 
 #[cfg(test)]
@@ -448,16 +743,23 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "table {table} should exist");
         }
-        // _plugin_migrations rows preserve apply order.
+        // _plugin_migrations rows preserve apply order, keyed by version.
         let mut stmt = conn
-            .prepare("SELECT name FROM _plugin_migrations ORDER BY applied_at, name")
+            .prepare("SELECT version, filename FROM _plugin_migrations ORDER BY version")
             .unwrap();
-        let names: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(0))
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
-        assert_eq!(names, vec!["0001_a.sql", "0002_b.sql", "0003_z.sql"]);
+        assert_eq!(
+            rows,
+            vec![
+                ("0001".to_string(), "0001_a.sql".to_string()),
+                ("0002".to_string(), "0002_b.sql".to_string()),
+                ("0003".to_string(), "0003_z.sql".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -483,14 +785,16 @@ mod tests {
         storage.run_migrations(&migrations).unwrap();
 
         let conn = storage.connect().unwrap();
-        let n: i64 = conn
+        let (version, filename, checksum): (String, String, String) = conn
             .query_row(
-                "SELECT COUNT(*) FROM _plugin_migrations WHERE name = ?1",
-                ["0001_init.sql"],
-                |r| r.get(0),
+                "SELECT version, filename, checksum FROM _plugin_migrations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(version, "0001");
+        assert_eq!(filename, "0001_init.sql");
+        assert_eq!(checksum.len(), 64, "sha256 hex is 64 chars: {checksum}");
     }
 
     #[test]
@@ -728,5 +1032,364 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1, "notes table should exist after applying the example-notes migration");
+    }
+
+    // ----- spec-compliant metadata + checksum (Round 8) -----
+
+    #[test]
+    fn derive_version_numeric_prefix() {
+        assert_eq!(derive_version("0001_init.sql"), "0001");
+        assert_eq!(derive_version("0042_add_index.sql"), "0042");
+        assert_eq!(derive_version("init.sql"), "init");
+        assert_eq!(derive_version("v1_legacy.sql"), "v1_legacy");
+    }
+
+    #[test]
+    fn checksum_hex_known_vector() {
+        // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        assert_eq!(
+            checksum_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        assert_eq!(
+            checksum_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn migration_metadata_schema_matches_spec() {
+        let root = tmp_root();
+        let migrations = root.path().join("mig");
+        write_migration(&migrations, "0001_init.sql", "CREATE TABLE t (id INTEGER);");
+        let storage = PluginStorage::open(root.path(), REAL_PLUGIN).unwrap();
+        storage.run_migrations(&migrations).unwrap();
+
+        let conn = storage.connect().unwrap();
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(_plugin_migrations)")
+            .unwrap();
+        let cols: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            cols,
+            vec![
+                ("version".to_string(), "TEXT".to_string()),
+                ("filename".to_string(), "TEXT".to_string()),
+                ("checksum".to_string(), "TEXT".to_string()),
+                ("applied_at".to_string(), "TEXT".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn same_file_same_checksum_skipped_idempotent() {
+        let root = tmp_root();
+        let migrations = root.path().join("mig");
+        write_migration(&migrations, "0001_init.sql", "CREATE TABLE t (id INTEGER);");
+        let storage = PluginStorage::open(root.path(), REAL_PLUGIN).unwrap();
+
+        let first = storage.run_migrations(&migrations).unwrap();
+        let second = storage.run_migrations(&migrations).unwrap();
+        assert_eq!(first, vec!["0001_init.sql"]);
+        assert!(second.is_empty());
+
+        // Exactly one row in _plugin_migrations.
+        let conn = storage.connect().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _plugin_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn same_file_modified_returns_checksum_mismatch() {
+        let root = tmp_root();
+        let migrations = root.path().join("mig");
+        let storage = PluginStorage::open(root.path(), REAL_PLUGIN).unwrap();
+
+        write_migration(&migrations, "0001_init.sql", "CREATE TABLE t (id INTEGER);");
+        storage.run_migrations(&migrations).unwrap();
+
+        // Rewrite the same filename with different body — common authoring
+        // mistake; must fail loudly.
+        write_migration(
+            &migrations,
+            "0001_init.sql",
+            "CREATE TABLE t (id INTEGER, extra TEXT);",
+        );
+        let err = storage.run_migrations(&migrations).unwrap_err();
+        match err {
+            PluginStorageError::MigrationChecksumMismatch {
+                plugin_id,
+                version,
+                existing_filename,
+                new_filename,
+            } => {
+                assert_eq!(plugin_id, REAL_PLUGIN);
+                assert_eq!(version, "0001");
+                assert_eq!(existing_filename, "0001_init.sql");
+                assert_eq!(new_filename, "0001_init.sql");
+            }
+            other => panic!("expected MigrationChecksumMismatch; got {other}"),
+        }
+    }
+
+    #[test]
+    fn renamed_file_with_same_version_returns_checksum_mismatch() {
+        let root = tmp_root();
+        let migrations = root.path().join("mig");
+        let storage = PluginStorage::open(root.path(), REAL_PLUGIN).unwrap();
+
+        write_migration(&migrations, "0001_init.sql", "CREATE TABLE t (id INTEGER);");
+        storage.run_migrations(&migrations).unwrap();
+
+        // Remove the original; place a different file with the same version
+        // prefix.
+        fs::remove_file(migrations.join("0001_init.sql")).unwrap();
+        write_migration(&migrations, "0001_init_v2.sql", "CREATE TABLE t (id INTEGER);");
+        let err = storage.run_migrations(&migrations).unwrap_err();
+        match err {
+            PluginStorageError::MigrationChecksumMismatch {
+                version,
+                existing_filename,
+                new_filename,
+                ..
+            } => {
+                assert_eq!(version, "0001");
+                assert_eq!(existing_filename, "0001_init.sql");
+                assert_eq!(new_filename, "0001_init_v2.sql");
+            }
+            other => panic!("expected MigrationChecksumMismatch; got {other}"),
+        }
+    }
+
+    #[test]
+    fn discover_migrations_propagates_read_dir_error() {
+        // Point at a regular file (not a directory) — `fs::read_dir` returns
+        // an Io error. Previously `entries.flatten()` would have swallowed
+        // any per-entry errors; this test pins the propagation contract on
+        // the directory-open path.
+        let root = tmp_root();
+        let not_a_dir = root.path().join("regular_file");
+        fs::write(&not_a_dir, "i am a file, not a dir").unwrap();
+        let err = discover_migrations(&not_a_dir).unwrap_err();
+        match err {
+            PluginStorageError::Io { context, .. } => {
+                assert!(
+                    context.contains("read_dir"),
+                    "context should describe read_dir failure: {context}"
+                );
+            }
+            other => panic!("expected Io; got {other}"),
+        }
+    }
+
+    // ----- AC-1.3 concurrent read/write stress -----
+
+    #[test]
+    fn concurrent_readers_writers_under_wal_busy_timeout() {
+        // Models the N×M sibling-sidecar contention case: multiple independent
+        // connections on the same plugin DB performing interleaved insert +
+        // select operations. WAL + busy_timeout=5000 must keep all operations
+        // moving without `SQLITE_BUSY` / `database is locked` errors.
+        let root = tmp_root();
+        let migrations = root.path().join("mig");
+        write_migration(
+            &migrations,
+            "0001_init.sql",
+            "CREATE TABLE rw_stress (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);",
+        );
+        let storage = PluginStorage::open(root.path(), REAL_PLUGIN).unwrap();
+        storage.run_migrations(&migrations).unwrap();
+
+        const THREADS: usize = 4;
+        const OPS_PER_THREAD: usize = 25; // 4 * 25 = 100 inserts (+ 100 selects)
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let root_path = root.path().to_path_buf();
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let root_path = root_path.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || -> Result<usize, String> {
+                    let storage = PluginStorage::open(&root_path, REAL_PLUGIN)
+                        .map_err(|e| format!("open: {e}"))?;
+                    let conn = storage.connect().map_err(|e| format!("connect: {e}"))?;
+                    barrier.wait();
+                    for i in 0..OPS_PER_THREAD {
+                        conn.execute(
+                            "INSERT INTO rw_stress (val) VALUES (?1)",
+                            [&format!("thread {tid} iter {i}")],
+                        )
+                        .map_err(|e| format!("insert thread {tid} iter {i}: {e}"))?;
+                        let _: i64 = conn
+                            .query_row("SELECT COUNT(*) FROM rw_stress", [], |r| r.get(0))
+                            .map_err(|e| format!("select thread {tid} iter {i}: {e}"))?;
+                    }
+                    Ok(OPS_PER_THREAD)
+                })
+            })
+            .collect();
+
+        let mut total_ops = 0usize;
+        for h in handles {
+            let n = h.join().expect("no panic").expect("no SQLITE_BUSY");
+            total_ops += n;
+        }
+        assert_eq!(total_ops, THREADS * OPS_PER_THREAD);
+
+        // Sibling-final assertion: every insert reached the table.
+        let storage = PluginStorage::open(root.path(), REAL_PLUGIN).unwrap();
+        let conn = storage.connect().unwrap();
+        let final_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM rw_stress", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(final_count as usize, THREADS * OPS_PER_THREAD);
+    }
+
+    // ----- PluginMigrationState (AC-9.3) -----
+
+    fn ok_status(applied: &[&str]) -> Result<Vec<String>, PluginStorageError> {
+        Ok(applied.iter().map(|s| (*s).to_string()).collect())
+    }
+    fn err_status() -> Result<Vec<String>, PluginStorageError> {
+        Err(PluginStorageError::MigrationFailed {
+            plugin_id: REAL_PLUGIN.into(),
+            file: "0001_bad.sql".into(),
+            source: rusqlite::Error::QueryReturnedNoRows,
+        })
+    }
+
+    #[test]
+    fn migration_state_records_ok_and_error() {
+        let state = PluginMigrationState::new();
+        state.record("plugin-a", ok_status(&["0001_init.sql"]));
+        state.record("plugin-b", err_status());
+        let snap = state.snapshot();
+        assert!(matches!(
+            snap.get("plugin-a"),
+            Some(PluginMigrationStatus::Ok { applied }) if applied == &vec!["0001_init.sql".to_string()]
+        ));
+        assert!(matches!(
+            snap.get("plugin-b"),
+            Some(PluginMigrationStatus::Error { error_kind, .. }) if error_kind == "migration_failed"
+        ));
+    }
+
+    #[test]
+    fn migration_state_one_plugin_failure_does_not_hide_other() {
+        let state = PluginMigrationState::new();
+        state.record("plugin-a", ok_status(&["0001_init.sql"]));
+        state.record("plugin-b", err_status());
+        let a = state.status("plugin-a").expect("plugin-a present");
+        let b = state.status("plugin-b").expect("plugin-b present");
+        assert!(matches!(a, PluginMigrationStatus::Ok { .. }));
+        assert!(matches!(b, PluginMigrationStatus::Error { .. }));
+    }
+
+    #[test]
+    fn migration_state_retry_overwrites_status() {
+        let state = PluginMigrationState::new();
+        state.record(REAL_PLUGIN, err_status());
+        assert!(matches!(
+            state.status(REAL_PLUGIN),
+            Some(PluginMigrationStatus::Error { .. })
+        ));
+        state.record(REAL_PLUGIN, ok_status(&["0001_init.sql"]));
+        match state.status(REAL_PLUGIN).expect("present") {
+            PluginMigrationStatus::Ok { applied } => {
+                assert_eq!(applied, vec!["0001_init.sql".to_string()]);
+            }
+            other => panic!("expected Ok; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_migration_status_from_storage_error_covers_every_variant() {
+        let cases: Vec<(PluginStorageError, &str)> = vec![
+            (
+                PluginStorageError::UnknownPlugin {
+                    plugin_id: "x".into(),
+                },
+                "unknown_plugin",
+            ),
+            (
+                PluginStorageError::Io {
+                    context: "ctx".into(),
+                    source: std::io::Error::other("boom"),
+                },
+                "io",
+            ),
+            (
+                PluginStorageError::Sqlite {
+                    context: "ctx".into(),
+                    source: rusqlite::Error::QueryReturnedNoRows,
+                },
+                "sqlite",
+            ),
+            (
+                PluginStorageError::ForbiddenSql {
+                    plugin_id: "p".into(),
+                    file: "f.sql".into(),
+                },
+                "forbidden_sql",
+            ),
+            (
+                PluginStorageError::MigrationFailed {
+                    plugin_id: "p".into(),
+                    file: "f.sql".into(),
+                    source: rusqlite::Error::QueryReturnedNoRows,
+                },
+                "migration_failed",
+            ),
+            (
+                PluginStorageError::MigrationChecksumMismatch {
+                    plugin_id: "p".into(),
+                    version: "0001".into(),
+                    existing_filename: "0001_a.sql".into(),
+                    new_filename: "0001_b.sql".into(),
+                },
+                "migration_checksum_mismatch",
+            ),
+        ];
+        for (err, expected_kind) in cases {
+            let status = PluginMigrationStatus::from_error(&err);
+            match status {
+                PluginMigrationStatus::Error { error_kind, .. } => {
+                    assert_eq!(error_kind, expected_kind);
+                }
+                _ => panic!("expected Error variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn run_all_plugin_migrations_at_bootstrap_populates_state_for_every_registered_plugin() {
+        let root = tmp_root();
+        let state = PluginMigrationState::new();
+        run_all_plugin_migrations_at_bootstrap(root.path(), &state);
+        let snap = state.snapshot();
+        for plugin in PLUGINS {
+            assert!(
+                snap.contains_key(plugin.plugin_id),
+                "missing state entry for {}",
+                plugin.plugin_id
+            );
+        }
+        // For example-notes the bundled migration is valid: status must be Ok.
+        match snap.get(REAL_PLUGIN).expect("example-notes present") {
+            PluginMigrationStatus::Ok { applied } => {
+                assert!(
+                    applied.contains(&"0001_init.sql".to_string()),
+                    "bundled example-notes migration should be applied: {applied:?}"
+                );
+            }
+            other => panic!("expected Ok for example-notes; got {other:?}"),
+        }
     }
 }

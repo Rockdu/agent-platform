@@ -1,6 +1,10 @@
-import { Suspense, lazy, useEffect, useMemo, useState, type ComponentType, type LazyExoticComponent } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState, type ComponentType, type LazyExoticComponent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { PLUGIN_TABS, type PluginTabEntry } from "./generated/plugin-tabs";
+import type {
+  PluginMigrationStatus,
+  PluginMigrationStatusMap,
+} from "./migration-status";
 import "./App.css";
 
 // Mirrors src-tauri/src/bootstrap.rs::BootstrapPaths
@@ -60,6 +64,37 @@ function lazyForPlugin(entry: PluginTabEntry): LazyExoticComponent<ComponentType
 export default function App() {
   const [active, setActive] = useState<ActiveTab>({ kind: "host", id: "orchestrator" });
   const [bootstrap, setBootstrap] = useState<BootstrapState>({ kind: "loading" });
+  const [migrationStatus, setMigrationStatus] = useState<PluginMigrationStatusMap>({});
+
+  const refreshMigrationStatus = useCallback(async () => {
+    try {
+      const map = await invoke<PluginMigrationStatusMap>("plugin_migration_status");
+      setMigrationStatus(map);
+    } catch {
+      // First-launch race: bootstrap may not have set the state yet; the
+      // map stays empty and plugin tabs render normally.
+      setMigrationStatus({});
+    }
+  }, []);
+
+  const retryMigration = useCallback(
+    async (pluginId: string) => {
+      try {
+        const status = await invoke<PluginMigrationStatus>("retry_plugin_migration", {
+          pluginId,
+        });
+        setMigrationStatus((prev) => ({ ...prev, [pluginId]: status }));
+      } catch (err) {
+        // Tauri-typed `Err` arms cross the boundary as throws; the payload
+        // is the same `PluginMigrationStatus` shape so the panel updates
+        // uniformly with the latest failure.
+        if (isMigrationStatus(err)) {
+          setMigrationStatus((prev) => ({ ...prev, [pluginId]: err }));
+        }
+      }
+    },
+    [],
+  );
 
   // Hide a placeholder if a real plugin label contains the placeholder's
   // keyword (suppress duplicates when MVP plugins start shipping as
@@ -74,7 +109,12 @@ export default function App() {
 
   useEffect(() => {
     invoke<BootstrapPaths>("bootstrap_status")
-      .then((paths) => setBootstrap({ kind: "ok", paths }))
+      .then((paths) => {
+        setBootstrap({ kind: "ok", paths });
+        // Bootstrap success means the setup hook has already kicked off
+        // per-plugin migrations; fetch the resulting status map.
+        return refreshMigrationStatus();
+      })
       .catch((err: unknown) => {
         if (isBootstrapErrorDto(err)) {
           setBootstrap({ kind: "error", error: err });
@@ -89,7 +129,7 @@ export default function App() {
           });
         }
       });
-  }, []);
+  }, [refreshMigrationStatus]);
 
   return (
     <div className="app">
@@ -126,7 +166,12 @@ export default function App() {
       <main className="tab-body">
         {active.kind === "host" && <OrchestratorPlaceholder />}
         {active.kind === "plugin" && (
-          <PluginBody pluginId={active.pluginId} registryEntry={lookupPlugin(active.pluginId)} />
+          <PluginBody
+            pluginId={active.pluginId}
+            registryEntry={lookupPlugin(active.pluginId)}
+            migrationStatus={migrationStatus[active.pluginId]}
+            onRetryMigration={retryMigration}
+          />
         )}
       </main>
 
@@ -143,6 +188,19 @@ function isBootstrapErrorDto(value: unknown): value is BootstrapErrorDto {
     "message" in value &&
     typeof (value as { kind: unknown }).kind === "string"
   );
+}
+
+function isMigrationStatus(value: unknown): value is PluginMigrationStatus {
+  if (typeof value !== "object" || value === null) return false;
+  const tag = (value as { kind?: unknown }).kind;
+  if (tag === "ok") return Array.isArray((value as { applied?: unknown }).applied);
+  if (tag === "error") {
+    return (
+      typeof (value as { errorKind?: unknown }).errorKind === "string" &&
+      typeof (value as { message?: unknown }).message === "string"
+    );
+  }
+  return false;
 }
 
 function lookupPlugin(pluginId: string): PluginTabEntry | undefined {
@@ -188,9 +246,13 @@ function OrchestratorPlaceholder() {
 function PluginBody({
   pluginId,
   registryEntry,
+  migrationStatus,
+  onRetryMigration,
 }: {
   pluginId: string;
   registryEntry: PluginTabEntry | undefined;
+  migrationStatus: PluginMigrationStatus | undefined;
+  onRetryMigration: (pluginId: string) => void;
 }) {
   if (!registryEntry) {
     // Static placeholder (MVP plugin not yet packaged as a manifest).
@@ -200,6 +262,18 @@ function PluginBody({
         <h2>{label}</h2>
         <p>插件占位。等该插件以 <code>plugin.toml</code> 形式落地后此面板将由生成的 wrapper 替换。</p>
       </section>
+    );
+  }
+  // AC-9.3: failed migration blocks plugin component mounting; show the
+  // typed error + retry button instead.
+  if (migrationStatus && migrationStatus.kind === "error") {
+    return (
+      <MigrationFailurePanel
+        pluginId={registryEntry.pluginId}
+        label={registryEntry.label}
+        status={migrationStatus}
+        onRetry={onRetryMigration}
+      />
     );
   }
   const LazyComponent = lazyForPlugin(registryEntry);
@@ -214,6 +288,50 @@ function PluginBody({
     >
       <LazyComponent />
     </Suspense>
+  );
+}
+
+function MigrationFailurePanel({
+  pluginId,
+  label,
+  status,
+  onRetry,
+}: {
+  pluginId: string;
+  label: string;
+  status: Extract<PluginMigrationStatus, { kind: "error" }>;
+  onRetry: (pluginId: string) => void;
+}) {
+  return (
+    <section
+      className="placeholder placeholder--error"
+      role="alert"
+      data-plugin-id={pluginId}
+    >
+      <h2>{label} · 迁移失败</h2>
+      <dl>
+        <dt>错误类型</dt>
+        <dd>
+          <code>{status.errorKind}</code>
+        </dd>
+        {status.file && (
+          <>
+            <dt>文件</dt>
+            <dd>
+              <code>{status.file}</code>
+            </dd>
+          </>
+        )}
+        <dt>消息</dt>
+        <dd>{status.message}</dd>
+      </dl>
+      <p>
+        该插件的 SQLite 迁移未成功，组件已被阻止挂载以避免对未就绪 schema 进行读写。
+      </p>
+      <button type="button" onClick={() => onRetry(pluginId)}>
+        重试迁移
+      </button>
+    </section>
   );
 }
 
