@@ -1,0 +1,14 @@
+# Example plugin manifest used to exercise the build.rs codegen pipeline.
+# Round 1 only requires the manifest to parse + appear in generated output.
+# The Rust adapter crate + frontend directory land in later rounds when this
+# plugin becomes a real implementation (or is replaced by an MVP plugin).
+
+name = "Notes"
+version = "0.0.1"
+type = "tab"
+command_bin = "notes-plugin"
+frontend = "frontend/index.tsx"
+permissions = ["notify"]
+required_apis = ["invoke", "listen"]
+db_namespace = "notes"
+migrations_path = "migrations/"

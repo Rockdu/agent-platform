@@ -4,22 +4,64 @@
 //! the mobile entry point both call `run()`.
 
 mod bootstrap;
+mod generated;
 
 use bootstrap::{BootstrapError, BootstrapPaths};
+use serde::Serialize;
 use std::sync::OnceLock;
 
 /// Cached result of the first-run bootstrap. Populated by the setup hook;
 /// consumed by the `bootstrap_status` Tauri command.
 static BOOTSTRAP_RESULT: OnceLock<Result<BootstrapPaths, BootstrapError>> = OnceLock::new();
 
+/// Serializable shape returned to the frontend on bootstrap failure. Preserves
+/// the variant tag and offending path (when applicable) so the UI can render
+/// them structurally instead of regex-matching a stringified message.
+#[derive(Debug, Clone, Serialize)]
+pub struct BootstrapErrorDto {
+    /// Discriminant: "no_home_dir" | "no_app_data_dir" | "create_dir" | "not_run".
+    pub kind: String,
+    /// Offending path for filesystem errors; `None` for env-lookup failures.
+    pub path: Option<String>,
+    /// Human-readable message (from `thiserror`); the frontend translates if needed.
+    pub message: String,
+}
+
+impl From<&BootstrapError> for BootstrapErrorDto {
+    fn from(err: &BootstrapError) -> Self {
+        match err {
+            BootstrapError::NoHomeDir => Self {
+                kind: "no_home_dir".into(),
+                path: None,
+                message: err.to_string(),
+            },
+            BootstrapError::NoAppDataDir => Self {
+                kind: "no_app_data_dir".into(),
+                path: None,
+                message: err.to_string(),
+            },
+            BootstrapError::CreateDir { path, .. } => Self {
+                kind: "create_dir".into(),
+                path: Some(path.display().to_string()),
+                message: err.to_string(),
+            },
+        }
+    }
+}
+
 #[tauri::command]
-fn bootstrap_status() -> Result<BootstrapPaths, String> {
+fn bootstrap_status() -> Result<BootstrapPaths, BootstrapErrorDto> {
     // OnceLock guarantees the setup hook ran before the frontend mounts and
-    // calls this command. If somehow it didn't, surface an explicit message.
+    // calls this command. If somehow it didn't, surface an explicit DTO with
+    // a "not_run" kind so the UI still gets a structured shape.
     match BOOTSTRAP_RESULT.get() {
         Some(Ok(paths)) => Ok(paths.clone()),
-        Some(Err(err)) => Err(err.to_string()),
-        None => Err("bootstrap has not run".to_string()),
+        Some(Err(err)) => Err(BootstrapErrorDto::from(err)),
+        None => Err(BootstrapErrorDto {
+            kind: "not_run".into(),
+            path: None,
+            message: "bootstrap has not run".into(),
+        }),
     }
 }
 

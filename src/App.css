@@ -136,3 +136,44 @@
   margin-top: 8px;
   color: #888;
 }
+
+/* Plugin meta panel in plugin tab body */
+.plugin-meta {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  column-gap: 16px;
+  row-gap: 4px;
+  margin: 12px 0;
+}
+
+.plugin-meta dt {
+  color: #777;
+  font-size: 12px;
+}
+
+.plugin-meta dd {
+  margin: 0;
+  color: #222;
+  font-size: 13px;
+}
+
+/* Bootstrap error card structured fields */
+.bootstrap-card--error dl {
+  display: grid;
+  grid-template-columns: 80px 1fr;
+  column-gap: 16px;
+  row-gap: 2px;
+  margin: 0;
+}
+
+.bootstrap-card--error dt {
+  color: #8a3a3a;
+  font-size: 12px;
+}
+
+.bootstrap-card--error dd {
+  margin: 0;
+  color: #5a1818;
+  font-size: 12px;
+  word-break: break-all;
+}

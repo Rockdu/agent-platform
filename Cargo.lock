@@ -13,13 +13,16 @@ name = "agent-platform"
 version = "0.0.1"
 dependencies = [
  "directories",
+ "heck 0.5.0",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "thiserror 2.0.18",
+ "toml 0.8.2",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
 ]
 
 [[package]]
