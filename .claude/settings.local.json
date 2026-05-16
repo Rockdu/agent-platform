@@ -1,6 +1,6 @@
 {
   "env": {
-    "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/rockdu/.local/bin",
+    "PATH": "/Users/rockdu/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/rockdu/.local/bin",
     "CLAUDE_PROJECT_DIR": "/Users/rockdu/claude_workspace"
   },
   "permissions": {

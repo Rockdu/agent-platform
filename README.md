@@ -4,8 +4,9 @@ A Tauri v2 desktop app for personal information + agent terminal management.
 
 **Current state**: planning phase. Architecture locked via 6 rounds of clarification on 2026-05-16; MVP implementation begins under the RLCR loop.
 
-- Architecture & MVP plan: [`.humanize/plans/plan.md`](.humanize/plans/plan.md)
-- Idea draft (v2): [`.humanize/ideas/idea-2026-05-16-v2.md`](.humanize/ideas/idea-2026-05-16-v2.md)
+- Architecture & MVP plan: [`docs/plan.md`](docs/plan.md)
+- Plugin specs (produced by Codex during Round 2): [`docs/specs/`](docs/specs/)
+- Idea draft (v2, local-only — `.humanize/` is gitignored per humanize plugin policy): `.humanize/ideas/idea-2026-05-16-v2.md`
 
 ## High-level shape
 
