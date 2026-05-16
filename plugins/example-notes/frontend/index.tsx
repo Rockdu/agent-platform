@@ -52,7 +52,7 @@ export default function NotesPanel() {
         </dd>
         <dt>handle 前缀</dt>
         <dd>
-          <code>{handleEnvelopePrefix}.…</code>
+          <code>{handleEnvelopePrefix}</code>
         </dd>
         <dt>generation</dt>
         <dd>
