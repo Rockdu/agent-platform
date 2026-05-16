@@ -7,6 +7,7 @@ mod bootstrap;
 mod dispatcher;
 mod generated;
 mod logging;
+mod plugin_sqlite;
 
 use bootstrap::{BootstrapError, BootstrapPaths};
 use dispatcher::MountRegistry;
