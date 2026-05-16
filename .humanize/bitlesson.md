@@ -30,4 +30,14 @@ Constraints: settings.local.json env changes take effect at next session/turn st
 Validation Evidence: Pre-fix: `which codex` returns "not found", stop-hook errors with "Codex CLI Not Found". Post-fix: stop-hook no longer fires that error. Next-session `which codex` resolves to `/opt/homebrew/bin/codex`. The same fix applies for any non-default-PATH tool (node, npm, cargo if installed outside /usr/bin, etc.).
 Source Rounds: 1 (problem surfaced during task1 toolchain check)
 
+## Lesson: codex-stdio-vs-filesystem-tools
+Lesson ID: BL-20260516-codex-output-channel
+Scope: any use of `ask-codex.sh` to produce spec docs or other markdown content
+Problem Description: When `ask-codex.sh` is invoked with a prompt containing phrasing like "Saved verbatim to `path/to/file.md`", codex's CLI tools (which include filesystem write access by default with `--full-auto`/`--sandbox workspace-write`) interpret that phrasing as a directive to write the file itself. Codex then writes the spec content directly to the requested path AND returns only a short summary like `Saved to docs/specs/X.md` in stdout. If the caller then naively `cp .humanize/skill/<id>/output.md $dest`, the destination file is OVERWRITTEN with the short summary, clobbering the real content codex wrote. Symptom: docs/specs/terminal-events.md ended up at 12 lines (a "Saved to..." summary) when the prompt expected a multi-hundred-line spec.
+Root Cause: Codex's CLI runs with workspace-write sandbox by default; its tool surface includes file write. Prompts that read like instructions to save the file are interpreted literally.
+Solution: In codex prompts for spec/doc generation, explicitly instruct: "Output ONLY the markdown content in stdout. Do NOT use any filesystem write tool to save the file yourself — the caller will save your stdout to <path>. No 'Saved to...' summary." Test verification: stdout-length should match expected spec size (hundreds of lines), not a 5-12 line summary. Inverse pattern (let codex write directly, then `cat` it back) is brittle and not recommended; stdout is the safer authoritative channel.
+Constraints: Applies to any `ask-codex.sh` invocation where the agent intends to control where output lands. Not relevant for codex calls that are purely analytical (no spec deliverable).
+Validation Evidence: Round 2 of RLCR loop: tasks 2, 9, 12 had stdout with full content (1341, 422, 509 lines); tasks 14 and 24 returned 12 and 5 lines respectively because codex wrote files directly. Task 14 re-run with explicit "do not use filesystem write tool" produced 563 lines of stdout content as expected.
+Source Rounds: 2
+
 <!-- Add lessons below using the strict template. -->

@@ -1,0 +1,37 @@
+# Build artifacts
+target/
+dist/
+build/
+node_modules/
+
+# Tauri build output
+src-tauri/target/
+
+# Codegen output (regenerated each build per AC-1.2)
+src-tauri/src/generated/
+src/generated/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Per-machine Claude Code settings (don't share between machines)
+.claude/settings.local.json
+
+# NOTE: .humanize/ is intentionally tracked per user policy (2026-05-16).
+# Do NOT add .humanize/ to this gitignore — the user wants planning
+# artifacts, RLCR rounds, bitlesson, and skill outputs all in version
+# control. The humanize plugin's stop hook may complain; that is a known
+# policy conflict; do not silently resolve it by re-untracking.
+
+# Workspaces live OUTSIDE this repo at ~/AgentPlatform/workspaces/.
