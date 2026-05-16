@@ -1,0 +1,138 @@
+.app {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  height: 100vh;
+}
+
+/* Tab strip: orchestrator fixed leftmost with distinct visual treatment */
+.tab-strip {
+  display: flex;
+  align-items: stretch;
+  background: #ffffff;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+  padding: 0 8px;
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 14px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: #444;
+  font-size: 13px;
+  border-bottom: 2px solid transparent;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.tab:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.tab--active {
+  color: #111;
+  border-bottom-color: #0066ff;
+}
+
+/* Orchestrator distinct treatment: fixed leftmost, accent color, badge-like icon */
+.tab--privileged {
+  background: linear-gradient(180deg, rgba(0, 102, 255, 0.08), rgba(0, 102, 255, 0));
+  border-right: 1px solid rgba(0, 0, 0, 0.08);
+  margin-right: 6px;
+  font-weight: 600;
+}
+
+.tab--privileged .tab__icon {
+  color: #0066ff;
+}
+
+.tab--privileged.tab--active {
+  background: linear-gradient(180deg, rgba(0, 102, 255, 0.16), rgba(0, 102, 255, 0));
+}
+
+.tab__icon {
+  font-size: 14px;
+}
+
+/* Tab body */
+.tab-body {
+  overflow: auto;
+  padding: 24px 32px;
+  background: #fafafa;
+}
+
+.placeholder {
+  max-width: 720px;
+  color: #333;
+}
+
+.placeholder h2 {
+  margin: 0 0 12px;
+  font-size: 18px;
+}
+
+.placeholder p {
+  line-height: 1.6;
+  margin: 8px 0;
+}
+
+.placeholder__hint {
+  color: #777;
+  font-size: 13px;
+  margin-top: 12px;
+}
+
+/* Bootstrap debug card at the bottom (Round 0 only; replaced later) */
+.bootstrap-card {
+  border-top: 1px solid rgba(0, 0, 0, 0.08);
+  background: #fff;
+  padding: 12px 20px;
+  font-size: 12px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.bootstrap-card h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: #555;
+}
+
+.bootstrap-card--loading {
+  color: #555;
+}
+
+.bootstrap-card--error {
+  background: #fff4f4;
+  border-top-color: #ff6b6b;
+  color: #6b1818;
+}
+
+.bootstrap-card--ok dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 16px;
+  row-gap: 2px;
+  margin: 0;
+}
+
+.bootstrap-card--ok dt {
+  color: #777;
+}
+
+.bootstrap-card--ok dd {
+  margin: 0;
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  color: #222;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bootstrap-card__hint {
+  margin-top: 8px;
+  color: #888;
+}

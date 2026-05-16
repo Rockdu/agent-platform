@@ -14,6 +14,11 @@ src/generated/
 # Logs
 *.log
 
+# TypeScript incremental + Vite config compiled output (built by `tsc -b`)
+*.tsbuildinfo
+vite.config.d.ts
+vite.config.js
+
 # OS
 .DS_Store
 Thumbs.db
