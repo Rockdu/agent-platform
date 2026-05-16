@@ -2389,6 +2389,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-stdio"
+version = "0.0.1"
+dependencies = [
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
