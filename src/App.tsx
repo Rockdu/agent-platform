@@ -1,5 +1,6 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useState, type ComponentType, type FormEvent, type LazyExoticComponent } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState, type ComponentType, type LazyExoticComponent } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { PLUGIN_TABS, type PluginTabEntry } from "./generated/plugin-tabs";
 import type {
   PluginMigrationStatus,
@@ -327,7 +328,6 @@ function TabButton(props: {
 function OrchestratorPlaceholder() {
   const [status, setStatus] = useState<ClaudeDiscoveryStatus | null>(null);
   const [error, setError] = useState<ClaudeDiscoveryErrorDto | null>(null);
-  const [overrideInput, setOverrideInput] = useState("");
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
@@ -356,24 +356,29 @@ function OrchestratorPlaceholder() {
     }
   }, [refresh]);
 
-  const onSubmitOverride = useCallback(
-    async (event: FormEvent<HTMLFormElement>) => {
-      event.preventDefault();
-      const trimmed = overrideInput.trim();
-      if (!trimmed) return;
-      setBusy(true);
-      try {
-        await setClaudePathOverride(trimmed);
-        await refresh();
-        setOverrideInput("");
-      } catch (err) {
-        if (isClaudeDiscoveryErrorDto(err)) setError(err);
-      } finally {
-        setBusy(false);
-      }
-    },
-    [overrideInput, refresh],
-  );
+  const onPickClaude = useCallback(async () => {
+    setBusy(true);
+    try {
+      const picked = await openFileDialog({
+        multiple: false,
+        directory: false,
+        title: "选择 claude 路径",
+      });
+      // Cancelled picker returns null; leave status unchanged and skip
+      // the backend call so we don't ping claude_set_path_override
+      // with an empty path.
+      if (picked === null) return;
+      const path = Array.isArray(picked) ? picked[0] : picked;
+      if (typeof path !== "string" || path === "") return;
+      setError(null);
+      await setClaudePathOverride(path);
+      await refresh();
+    } catch (err) {
+      if (isClaudeDiscoveryErrorDto(err)) setError(err);
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
 
   if (!status) {
     return (
@@ -403,9 +408,7 @@ function OrchestratorPlaceholder() {
     <ClaudeOnboardingCard
       probed={probed}
       error={error}
-      overrideInput={overrideInput}
-      setOverrideInput={setOverrideInput}
-      onSubmitOverride={onSubmitOverride}
+      onPickClaude={onPickClaude}
       onRedo={onRedo}
       busy={busy}
     />
@@ -444,17 +447,13 @@ function ClaudeReadyFooter({
 function ClaudeOnboardingCard({
   probed,
   error,
-  overrideInput,
-  setOverrideInput,
-  onSubmitOverride,
+  onPickClaude,
   onRedo,
   busy,
 }: {
   probed: string[];
   error: ClaudeDiscoveryErrorDto | null;
-  overrideInput: string;
-  setOverrideInput: (s: string) => void;
-  onSubmitOverride: (e: FormEvent<HTMLFormElement>) => void;
+  onPickClaude: () => void;
   onRedo: () => void;
   busy: boolean;
 }) {
@@ -478,24 +477,14 @@ function ClaudeOnboardingCard({
         ))}
       </ul>
       <p>你可以选择 claude 可执行文件，或安装 Claude Code 后重试。</p>
-      <form onSubmit={onSubmitOverride} className="claude-discovery__override">
-        <label>
+      <div className="claude-discovery__actions">
+        <button type="button" onClick={onPickClaude} disabled={busy}>
           选择 claude 路径
-          <input
-            type="text"
-            placeholder="/usr/local/bin/claude"
-            value={overrideInput}
-            onChange={(e) => setOverrideInput(e.target.value)}
-            spellCheck={false}
-          />
-        </label>
-        <button type="submit" disabled={busy || overrideInput.trim() === ""}>
-          提交
         </button>
-      </form>
-      <button type="button" onClick={onRedo} disabled={busy}>
-        重新查找
-      </button>
+        <button type="button" onClick={onRedo} disabled={busy}>
+          重新查找
+        </button>
+      </div>
       {error && (
         <p className="bootstrap-card__hint" data-claude-discovery-error={error.kind}>
           错误：<code>{error.kind}</code>

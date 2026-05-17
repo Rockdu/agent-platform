@@ -176,6 +176,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_stronghold::Builder::new(hash_password).build())
+        .plugin(tauri_plugin_dialog::init())
         .manage(MountRegistry::new())
         .manage(PluginMigrationState::new())
         .manage(AccessTokenCache::new())
