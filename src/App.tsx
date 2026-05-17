@@ -611,6 +611,24 @@ function OrchestratorPlaceholder({
   );
 }
 
+// Condense a long claude binary path into a single-line summary that
+// fits in the compact footer pill while keeping the file basename
+// visible. The full path stays in the title attribute (hover) and in
+// the expanded panel's details list, so no information is hidden.
+function shortenClaudePath(path: string): string {
+  const MAX = 36;
+  if (path.length <= MAX) return path;
+  const segments = path.split("/").filter((s) => s.length > 0);
+  if (segments.length >= 2) {
+    const tail = segments.slice(-2).join("/");
+    if (tail.length + 2 <= MAX) {
+      return `…/${tail}`;
+    }
+  }
+  const basename = segments[segments.length - 1] ?? path;
+  return `…/${basename}`;
+}
+
 function ClaudeReadyFooter({
   record,
   onRedo,
@@ -636,7 +654,14 @@ function ClaudeReadyFooter({
       data-expanded={expanded ? "true" : "false"}
     >
       <header className="claude-ready-footer__header">
-        <span className="claude-ready-footer__title">Claude Code 已就绪</span>
+        <span
+          className="claude-ready-footer__title"
+          title={record.path}
+        >
+          {`claude · v${record.version ?? "unknown"} · ${shortenClaudePath(
+            record.path,
+          )}`}
+        </span>
         <button
           type="button"
           className="claude-ready-footer__chevron"
@@ -1411,6 +1436,7 @@ function MultiTerminalContainer() {
               cwd={t.workspacePath}
               workspaceName={t.workspaceName}
               tabId={t.tabId}
+              workspaceId={t.workspaceId}
               focusNonce={focusNonceByTabId[t.tabId]}
             />
           ))}

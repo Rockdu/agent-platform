@@ -152,8 +152,10 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 24px;
-  padding: 4px 12px;
+  height: 24px;
+  box-sizing: border-box;
+  padding: 0 12px;
+  line-height: 1;
 }
 .claude-ready-footer__title {
   flex: 1 1 auto;

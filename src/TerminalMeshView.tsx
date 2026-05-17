@@ -56,6 +56,12 @@ export interface TerminalMeshViewProps {
   /// resolution. Ignored when `existingTerminalId` is set (the
   /// orchestrator's path already supplied its own tab id Rust-side).
   tabId?: string;
+  /// Persisted workspace id this terminal is bound to. Threaded into
+  /// `spawnTerminal` so the host's lifecycle snapshot can carry it
+  /// and the `terminal_mesh.list_tabs` MCP tool can project real
+  /// workspace ids to MCP clients. Ignored when `existingTerminalId`
+  /// is set (orchestrator path; its terminal is already recorded).
+  workspaceId?: string;
   /// Monotonically increasing counter that requests keyboard focus
   /// for this terminal. When the value changes AND the panel is
   /// active, the component calls `term.focus()` so the user can type
@@ -71,6 +77,7 @@ export function TerminalMeshView({
   workspaceName,
   existingTerminalId,
   tabId,
+  workspaceId,
   focusNonce,
 }: TerminalMeshViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -153,6 +160,7 @@ export function TerminalMeshView({
               rows: term.rows,
               cwd,
               tabId,
+              workspaceId,
             })
           ).terminalId;
         // Recheck after each await: if the component unmounted while

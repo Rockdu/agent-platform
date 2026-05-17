@@ -313,6 +313,7 @@ pub(crate) fn spawn_orchestrator_claude(
         registry,
         Some(tab_id.clone()),
         crate::workspace_lifecycle::TabKind::Orchestrator,
+        None,
     ) {
         Ok(terminal_id) => {
             // task21 / AC-3.3: mint the orchestrator's privileged
@@ -690,6 +691,7 @@ mod tests {
             scrollback,
             None,
             crate::workspace_lifecycle::TabKind::Orchestrator,
+            None,
         );
 
         let discovery = DiscoveryCache::empty();

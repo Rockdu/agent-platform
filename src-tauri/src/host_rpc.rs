@@ -42,8 +42,8 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::dispatcher::MountRegistry;
 use crate::orchestrator::OrchestratorState;
 use crate::terminal_mesh::{
-    cross_tab_read_by_tab, read_tab_scrollback_bounded, TerminalMeshError, TerminalMeshRegistry,
-    MAX_CROSS_TAB_READ_BYTES,
+    cross_tab_read_by_tab, read_tab_scrollback_bounded, TerminalListTabsEntry, TerminalMeshError,
+    TerminalMeshRegistry, MAX_CROSS_TAB_READ_BYTES,
 };
 
 /// JSON-RPC error code mapping (private to this module — frontends
@@ -91,6 +91,18 @@ struct ReadScrollbackResult {
     /// can advertise the truncation contract. NOT a privileged-flag
     /// leak — it's the public bound.
     max_bytes: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListTabsParams {
+    client_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListTabsResult {
+    tabs: Vec<TerminalListTabsEntry>,
 }
 
 /// Prepare the socket directory under `${app_data}/host-rpc/`. Returns
@@ -246,6 +258,15 @@ pub fn dispatch_method(
                 })?;
             handle_read_scrollback(state, parsed)
         }
+        "terminalMesh.listTabs" => {
+            let parsed: ListTabsParams =
+                serde_json::from_value(params).map_err(|e| JsonRpcError {
+                    code: ERR_INVALID_PARAMS,
+                    message: format!("invalid params: {e}"),
+                    data: None,
+                })?;
+            handle_list_tabs(state, parsed)
+        }
         other => Err(JsonRpcError {
             code: ERR_METHOD_NOT_FOUND,
             message: format!("unknown method `{other}`"),
@@ -347,6 +368,50 @@ fn handle_read_scrollback(
     }
 }
 
+fn handle_list_tabs(
+    state: &HostRpcState,
+    params: ListTabsParams,
+) -> Result<Value, JsonRpcError> {
+    let caller = ClientId::parse(&params.client_id).map_err(|e| JsonRpcError {
+        code: ERR_INVALID_CLIENT_ID,
+        message: format!("invalid clientId: {e:?}"),
+        data: None,
+    })?;
+    let (caller_tab_id, plugin_id) = match caller {
+        ClientId::Claude { tab_id, plugin_id } => (tab_id.to_string(), plugin_id),
+        ClientId::HostUi { .. } => {
+            return Err(JsonRpcError {
+                code: ERR_INVALID_REQUEST,
+                message: "host_ui clientId cannot call terminalMesh.listTabs".into(),
+                data: None,
+            });
+        }
+    };
+    if plugin_id != "terminal-mesh" {
+        return Err(JsonRpcError {
+            code: ERR_INVALID_REQUEST,
+            message: format!(
+                "terminalMesh.listTabs requires plugin_id=terminal-mesh; got `{plugin_id}`"
+            ),
+            data: None,
+        });
+    }
+
+    // Orchestrator-vs-regular auth filter: the orchestrator sees every
+    // tab (including its own slot); regular workspace callers see only
+    // workspace-kind tabs. The is_orchestrator check mirrors
+    // `handle_read_scrollback` — both use the recorded orchestrator
+    // session's tab id as the identity boundary.
+    let allow_orchestrator = state
+        .orchestrator
+        .snapshot()
+        .map(|s| s.tab_id == caller_tab_id)
+        .unwrap_or(false);
+
+    let tabs = state.terminal_registry.list_tabs(allow_orchestrator);
+    Ok(json!(ListTabsResult { tabs }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +443,7 @@ mod tests {
                 buf,
                 Some(tab_id),
                 crate::workspace_lifecycle::TabKind::Workspace,
+                None,
             );
         }
 
@@ -565,6 +631,7 @@ mod tests {
                 buf,
                 Some(extra_tab_id.clone()),
                 crate::workspace_lifecycle::TabKind::Workspace,
+                None,
             );
 
         // Orchestrator reads the new workspace tab end-to-end.
@@ -599,6 +666,7 @@ mod tests {
                 buf,
                 None,
                 crate::workspace_lifecycle::TabKind::Workspace,
+                None,
             );
 
         // The orchestrator tries to address it by the OLD (terminal_id)
@@ -613,5 +681,131 @@ mod tests {
         });
         let err = dispatch_method(&state, "terminalMesh.readScrollback", params).unwrap_err();
         assert_eq!(err.code, ERR_NOT_FOUND);
+    }
+
+    /// Build a state where the orchestrator slot is recorded as
+    /// `TabKind::Orchestrator` AND two regular workspace tabs are
+    /// recorded as `TabKind::Workspace`. The auth filter in
+    /// `handle_list_tabs` looks at the orchestrator session's tab id
+    /// to decide whether to include the orchestrator entry, but the
+    /// snapshot store needs the orchestrator tab to be marked
+    /// `Orchestrator` so the filter actually has something to skip.
+    /// Returns the state plus the two workspace tab ids so tests can
+    /// construct valid `claude:<uuid>:terminal-mesh` clientIds.
+    fn bridge_state_for_list_tabs(orch_tab_id: &str) -> (HostRpcState, String, String) {
+        let mount_registry = MountRegistry::new();
+        let terminal_registry = TerminalMeshRegistry::new();
+
+        // Orchestrator slot — kind=Orchestrator, no workspace id.
+        {
+            let id = Uuid::new_v4();
+            let (tx, _rx) = mpsc::channel::<terminal_mesh_core::ActorCommand>(1);
+            let buf = Arc::new(StdMutex::new(String::new()));
+            terminal_registry.record(
+                id,
+                tx,
+                buf,
+                Some(orch_tab_id.to_string()),
+                crate::workspace_lifecycle::TabKind::Orchestrator,
+                None,
+            );
+        }
+        // Two workspace tabs — clientId parsing requires the tab id
+        // to be a valid UUID, so generate fresh ones here.
+        let ws_tab_a = make_uuid_tab_id();
+        let ws_tab_b = make_uuid_tab_id();
+        for (tab_id, ws_id) in [
+            (ws_tab_a.clone(), "workspace-A"),
+            (ws_tab_b.clone(), "workspace-B"),
+        ] {
+            let id = Uuid::new_v4();
+            let (tx, _rx) = mpsc::channel::<terminal_mesh_core::ActorCommand>(1);
+            let buf = Arc::new(StdMutex::new(String::new()));
+            terminal_registry.record(
+                id,
+                tx,
+                buf,
+                Some(tab_id),
+                crate::workspace_lifecycle::TabKind::Workspace,
+                Some(ws_id.into()),
+            );
+        }
+
+        let orchestrator = OrchestratorState::new();
+        orchestrator.record_session(OrchestratorSession {
+            terminal_id: Uuid::new_v4(),
+            tab_id: orch_tab_id.to_string(),
+            mcp_config_path: std::path::PathBuf::from("/tmp/orch.json"),
+            terminal_mesh_capability: None,
+        });
+
+        let state = HostRpcState {
+            orchestrator,
+            mount_registry,
+            terminal_registry,
+        };
+        (state, ws_tab_a, ws_tab_b)
+    }
+
+    #[test]
+    fn host_rpc_list_tabs_rejects_unknown_client_id() {
+        let orch_tab = make_uuid_tab_id();
+        let (state, _, _) = bridge_state_for_list_tabs(&orch_tab);
+        let params = json!({ "clientId": "this is not a valid client id" });
+        let err = dispatch_method(&state, "terminalMesh.listTabs", params).unwrap_err();
+        assert_eq!(err.code, ERR_INVALID_CLIENT_ID);
+    }
+
+    #[test]
+    fn host_rpc_list_tabs_rejects_host_ui_client_id() {
+        let orch_tab = make_uuid_tab_id();
+        let (state, _, _) = bridge_state_for_list_tabs(&orch_tab);
+        let params = json!({ "clientId": "host_ui:terminal-mesh" });
+        let err = dispatch_method(&state, "terminalMesh.listTabs", params).unwrap_err();
+        assert_eq!(err.code, ERR_INVALID_REQUEST);
+    }
+
+    #[test]
+    fn host_rpc_list_tabs_orchestrator_client_id_includes_orchestrator() {
+        let orch_tab = make_uuid_tab_id();
+        let (state, _, _) = bridge_state_for_list_tabs(&orch_tab);
+        let params = json!({
+            "clientId": format!("claude:{orch_tab}:terminal-mesh"),
+        });
+        let v = dispatch_method(&state, "terminalMesh.listTabs", params)
+            .expect("orchestrator client may list every tab");
+        let tabs = v["tabs"].as_array().expect("tabs is an array");
+        assert_eq!(tabs.len(), 3, "orchestrator + 2 workspace tabs");
+        let kinds: Vec<&str> = tabs
+            .iter()
+            .filter_map(|t| t["tabKind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"Orchestrator"));
+    }
+
+    #[test]
+    fn host_rpc_list_tabs_workspace_client_id_excludes_orchestrator() {
+        let orch_tab = make_uuid_tab_id();
+        let (state, ws_tab_a, _ws_tab_b) = bridge_state_for_list_tabs(&orch_tab);
+        // A regular workspace clientId uses one of the recorded
+        // workspace tab ids so it parses; the auth filter sees the
+        // tab id != orchestrator tab id and skips the orchestrator
+        // entry.
+        let params = json!({
+            "clientId": format!("claude:{ws_tab_a}:terminal-mesh"),
+        });
+        let v = dispatch_method(&state, "terminalMesh.listTabs", params)
+            .expect("regular workspace client may list workspace tabs");
+        let tabs = v["tabs"].as_array().expect("tabs is an array");
+        assert_eq!(tabs.len(), 2, "orchestrator entry must be filtered out");
+        for tab in tabs {
+            assert_eq!(tab["tabKind"], "Workspace");
+        }
+        let ws_ids: Vec<&str> = tabs
+            .iter()
+            .filter_map(|t| t["workspaceId"].as_str())
+            .collect();
+        assert!(ws_ids.contains(&"workspace-A"));
+        assert!(ws_ids.contains(&"workspace-B"));
     }
 }

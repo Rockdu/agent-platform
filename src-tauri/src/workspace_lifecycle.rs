@@ -75,13 +75,25 @@ pub struct WorkspaceLifecycleSnapshot {
 }
 
 impl WorkspaceLifecycleSnapshot {
-    /// Default snapshot for a freshly-spawned local tab. Callers
-    /// override `tab_kind` (the orchestrator path passes
-    /// `TabKind::Orchestrator`) and `transport_kind` (remote tabs pass
-    /// `Ssh` / `SshDocker`) as needed.
+    /// Default snapshot for a freshly-spawned local tab without a
+    /// persisted workspace id. Kept as a convenience for tests + any
+    /// caller that doesn't need workspace binding; the live spawn
+    /// path uses `fresh_local_with_workspace_id`.
+    #[allow(dead_code)]
     pub fn fresh_local(tab_kind: TabKind) -> Self {
+        Self::fresh_local_with_workspace_id(tab_kind, None)
+    }
+
+    /// Variant that populates `workspace_id` from the persisted
+    /// workspace record. Used by the spawn path so the `list_tabs`
+    /// MCP tool projection can return real workspace ids; orchestrator
+    /// and transient terminals pass `None`.
+    pub fn fresh_local_with_workspace_id(
+        tab_kind: TabKind,
+        workspace_id: Option<String>,
+    ) -> Self {
         Self {
-            workspace_id: None,
+            workspace_id,
             tab_kind,
             transport_kind: TransportKind::Local,
             status: TabStatus::Running,
@@ -449,7 +461,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        registry.record(id, tx, scrollback, None, TabKind::Workspace);
+        registry.record(id, tx, scrollback, None, TabKind::Workspace, None);
 
         // Drive to Done first.
         registry
@@ -475,7 +487,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        registry.record(id, tx, scrollback, None, TabKind::Workspace);
+        registry.record(id, tx, scrollback, None, TabKind::Workspace, None);
         let baseline = registry.snapshot_for_terminal(id).expect("recorded");
 
         let result = update_snapshot_for_user_stdin(&registry, id);
@@ -506,7 +518,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        registry.record(id, tx, scrollback, None, TabKind::Orchestrator);
+        registry.record(id, tx, scrollback, None, TabKind::Orchestrator, None);
         let before = registry.snapshot_for_terminal(id).expect("recorded");
 
         let result = update_snapshot_for_attention(
@@ -536,7 +548,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        registry.record(id, tx, scrollback, None, TabKind::Workspace);
+        registry.record(id, tx, scrollback, None, TabKind::Workspace, None);
 
         let updated = update_snapshot_for_attention(
             &registry,

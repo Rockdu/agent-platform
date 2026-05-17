@@ -17,6 +17,14 @@ export interface TerminalSpawnRequest {
    * self-read their own scrollback through the same bridge surface).
    */
   tabId?: string;
+  /**
+   * Persisted workspace id this terminal is bound to. The host
+   * stores it in the lifecycle snapshot so the
+   * `terminal_mesh.list_tabs` MCP tool can project real workspace ids
+   * to MCP clients. Orchestrator-routed and transient terminals omit
+   * this field.
+   */
+  workspaceId?: string;
 }
 
 export interface TerminalSpawnResponse {
