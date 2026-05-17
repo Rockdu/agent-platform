@@ -36,6 +36,11 @@ const COMMAND_CHANNEL_CAPACITY: usize = 64;
 const RAW_BYTES_CHANNEL_CAPACITY: usize = 64;
 const PROMPT_TAIL_BYTES: usize = 4096;
 const PROMPT_TICK_INTERVAL: Duration = Duration::from_millis(200);
+/// Post-SIGHUP grace window before SIGKILL escalation. portable-pty's
+/// `ProcessSignaller::kill()` only sends SIGHUP on Unix; this gives a
+/// cooperative child time to flush + exit before we hard-kill it. Set
+/// at the midpoint of Codex's 300-500ms recommendation.
+const ESCALATE_TO_SIGKILL_AFTER: Duration = Duration::from_millis(400);
 
 #[derive(Debug, Clone)]
 pub struct TerminalSpec {
@@ -119,6 +124,12 @@ impl TerminalActor {
         // processor task so Shutdown can fire without racing the
         // wait-thread's blocking `child.wait()`.
         let killer: Box<dyn ChildKiller + Send + Sync> = child.clone_killer();
+        // Capture the child's PID for SIGKILL escalation; portable-pty
+        // 0.9's ProcessSignaller::kill() only sends SIGHUP on Unix, so
+        // a child that traps HUP needs an out-of-band hard kill that
+        // the processor task issues if `exit_rx` doesn't resolve
+        // within the escalation window.
+        let child_pid: Option<u32> = child.process_id();
         // Drop the slave half so the child owns it exclusively.
         drop(pty_pair.slave);
 
@@ -183,6 +194,7 @@ impl TerminalActor {
             master,
             writer,
             killer,
+            child_pid,
             bytes_rx,
             command_rx,
             events_tx,
@@ -206,6 +218,7 @@ async fn processor_task(
     master: Box<dyn MasterPty + Send>,
     mut writer: Box<dyn std::io::Write + Send>,
     mut killer: Box<dyn ChildKiller + Send + Sync>,
+    child_pid: Option<u32>,
     mut bytes_rx: mpsc::Receiver<Vec<u8>>,
     mut command_rx: mpsc::Receiver<ActorCommand>,
     events_tx: mpsc::Sender<TerminalEventEnvelope>,
@@ -226,6 +239,11 @@ async fn processor_task(
     let mut reader_drained = false;
     let mut exit_observed = false;
     let mut drain_deadline: Option<tokio::time::Instant> = None;
+    // Set on Shutdown; if it fires before exit_rx resolves, the
+    // processor escalates from SIGHUP (already issued via killer) to
+    // SIGKILL on Unix. Cleared after escalation so the arm only
+    // fires once per shutdown.
+    let mut escalation_deadline: Option<tokio::time::Instant> = None;
 
     loop {
         // Termination predicate: we have observed the child exit AND
@@ -281,12 +299,21 @@ async fn processor_task(
                     }
                     Some(ActorCommand::Shutdown) => {
                         shutdown_requested = true;
-                        // Non-blocking signal through the cloned killer
-                        // — the wait thread, which holds the original
-                        // `Child`, observes the exit and forwards the
-                        // code through `exit_rx`.
+                        // Step 1 (graceful): SIGHUP via the cloned
+                        // killer (portable-pty 0.9's ProcessSignaller
+                        // on Unix). A well-behaved child unwinds and
+                        // exits; the wait thread then resolves
+                        // `exit_rx`.
                         if let Err(e) = killer.kill() {
-                            tracing::warn!(%terminal_id, %e, "child kill failed");
+                            tracing::warn!(%terminal_id, %e, "child kill (SIGHUP) failed");
+                        }
+                        // Step 2 (escalation): if exit_rx hasn't
+                        // resolved within the grace window, the new
+                        // select arm below sends SIGKILL out-of-band.
+                        if escalation_deadline.is_none() && !exit_observed {
+                            escalation_deadline = Some(
+                                tokio::time::Instant::now() + ESCALATE_TO_SIGKILL_AFTER,
+                            );
                         }
                     }
                     None => {
@@ -366,6 +393,23 @@ async fn processor_task(
                 reader_drained = true;
             }
 
+            // ---- SIGKILL escalation for HUP-trapping children ----
+            _ = async {
+                if let Some(d) = escalation_deadline {
+                    tokio::time::sleep_until(d).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if escalation_deadline.is_some() && !exit_observed => {
+                send_hard_kill(terminal_id, child_pid, &mut killer);
+                // Single-shot: clear the deadline so the arm doesn't
+                // fire repeatedly. If SIGKILL itself somehow fails to
+                // terminate the child, the wait thread stays blocked
+                // and the loop falls through to the drain-deadline
+                // exit path on the next iteration anyway.
+                escalation_deadline = None;
+            }
+
             // ---- post-exit drain deadline ----
             _ = async {
                 if let Some(d) = drain_deadline {
@@ -397,6 +441,47 @@ async fn processor_task(
     if shutdown_requested {
         let env = TerminalEventEnvelope::now(terminal_id, TerminalEvent::Cancelled);
         let _ = events_tx.send(env).await;
+    }
+}
+
+/// Hard-kill escalation. On Unix this delivers SIGKILL to both the
+/// child PID and (best-effort) its process group — portable-pty
+/// `setsid`s the child, so the negative-pid form catches descendants
+/// the shell spawned. On non-Unix we re-invoke the cloned killer
+/// since portable-pty's Windows path already does `TerminateProcess`.
+fn send_hard_kill(
+    terminal_id: Uuid,
+    child_pid: Option<u32>,
+    killer: &mut Box<dyn ChildKiller + Send + Sync>,
+) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        if let Some(pid) = child_pid {
+            let raw = pid as i32;
+            if let Err(e) = kill(Pid::from_raw(raw), Signal::SIGKILL) {
+                tracing::warn!(%terminal_id, pid = raw, %e, "SIGKILL escalation to pid failed");
+            }
+            // Best-effort process-group kill; portable-pty's `setsid`
+            // makes the child its own session leader, so this catches
+            // any descendants the shell spawned. ESRCH (no such
+            // process) is expected if the child already exited
+            // between the SIGHUP and SIGKILL — log at debug only.
+            if let Err(e) = kill(Pid::from_raw(-raw), Signal::SIGKILL) {
+                tracing::debug!(%terminal_id, pgid = -raw, %e, "SIGKILL pgid (best-effort) failed");
+            }
+        } else {
+            tracing::warn!(%terminal_id, "no child_pid captured; falling back to killer.kill()");
+            let _ = killer.kill();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child_pid; // not used
+        if let Err(e) = killer.kill() {
+            tracing::warn!(%terminal_id, %e, "fallback killer.kill() failed on non-unix");
+        }
     }
 }
 
@@ -681,6 +766,47 @@ mod tests {
         assert!(
             evs.iter().any(|e| matches!(e.event, TerminalEvent::Exit { .. })),
             "Exit envelope expected after killer.kill(); got {evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(e.event, TerminalEvent::Cancelled)),
+            "Cancelled envelope expected after Shutdown; got {evs:?}"
+        );
+    }
+
+    /// Codex round-23 blocker regression: portable-pty's
+    /// `ChildKiller::kill()` only sends SIGHUP on Unix. A child that
+    /// installs `trap "" HUP` ignores SIGHUP entirely, so without
+    /// SIGKILL escalation the wait thread blocks until natural exit.
+    /// With escalation, `Shutdown` must terminate the child within
+    /// the ~400ms grace + reasonable cleanup margin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_escalates_to_sigkill_for_hup_trapping_child() {
+        let started = std::time::Instant::now();
+        let h = TerminalActor::spawn(shell_spec("trap '' HUP; sleep 30"))
+            .expect("spawn");
+        let TerminalHandle {
+            mut events_rx,
+            command_tx,
+            ..
+        } = h;
+        // Give the child time to install the trap and start sleeping.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        command_tx.send(ActorCommand::Shutdown).await.unwrap();
+        let evs = collect_until(
+            &mut events_rx,
+            |e| matches!(e.event, TerminalEvent::Cancelled),
+            3000,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "SIGKILL escalation must close the HUP-ignoring child well \
+             before its 30s natural exit; took {elapsed:?}"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(e.event, TerminalEvent::Exit { .. })),
+            "Exit envelope expected after SIGKILL; got {evs:?}"
         );
         assert!(
             evs.iter().any(|e| matches!(e.event, TerminalEvent::Cancelled)),
