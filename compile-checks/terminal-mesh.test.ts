@@ -46,6 +46,10 @@ export function _probe_attention_kind_discrimination(k: AttentionKind): string {
       return "promptWaiting";
     case "agentMarker":
       return `agentMarker:${k.severity}:${k.summary ?? "<none>"}`;
+    case "disconnect":
+      return "disconnect";
+    case "taskComplete":
+      return `taskComplete:${k.summary}`;
   }
 }
 

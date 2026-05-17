@@ -29,7 +29,9 @@ export type AttentionKind =
   | { kind: "completion"; exitCode: number }
   | { kind: "nonZeroExit"; exitCode: number }
   | { kind: "promptWaiting" }
-  | { kind: "agentMarker"; summary: string | null; severity: AttentionSeverity };
+  | { kind: "agentMarker"; summary: string | null; severity: AttentionSeverity }
+  | { kind: "disconnect" }
+  | { kind: "taskComplete"; summary: string };
 
 export interface NeedsAttentionPayload {
   eventId: string;
@@ -65,6 +67,39 @@ export type TerminalMeshErrorDto =
   | { kind: "io"; context: string; message: string }
   | { kind: "permissionDenied"; message: string };
 
+// Host-side lifecycle snapshot consumed by the inner-rail Running/
+// Done queue, the upcoming `terminal_mesh.list_tabs` MCP tool, and
+// the orchestrator-isolation filter. Wire shape mirrors
+// `src-tauri/src/workspace_lifecycle.rs`.
+export type TabKind = "Orchestrator" | "Workspace";
+export type TransportKind = "Local" | "Ssh" | "SshDocker";
+export type TabStatus = "Running" | "Done";
+
+export type DoneReason =
+  | { kind: "CleanCompletion" }
+  | { kind: "NonZeroExit"; code: number }
+  | { kind: "Disconnected" }
+  | { kind: "TaskComplete"; summary: string };
+
+export interface WorkspaceLifecycleSnapshot {
+  workspaceId: string | null;
+  tabKind: TabKind;
+  transportKind: TransportKind;
+  status: TabStatus;
+  doneReason: DoneReason | null;
+  lastActivityAtUnixMs: number;
+}
+
+// Single envelope shape shared between the initial `workspace_
+// lifecycle_snapshot` fetch and the `lifecycle://updated` event
+// stream so the frontend hook can apply the same handler to both.
+export interface LifecycleUpdateEvent {
+  terminalId: string;
+  snapshot: WorkspaceLifecycleSnapshot;
+}
+
+export const LIFECYCLE_UPDATED_TOPIC = "lifecycle://updated";
+
 export function isTerminalMeshErrorDto(
   value: unknown,
 ): value is TerminalMeshErrorDto {
@@ -88,8 +123,13 @@ export async function spawnTerminal(
 export async function writeTerminalStdin(
   terminalId: string,
   data: string,
+  userInitiated?: boolean,
 ): Promise<void> {
-  await invoke<void>("terminal_write_stdin", { terminalId, data });
+  await invoke<void>("terminal_write_stdin", {
+    terminalId,
+    data,
+    userInitiated,
+  });
 }
 
 export async function resizeTerminal(
@@ -138,4 +178,27 @@ export async function subscribeTerminalStatus(
   return await listen<BufferTruncated>(statusTopic(terminalId), (msg) => {
     onStatus(msg.payload);
   });
+}
+
+// ----- Lifecycle (Running/Done queue) wire functions -----
+
+export async function workspaceLifecycleSnapshot(
+  tabId: string,
+): Promise<LifecycleUpdateEvent | null> {
+  const entry = await invoke<LifecycleUpdateEvent | null>(
+    "workspace_lifecycle_snapshot",
+    { tabId },
+  );
+  return entry ?? null;
+}
+
+export async function subscribeWorkspaceLifecycleUpdates(
+  onUpdate: (event: LifecycleUpdateEvent) => void,
+): Promise<UnlistenFn> {
+  return await listen<LifecycleUpdateEvent>(
+    LIFECYCLE_UPDATED_TOPIC,
+    (msg) => {
+      onUpdate(msg.payload);
+    },
+  );
 }

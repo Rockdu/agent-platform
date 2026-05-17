@@ -29,6 +29,7 @@ import {
   type ClaudePathRecord,
 } from "./claude-discovery";
 import { TerminalMeshView } from "./TerminalMeshView";
+import { useWorkspaceLifecycleStatus } from "./use-workspace-lifecycle-status";
 import {
   getOrchestratorStatus,
   isOrchestratorErrorDto,
@@ -1007,8 +1008,74 @@ function transportKindIcon(kind: TransportKindHint): string {
   }
 }
 
+function transportKindLabel(kind: TransportKindHint): string {
+  switch (kind) {
+    case "Ssh":
+      return "SSH 远端终端";
+    case "SshDocker":
+      return "SSH 内 Docker 容器终端";
+    case "Local":
+    default:
+      return "本地终端";
+  }
+}
+
 function statusBadgeLabel(status: TabStatusHint): string {
   return status === "Done" ? "Done" : "Running";
+}
+
+interface WorkspaceRailRowProps {
+  tab: OpenTab;
+  isActive: boolean;
+  onSelect: (tabId: string) => void;
+  onClose: (tabId: string) => void;
+}
+
+function WorkspaceRailRow(props: WorkspaceRailRowProps) {
+  const { tab, isActive, onSelect, onClose } = props;
+  const lifecycle = useWorkspaceLifecycleStatus(tab.tabId);
+  const icon = transportKindIcon(lifecycle.transportKind);
+  const transportLabel = transportKindLabel(lifecycle.transportKind);
+  const status = statusBadgeLabel(lifecycle.status);
+  return (
+    <div
+      className={`terminal-mesh-container__rail-row ${
+        isActive ? "terminal-mesh-container__rail-row--active" : ""
+      }`}
+    >
+      <span
+        className="rail-row__transport-icon"
+        aria-label={transportLabel}
+        title={transportLabel}
+      >
+        {icon}
+      </span>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={isActive}
+        className="rail-row__label"
+        onClick={() => onSelect(tab.tabId)}
+        title={tab.workspacePath}
+      >
+        {tab.workspaceName}
+      </button>
+      <span
+        className={`rail-row__status-badge rail-row__status-badge--${status.toLowerCase()}`}
+        aria-label={`状态：${status}`}
+      >
+        {status}
+      </span>
+      <button
+        type="button"
+        className="terminal-mesh-container__close"
+        aria-label={`关闭 ${tab.workspaceName}`}
+        onClick={() => onClose(tab.tabId)}
+      >
+        ×
+      </button>
+    </div>
+  );
 }
 
 function MultiTerminalContainer() {
@@ -1118,56 +1185,15 @@ function MultiTerminalContainer() {
         role="tablist"
         aria-orientation="vertical"
       >
-        {tabs.map((t) => {
-          // The transport-kind icon + status badge are placeholders
-          // today (LocalTransport is the only live transport and the
-          // lifecycle snapshot hook lands in a follow-up). The
-          // helpers fall through to Local + Running when no data is
-          // wired in.
-          const transportIcon = transportKindIcon(undefined);
-          const status = statusBadgeLabel(undefined);
-          const isActive = activeId === t.tabId;
-          return (
-            <div
-              key={t.tabId}
-              className={`terminal-mesh-container__rail-row ${
-                isActive ? "terminal-mesh-container__rail-row--active" : ""
-              }`}
-            >
-              <span
-                className="rail-row__transport-icon"
-                aria-label="Local"
-                title="Local transport"
-              >
-                {transportIcon}
-              </span>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={isActive}
-                className="rail-row__label"
-                onClick={() => setActive(t.tabId)}
-                title={t.workspacePath}
-              >
-                {t.workspaceName}
-              </button>
-              <span
-                className={`rail-row__status-badge rail-row__status-badge--${status.toLowerCase()}`}
-                aria-label={`状态：${status}`}
-              >
-                {status}
-              </span>
-              <button
-                type="button"
-                className="terminal-mesh-container__close"
-                aria-label={`关闭 ${t.workspaceName}`}
-                onClick={() => void closeTab(t.tabId)}
-              >
-                ×
-              </button>
-            </div>
-          );
-        })}
+        {tabs.map((t) => (
+          <WorkspaceRailRow
+            key={t.tabId}
+            tab={t}
+            isActive={activeId === t.tabId}
+            onSelect={setActive}
+            onClose={(id) => void closeTab(id)}
+          />
+        ))}
         <button
           type="button"
           className="terminal-mesh-container__add"

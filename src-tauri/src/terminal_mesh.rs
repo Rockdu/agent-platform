@@ -21,7 +21,7 @@ use terminal_mesh_core::{
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::workspace_lifecycle::{TabKind, WorkspaceLifecycleSnapshot};
+use crate::workspace_lifecycle::{LifecycleUpdateEvent, TabKind, WorkspaceLifecycleSnapshot};
 
 /// Maximum scrollback retained in-memory per terminal so the frontend
 /// can ask `terminal_scrollback` to restore content on tab remount.
@@ -273,6 +273,25 @@ impl TerminalMeshRegistry {
         let terminal_id = snap_idx.get(tab_id).copied()?;
         drop(snap_idx);
         self.snapshot_for_terminal(terminal_id)
+    }
+
+    /// Combined `(terminal_id, snapshot)` lookup for a tab. The
+    /// frontend lifecycle hook needs the terminal id to filter
+    /// `lifecycle://updated` events so it only reacts to its own
+    /// tab's updates; this single lookup avoids a separate id
+    /// resolution call.
+    pub fn lifecycle_entry_for_tab(
+        &self,
+        tab_id: &str,
+    ) -> Option<(Uuid, WorkspaceLifecycleSnapshot)> {
+        let snap_idx = self
+            .snapshot_tab_index
+            .lock()
+            .expect("snapshot_tab_index poisoned");
+        let terminal_id = snap_idx.get(tab_id).copied()?;
+        drop(snap_idx);
+        let snapshot = self.snapshot_for_terminal(terminal_id)?;
+        Some((terminal_id, snapshot))
     }
 
     /// Apply `mutator` to the retained snapshot under the lock and
@@ -898,18 +917,25 @@ pub fn terminal_mesh_cross_tab_read_scrollback(
     .map_err(|e| TerminalMeshErrorDto::from(&e))
 }
 
-/// Look up the host-side lifecycle snapshot for a workspace tab. The
-/// inner-rail polls this on mount and after every `lifecycle://updated`
-/// event. Reads from the retained snapshot store, so it returns the
-/// last-known snapshot even after the underlying actor has exited
-/// naturally — only an explicit `terminal_shutdown` (or the absence of
-/// any prior registry insert for `tab_id`) yields `None`.
+/// Look up the host-side lifecycle envelope for a workspace tab. The
+/// inner-rail polls this on mount; the same envelope shape is
+/// emitted on `lifecycle://updated` so the frontend hook can reuse
+/// one wire type across both paths. Reads from the retained snapshot
+/// store, so it returns the last-known snapshot even after the
+/// underlying actor has exited naturally — only an explicit
+/// `terminal_shutdown` (or the absence of any prior registry insert
+/// for `tab_id`) yields `None`.
 #[tauri::command]
 pub fn workspace_lifecycle_snapshot(
     tab_id: String,
     registry: State<'_, TerminalMeshRegistry>,
-) -> Result<Option<WorkspaceLifecycleSnapshot>, TerminalMeshErrorDto> {
-    Ok(registry.snapshot_for_tab(&tab_id))
+) -> Result<Option<LifecycleUpdateEvent>, TerminalMeshErrorDto> {
+    Ok(registry
+        .lifecycle_entry_for_tab(&tab_id)
+        .map(|(terminal_id, snapshot)| LifecycleUpdateEvent {
+            terminal_id: terminal_id.to_string(),
+            snapshot,
+        }))
 }
 
 #[cfg(test)]
@@ -1027,6 +1053,27 @@ mod tests {
         let r = TerminalMeshRegistry::new();
         let result = r.update_snapshot(Uuid::new_v4(), |_| panic!("should not run"));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn lifecycle_entry_for_tab_returns_terminal_and_snapshot() {
+        let r = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let buf = StdArc::new(StdMutex::new(String::new()));
+        r.record(id, tx, buf, Some("tab-entry".into()), TabKind::Workspace);
+
+        let entry = r
+            .lifecycle_entry_for_tab("tab-entry")
+            .expect("entry present");
+        let (terminal_id, snap) = entry;
+        assert_eq!(terminal_id, id, "terminal id must match the recorded id");
+        assert!(matches!(snap.tab_kind, TabKind::Workspace));
+
+        assert!(
+            r.lifecycle_entry_for_tab("does-not-exist").is_none(),
+            "unknown tab id must return None"
+        );
     }
 
     #[test]
