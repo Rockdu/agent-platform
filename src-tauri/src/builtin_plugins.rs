@@ -41,7 +41,13 @@ pub const BUILTIN_PLUGINS: &[BuiltinPlugin] = &[BuiltinPlugin {
     permissions: &["cross_tab_read", "pty.read_scrollback"],
     commands: &[BuiltinCommand {
         name: "read_scrollback",
-        permissions: &["cross_tab_read"],
+        // Both required at the command level — defense in depth.
+        // `cross_tab_read_inner` consults this list via
+        // `dispatcher::command_required_permissions("terminal-mesh",
+        // "read_scrollback")` (Round 39: actual enforcement, not
+        // declarative-only). A mount that declares only one of the
+        // two is denied at read time.
+        permissions: &["cross_tab_read", "pty.read_scrollback"],
     }],
 }];
 

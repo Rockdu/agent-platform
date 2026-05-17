@@ -425,6 +425,24 @@ pub fn insert_orchestrator_mount(
             "cross_tab_read",
         ));
     }
+    // Round 39: defense in depth at mount time — the resolved
+    // plugin permissions must cover every permission declared by
+    // every command of the same plugin in the built-in metadata
+    // (mounting a plugin without enough perms to actually serve
+    // its own commands is a misconfig that should fail loud).
+    if let Some(builtin) = crate::builtin_plugins::lookup_plugin(plugin_id) {
+        for cmd in builtin.commands {
+            for required in cmd.permissions {
+                if !permissions.iter().any(|p| p == required) {
+                    return Err(DispatchErrorDto::permission_denied(
+                        plugin_id,
+                        cmd.name,
+                        required,
+                    ));
+                }
+            }
+        }
+    }
     let mount_id = Uuid::new_v4();
     let nonce_bytes = fresh_nonce_bytes();
     let handle = encode_handle(mount_id, &nonce_bytes);

@@ -1113,6 +1113,7 @@ function MultiTerminalContainer() {
             active={activeId === t.tabId}
             cwd={t.workspacePath}
             workspaceName={t.workspaceName}
+            tabId={t.tabId}
           />
         ))}
       </div>

@@ -78,6 +78,36 @@ export function _probe_permission_denied_has_no_cross_tab_read_field(): void {
   void e;
 }
 
+// task21 / AC-3.3 Round 39: TerminalSpawnRequest must accept an
+// optional `tabId` so workspace tabs can register themselves under
+// their tab id (the host RPC bridge resolves `target_tab_id →
+// terminal_id` via this index). Omitting `tabId` must still type-
+// check (back-compat for the orchestrator path that uses
+// `existingTerminalId` instead).
+export function _probe_spawn_request_accepts_optional_tab_id(): void {
+  const withTab: import("../src/terminal-mesh").TerminalSpawnRequest = {
+    cols: 80,
+    rows: 24,
+    tabId: "tab-A",
+  };
+  const withoutTab: import("../src/terminal-mesh").TerminalSpawnRequest = {
+    cols: 80,
+    rows: 24,
+  };
+  void withTab;
+  void withoutTab;
+}
+
+export function _probe_spawn_request_tab_id_must_be_string(): void {
+  const r: import("../src/terminal-mesh").TerminalSpawnRequest = {
+    cols: 80,
+    rows: 24,
+    // @ts-expect-error `tabId` must be a string when present
+    tabId: 42,
+  };
+  void r;
+}
+
 export function _probe_is_terminal_mesh_error_dto_narrows(): void {
   const v: unknown = { kind: "notFound", terminalId: "abc" };
   if (isTerminalMeshErrorDto(v)) {

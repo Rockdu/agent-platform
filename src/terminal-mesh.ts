@@ -9,6 +9,14 @@ export interface TerminalSpawnRequest {
   env?: Array<[string, string]>;
   cols?: number;
   rows?: number;
+  /**
+   * task21 / AC-3.3: workspace tab id this terminal belongs to. Threaded
+   * into `TerminalMeshRegistry.tab_index` so the host RPC bridge can
+   * resolve `target_tab_id → terminal_id` for cross-tab read requests
+   * coming from the orchestrator's claude (and for regular tabs to
+   * self-read their own scrollback through the same bridge surface).
+   */
+  tabId?: string;
 }
 
 export interface TerminalSpawnResponse {

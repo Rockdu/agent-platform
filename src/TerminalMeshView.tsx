@@ -50,6 +50,12 @@ export interface TerminalMeshViewProps {
   /// terminal_id here). When set, the cleanup path also skips
   /// `terminal_shutdown` — the orchestrator owns that lifecycle.
   existingTerminalId?: string;
+  /// task21 / AC-3.3 Round 39: workspace tab id, passed through to
+  /// `spawnTerminal` so the registry indexes the PTY under this id.
+  /// The host RPC bridge needs this for `target_tab_id → terminal_id`
+  /// resolution. Ignored when `existingTerminalId` is set (the
+  /// orchestrator's path already supplied its own tab id Rust-side).
+  tabId?: string;
 }
 
 export function TerminalMeshView({
@@ -57,6 +63,7 @@ export function TerminalMeshView({
   cwd,
   workspaceName,
   existingTerminalId,
+  tabId,
 }: TerminalMeshViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -137,6 +144,7 @@ export function TerminalMeshView({
               cols: term.cols,
               rows: term.rows,
               cwd,
+              tabId,
             })
           ).terminalId;
         // Recheck after each await: if the component unmounted while

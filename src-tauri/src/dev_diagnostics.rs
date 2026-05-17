@@ -189,6 +189,25 @@ mod tests {
             .any(|p| p.ends_with("target/release/notes-plugin")));
     }
 
+    /// task21 / AC-3.3 Round 39: prove the resolver knows where the
+    /// `terminal-mesh-sidecar` binary lives. The npm `prebuild` /
+    /// `predev` script chain ensures one of these paths is populated
+    /// before the frontend bundle ships, so `mcp_config::generate_*`
+    /// finds the binary and emits the terminal-mesh MCP entry. This
+    /// test only verifies the candidate list; the per-build presence
+    /// is enforced by the `npm run build` validation step.
+    #[test]
+    fn resolve_expected_paths_lists_terminal_mesh_sidecar_locations() {
+        let root = Path::new("/tmp/fake-workspace");
+        let paths = resolve_expected_paths(root, "terminal-mesh-sidecar");
+        assert!(paths
+            .iter()
+            .any(|p| p.ends_with("target/debug/terminal-mesh-sidecar")));
+        assert!(paths
+            .iter()
+            .any(|p| p.ends_with("target/release/terminal-mesh-sidecar")));
+    }
+
     #[test]
     fn diagnose_reports_missing_when_no_binary_present() {
         let dir = tmp();

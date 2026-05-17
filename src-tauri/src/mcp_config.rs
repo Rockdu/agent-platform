@@ -153,6 +153,14 @@ fn configs_dir(app_data: &Path) -> PathBuf {
 /// Build the in-memory `McpConfigDocument`. Pure function: only touches
 /// the filesystem to resolve plugin binary paths. The atomic disk write
 /// happens in [`write_atomic`].
+///
+/// Round 39 (task21 remediation per Codex round-38 review): retained
+/// as a back-compat shim only — every production caller now goes
+/// through [`generate_config_with_host_rpc_sock`] so the terminal-mesh
+/// sidecar receives `--host-rpc-sock`. Tests still drive the no-sock
+/// path through this entry point. `#[allow(dead_code)]` because
+/// production-time dead-code detection sees only the tests' usage.
+#[allow(dead_code)]
 pub fn generate_config(
     tab_id: &str,
     workspace: &Path,
@@ -426,6 +434,7 @@ pub async fn generate_mcp_config(
     workspace: String,
     kind: McpConfigKindDto,
     registry: tauri::State<'_, McpConfigRegistry>,
+    bootstrap: tauri::State<'_, crate::orchestrator::OrchestratorBootstrap>,
 ) -> Result<String, McpConfigErrorDto> {
     let Some((_, app_data)) = resolve_dirs() else {
         return Err(McpConfigErrorDto::Io {
@@ -435,12 +444,18 @@ pub async fn generate_mcp_config(
     };
     let workspace_path = PathBuf::from(workspace);
     let workspace_root = crate::dev_diagnostics::workspace_root_for_dev();
-    let doc = generate_config(
+    // task21 / AC-3.3 Round 39: every per-tab config (orchestrator AND
+    // standard) must carry `--host-rpc-sock` because the terminal-mesh
+    // sidecar binary requires it at startup. Without it, a regular
+    // tab's terminal-mesh sidecar exits before it can route its
+    // PermissionDenied for cross-tab reads through the bridge.
+    let doc = generate_config_with_host_rpc_sock(
         &tab_id,
         &workspace_path,
         kind.into(),
         &app_data,
         &workspace_root,
+        bootstrap.host_rpc_sock.as_deref(),
     )
     .map_err(|e| McpConfigErrorDto::from(&e))?;
     let final_path = write_atomic(&app_data, &tab_id, &doc).map_err(|e| McpConfigErrorDto::from(&e))?;
@@ -651,18 +666,23 @@ mod tests {
     }
 
     #[test]
-    fn generate_standard_config_includes_terminal_mesh_sidecar_without_cross_tab_read() {
+    fn generate_standard_config_includes_terminal_mesh_sidecar_with_host_rpc_sock_without_cross_tab_read() {
         let app_data = tempfile::TempDir::new().unwrap();
         let workspace_root = tempfile::TempDir::new().unwrap();
         let workspace = make_workspace_dir();
         stub_sidecar_for(workspace_root.path(), "notes-plugin");
         stub_sidecar_for(workspace_root.path(), "terminal-mesh-sidecar");
-        let doc = generate_config(
+        // Round 39: standard tabs ALSO need --host-rpc-sock so the
+        // terminal-mesh sidecar can boot and route denials through
+        // the bridge (it requires the arg at startup). Generating
+        // standard config WITHOUT the sock is a misconfig.
+        let doc = generate_config_with_host_rpc_sock(
             "tab-std",
             workspace.path(),
             McpConfigKind::Standard,
             app_data.path(),
             workspace_root.path(),
+            Some(std::path::Path::new("/tmp/host-std.sock")),
         )
         .expect("generate");
         let entry = doc
@@ -672,6 +692,22 @@ mod tests {
         assert!(
             !entry.args.iter().any(|a| a == "--cross-tab-read"),
             "non-orchestrator terminal-mesh entry MUST NOT carry --cross-tab-read; args={:?}",
+            entry.args
+        );
+        // --host-rpc-sock /tmp/host-std.sock present.
+        let mut iter = entry.args.iter();
+        let has_sock = loop {
+            match iter.next() {
+                Some(a) if a == "--host-rpc-sock" => {
+                    break iter.next().map(|s| s.as_str()) == Some("/tmp/host-std.sock");
+                }
+                Some(_) => continue,
+                None => break false,
+            }
+        };
+        assert!(
+            has_sock,
+            "--host-rpc-sock /tmp/host-std.sock MUST be present even in standard config; args={:?}",
             entry.args
         );
     }

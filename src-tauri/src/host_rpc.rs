@@ -522,4 +522,71 @@ mod tests {
         let err = dispatch_method(&state, "no.such.method", json!({})).unwrap_err();
         assert_eq!(err.code, ERR_METHOD_NOT_FOUND);
     }
+
+    // ----- Round 39: end-to-end app-spawn path validation -----
+    //
+    // The Round 38 tests pre-registered tab ids directly. These
+    // regressions exercise the path the actual frontend takes:
+    // call `terminal_mesh::spawn_into_registry`-equivalent helpers
+    // with a tab_id, then prove the bridge resolves it.
+
+    #[test]
+    fn bridge_resolves_tab_id_registered_via_record_helper() {
+        let orch_tab = make_uuid_tab_id();
+        let regular_tab = make_uuid_tab_id();
+        let (state, _) = bridge_state_with_two_tabs(&orch_tab, &regular_tab);
+
+        // Spawn a NEW workspace tab using the same `record()` call
+        // path that `spawn_into_registry` walks when the frontend
+        // sets `req.tab_id`. The bridge must resolve `target_tab_id`
+        // → terminal_id via the tab_index.
+        let extra_tab_id = make_uuid_tab_id();
+        let extra_terminal_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<terminal_mesh_core::ActorCommand>(1);
+        let buf = Arc::new(StdMutex::new("WORKSPACE_TAB_OUTPUT".into()));
+        state
+            .terminal_registry
+            .record(extra_terminal_id, tx, buf, Some(extra_tab_id.clone()));
+
+        // Orchestrator reads the new workspace tab end-to-end.
+        let params = json!({
+            "clientId": format!("claude:{orch_tab}:terminal-mesh"),
+            "targetTabId": extra_tab_id,
+            "maxBytes": 8192_u32,
+        });
+        let v = dispatch_method(&state, "terminalMesh.readScrollback", params)
+            .expect("orchestrator may read the freshly spawned workspace tab");
+        assert_eq!(v["data"], "WORKSPACE_TAB_OUTPUT");
+    }
+
+    #[test]
+    fn bridge_returns_not_found_when_terminal_registered_without_tab_id() {
+        // Negative variant: if a terminal is spawned WITHOUT a tab_id
+        // (the back-compat path), bridge lookup by tab_id MUST return
+        // NotFound — proving the index path is the authoritative
+        // mechanism, not just a heuristic.
+        let orch_tab = make_uuid_tab_id();
+        let regular_tab = make_uuid_tab_id();
+        let (state, _) = bridge_state_with_two_tabs(&orch_tab, &regular_tab);
+
+        let no_tab_terminal_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<terminal_mesh_core::ActorCommand>(1);
+        let buf = Arc::new(StdMutex::new("UNINDEXED".into()));
+        state
+            .terminal_registry
+            .record(no_tab_terminal_id, tx, buf, None);
+
+        // The orchestrator tries to address it by the OLD (terminal_id)
+        // value as a "tab_id". Since the tab_index is empty for it,
+        // resolution fails with NotFound — exactly the Codex round-38
+        // contract: regular workspace terminals must be registered
+        // under their tab id or they're not addressable.
+        let params = json!({
+            "clientId": format!("claude:{orch_tab}:terminal-mesh"),
+            "targetTabId": no_tab_terminal_id.to_string(),
+            "maxBytes": 8192_u32,
+        });
+        let err = dispatch_method(&state, "terminalMesh.readScrollback", params).unwrap_err();
+        assert_eq!(err.code, ERR_NOT_FOUND);
+    }
 }

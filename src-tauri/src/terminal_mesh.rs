@@ -526,7 +526,45 @@ pub fn cross_tab_read_inner(
     target_terminal_id: &str,
     max_bytes: usize,
 ) -> Result<String, TerminalMeshError> {
-    // 1. Validate the capability and surface the (Rust-only) MountEntry.
+    let entry = authorize_for_read_scrollback(mount_registry, capability_handle)?;
+
+    let id = parse_terminal_id(target_terminal_id)?;
+    let scrollback = terminal_registry
+        .lookup_scrollback(id)
+        .ok_or_else(|| TerminalMeshError::NotFound {
+            terminal_id: id.to_string(),
+        })?;
+
+    // Silence unused-variable lint; the entry is only used for its
+    // side effect of being validated. Future per-tab ACLs may key on
+    // entry.tab_id here.
+    let _ = entry;
+    Ok(bound_scrollback_tail(&scrollback, max_bytes))
+}
+
+/// task21 / AC-3.3 Round 39: shared authorization helper for the
+/// `terminal_mesh.read_scrollback` privileged read endpoint. Returns
+/// the validated `MountEntry` on success. Three gates, in order:
+///
+/// 1. Capability handle validates via
+///    `dispatcher::authorize_capability_handle("terminal-mesh")`.
+/// 2. `entry.cross_tab_read_flag` is `true` (Rust-only privileged
+///    grant minted by `dispatcher::insert_orchestrator_mount`).
+/// 3. `entry.permissions` contains EVERY permission listed by
+///    `dispatcher::command_required_permissions("terminal-mesh",
+///    "read_scrollback")` — the built-in command metadata. If the
+///    metadata is missing (e.g., command renamed without updating
+///    the registry), the read is denied with a clear message.
+///
+/// This replaces the Round-38 ad-hoc `entry.permissions.contains(
+/// "cross_tab_read")` check with a metadata-driven loop, so changing
+/// the command's declared permissions in
+/// `builtin_plugins::BUILTIN_PLUGINS` changes the enforcement at the
+/// read site without further code edits.
+fn authorize_for_read_scrollback(
+    mount_registry: &crate::dispatcher::MountRegistry,
+    capability_handle: &str,
+) -> Result<crate::dispatcher::MountEntry, TerminalMeshError> {
     let entry = crate::dispatcher::authorize_capability_handle(
         mount_registry,
         capability_handle,
@@ -536,31 +574,43 @@ pub fn cross_tab_read_inner(
         message: format!("capability rejected: {dto}"),
     })?;
 
-    // 2. Gate on BOTH the Rust-only cross_tab_read_flag AND the
-    //    declared `cross_tab_read` plugin permission. A privileged-
-    //    looking mount whose metadata doesn't declare the permission
-    //    must still be denied (defense-in-depth matching the spec's
-    //    Permission Gating section).
     if !entry.cross_tab_read_flag {
         return Err(TerminalMeshError::PermissionDenied {
             message: "capability lacks cross-tab read privilege".into(),
         });
     }
-    if !entry.permissions.iter().any(|p| p == "cross_tab_read") {
-        return Err(TerminalMeshError::PermissionDenied {
-            message: "capability does not declare cross_tab_read permission".into(),
-        });
-    }
 
-    // 3. Resolve the target scrollback or NotFound.
-    let id = parse_terminal_id(target_terminal_id)?;
-    let scrollback = terminal_registry
-        .lookup_scrollback(id)
-        .ok_or_else(|| TerminalMeshError::NotFound {
-            terminal_id: id.to_string(),
+    check_command_permissions(&entry, "terminal-mesh", "read_scrollback")?;
+    Ok(entry)
+}
+
+/// Validate that `entry.permissions` covers every declared permission
+/// for `(plugin_id, command_name)` per the dispatcher's metadata
+/// (manifest `PLUGINS` or fallthrough `BUILTIN_PLUGINS`). Returns
+/// `PermissionDenied` if the metadata is missing OR if any required
+/// permission is absent from the entry. Pure helper — public so the
+/// host RPC bridge can reuse it for future endpoints.
+pub fn check_command_permissions(
+    entry: &crate::dispatcher::MountEntry,
+    plugin_id: &str,
+    command_name: &str,
+) -> Result<(), TerminalMeshError> {
+    let required = crate::dispatcher::command_required_permissions(plugin_id, command_name)
+        .ok_or_else(|| TerminalMeshError::PermissionDenied {
+            message: format!(
+                "command metadata missing for `{plugin_id}.{command_name}`; refusing to authorize"
+            ),
         })?;
-
-    Ok(bound_scrollback_tail(&scrollback, max_bytes))
+    for perm in &required {
+        if !entry.permissions.iter().any(|p| p == perm) {
+            return Err(TerminalMeshError::PermissionDenied {
+                message: format!(
+                    "capability does not declare `{perm}` permission required by `{plugin_id}.{command_name}`"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// task21 / AC-3.3 — same as `cross_tab_read_inner` but keyed by
@@ -575,24 +625,7 @@ pub fn cross_tab_read_by_tab(
     target_tab_id: &str,
     max_bytes: usize,
 ) -> Result<String, TerminalMeshError> {
-    let entry = crate::dispatcher::authorize_capability_handle(
-        mount_registry,
-        capability_handle,
-        "terminal-mesh",
-    )
-    .map_err(|dto| TerminalMeshError::PermissionDenied {
-        message: format!("capability rejected: {dto}"),
-    })?;
-    if !entry.cross_tab_read_flag {
-        return Err(TerminalMeshError::PermissionDenied {
-            message: "capability lacks cross-tab read privilege".into(),
-        });
-    }
-    if !entry.permissions.iter().any(|p| p == "cross_tab_read") {
-        return Err(TerminalMeshError::PermissionDenied {
-            message: "capability does not declare cross_tab_read permission".into(),
-        });
-    }
+    let _entry = authorize_for_read_scrollback(mount_registry, capability_handle)?;
     let terminal_id = terminal_registry
         .lookup_terminal_by_tab(target_tab_id)
         .ok_or_else(|| TerminalMeshError::NotFound {
@@ -1118,8 +1151,80 @@ mod tests {
         match err {
             TerminalMeshError::PermissionDenied { message } => {
                 assert!(
-                    message.contains("does not declare cross_tab_read"),
+                    message.contains("does not declare `cross_tab_read`"),
                     "unexpected permission_denied message: {message}"
+                );
+                assert!(
+                    message.contains("terminal-mesh.read_scrollback"),
+                    "message should name the command path: {message}"
+                );
+            }
+            other => panic!("expected PermissionDenied; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_tab_read_inner_denies_when_pty_read_scrollback_permission_missing() {
+        // Mount has cross_tab_read_flag=true AND declares cross_tab_read
+        // BUT misses pty.read_scrollback (the second command-level
+        // requirement added in Round 39). The read MUST be denied.
+        let (term_registry, target_id) = registry_with_one_scrollback("secret-2");
+        let mount_registry = crate::dispatcher::MountRegistry::new();
+        let mount_id = Uuid::new_v4();
+        let nonce = crate::dispatcher::fresh_nonce_bytes();
+        let handle = crate::dispatcher::encode_handle(mount_id, &nonce);
+        crate::dispatcher::insert_mount_with_flag(
+            &mount_registry,
+            "terminal-mesh",
+            mount_id,
+            crate::dispatcher::hash_nonce(&nonce),
+            vec!["cross_tab_read".into()], // <-- missing pty.read_scrollback
+            Some("tab-half-perm".into()),
+            true,
+        );
+        let err = cross_tab_read_inner(
+            &mount_registry,
+            &term_registry,
+            &handle,
+            &target_id.to_string(),
+            8192,
+        )
+        .unwrap_err();
+        match err {
+            TerminalMeshError::PermissionDenied { message } => {
+                assert!(
+                    message.contains("does not declare `pty.read_scrollback`"),
+                    "expected pty.read_scrollback denial; got: {message}"
+                );
+            }
+            other => panic!("expected PermissionDenied; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_command_permissions_denies_when_command_metadata_missing() {
+        // A privileged mount whose declared permissions are fine
+        // for terminal-mesh.read_scrollback should STILL deny if
+        // we ask about a command the metadata doesn't know about.
+        let mount_registry = crate::dispatcher::MountRegistry::new();
+        let resp = crate::dispatcher::insert_orchestrator_mount(
+            &mount_registry,
+            "terminal-mesh",
+            None,
+        )
+        .expect("terminal-mesh built-in metadata declares cross_tab_read");
+        let entry = crate::dispatcher::authorize_capability_handle(
+            &mount_registry,
+            &resp.handle,
+            "terminal-mesh",
+        )
+        .expect("handle authorizes");
+        let err = check_command_permissions(&entry, "terminal-mesh", "no-such-command").unwrap_err();
+        match err {
+            TerminalMeshError::PermissionDenied { message } => {
+                assert!(
+                    message.contains("command metadata missing"),
+                    "expected metadata-missing denial; got: {message}"
                 );
             }
             other => panic!("expected PermissionDenied; got {other:?}"),
