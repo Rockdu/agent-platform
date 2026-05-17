@@ -38,6 +38,8 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 fs4 = "1"
 tauri-plugin-stronghold = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-positioner = "2"
 argon2 = "0.5"
 mcp-stdio = { path = "../crates/mcp-stdio" }
 terminal-mesh-core = { path = "../crates/terminal-mesh-core" }

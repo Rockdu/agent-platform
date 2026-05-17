@@ -9,6 +9,7 @@ mod claude_discovery;
 mod dev_diagnostics;
 mod dispatcher;
 mod host_rpc;
+mod notification;
 mod generated;
 mod ide_handoff;
 mod logging;
@@ -187,6 +188,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_stronghold::Builder::new(hash_password).build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_positioner::init())
         .manage(MountRegistry::new())
         .manage(PluginMigrationState::new())
         .manage(AccessTokenCache::new())
@@ -336,6 +339,20 @@ pub fn run() {
                         app_data_root,
                         host_rpc_sock: host_rpc_sock_path,
                     });
+
+                    // Round 40 (task22): notification surface — wires
+                    // tauri-plugin-notification + tauri-plugin-positioner
+                    // through a host-level dedup arbiter, lazy
+                    // permission flow, and tray-entry ring. The
+                    // `RealNotifySink` holds a clone of the
+                    // AppHandle so it can call into the notification
+                    // plugin on every fire.
+                    let real_sink = std::sync::Arc::new(
+                        notification::RealNotifySink::new(app.handle().clone()),
+                    );
+                    let notification_service =
+                        notification::NotificationService::with_sink(real_sink);
+                    app.manage(notification_service);
                 }
                 Err(err) => tracing::error!(%err, "bootstrap failed"),
             }
@@ -382,6 +399,9 @@ pub fn run() {
             orchestrator::orchestrator_status,
             orchestrator::orchestrator_launch_claude,
             orchestrator::orchestrator_shutdown,
+            notification::notification_list_recent_tray_entries,
+            notification::notification_clear_tray_entries,
+            notification::notification_get_permission_state,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

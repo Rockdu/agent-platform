@@ -1,5 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useState, type ComponentType, type LazyExoticComponent } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { PLUGIN_TABS, type PluginTabEntry } from "./generated/plugin-tabs";
 import type {
@@ -45,6 +46,10 @@ import {
   type WorkspaceRecord,
 } from "./workspaces";
 import { WorkspaceSwitcherModal } from "./WorkspaceSwitcherModal";
+import {
+  notificationGetPermissionState,
+  type PermissionStateDto,
+} from "./notification";
 import "@xterm/xterm/css/xterm.css";
 import "./App.css";
 
@@ -107,6 +112,11 @@ export default function App() {
   const [bootstrap, setBootstrap] = useState<BootstrapState>({ kind: "loading" });
   const [migrationStatus, setMigrationStatus] = useState<PluginMigrationStatusMap>({});
   const [diagnostics, setDiagnostics] = useState<SidecarBinaryDiagnostic[]>([]);
+  // task22 / AC-8.4: polled once at mount + after notification activity
+  // (the tray bridge emits `tray://updated` which the host already
+  // re-fires perm state at the user via this banner). The denial
+  // banner explains the fallback in Chinese.
+  const [notifPermission, setNotifPermission] = useState<PermissionStateDto>("unknown");
 
   const refreshMigrationStatus = useCallback(async () => {
     try {
@@ -161,6 +171,39 @@ export default function App() {
     });
   }, []);
 
+  // task22 / AC-8.4: poll notification permission state on mount and
+  // whenever the tray refreshes (so the banner flips off if the user
+  // grants permission after first denial). The host caches the
+  // resolved state internally; this just mirrors it for the UI.
+  useEffect(() => {
+    let cancelled = false;
+    const refreshPerm = async () => {
+      try {
+        const p = await notificationGetPermissionState();
+        if (!cancelled) setNotifPermission(p);
+      } catch {
+        // Notification service may not be ready at very first paint;
+        // safe to ignore — the next tray:// event triggers a retry.
+      }
+    };
+    void refreshPerm();
+    let unlisten: (() => void) | null = null;
+    void (async () => {
+      const u = await listen("tray://updated", () => {
+        void refreshPerm();
+      });
+      if (cancelled) {
+        u();
+        return;
+      }
+      unlisten = u;
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
   useEffect(() => {
     invoke<BootstrapPaths>("bootstrap_status")
       .then((paths) => {
@@ -195,6 +238,15 @@ export default function App() {
 
   return (
     <div className="app">
+      {notifPermission === "denied" && (
+        <aside
+          className="notif-permission-banner"
+          role="alert"
+          data-notif-permission="denied"
+        >
+          系统通知已被拒绝。请在系统设置中开启通知权限，否则只能通过菜单栏托盘窗口查看任务提醒。
+        </aside>
+      )}
       <nav className="tab-strip" role="tablist">
         <TabButton
           icon={ORCHESTRATOR.icon}

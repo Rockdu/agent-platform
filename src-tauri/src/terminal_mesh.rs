@@ -373,6 +373,21 @@ async fn forward_events_to_webview(
         if let TerminalEvent::Output { bytes } = &env.event {
             append_scrollback(&scrollback, bytes);
         }
+        // Round 40 (task22): NeedsAttention events are also routed
+        // through the host-level NotificationService for dedup, the
+        // tray-entry ring, and native macOS notifications. The
+        // service is best-effort; if the host hasn't managed it
+        // (test paths, bootstrap failure) skip silently.
+        if matches!(env.event, TerminalEvent::NeedsAttention { .. }) {
+            if let Some(service) = app.try_state::<crate::notification::NotificationService>() {
+                let _decision = service.on_needs_attention(&env);
+                // Emit a frontend event so the tray window can
+                // refetch its entries list. Best-effort.
+                if let Err(err) = app.emit("tray://updated", &serde_json::json!({})) {
+                    tracing::warn!(%err, "tray://updated emit failed");
+                }
+            }
+        }
         if let Err(err) = app.emit(&topic, &env) {
             tracing::warn!(%id, %err, "terminal event emit failed");
         }

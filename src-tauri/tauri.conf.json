@@ -19,6 +19,20 @@
         "minWidth": 960,
         "minHeight": 600,
         "resizable": true
+      },
+      {
+        "title": "Tray",
+        "label": "tray",
+        "url": "index.html#/tray",
+        "width": 360,
+        "height": 320,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visible": false,
+        "skipTaskbar": true,
+        "resizable": false,
+        "focus": false
       }
     ],
     "security": {

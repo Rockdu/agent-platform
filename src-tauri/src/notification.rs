@@ -1,0 +1,582 @@
+//! task22 / AC-8.1 / AC-8.2 / AC-8.4 — host-side notification surface.
+//!
+//! Subscribes (indirectly, via `terminal_mesh::forward_events_to_webview`)
+//! to per-PTY `NeedsAttention` events, deduplicates them at the host level
+//! by `(plugin_id, terminal_id, event_kind)` per `docs/specs/terminal-events.md`
+//! §"Dedup Arbiter Behavior", and fires:
+//! - one native macOS notification per non-deduped event via
+//!   `tauri-plugin-notification` (AC-8.1)
+//! - one tray-entry record persisted in a bounded ring buffer for the
+//!   TrayBottomCenter tray window to render (AC-8.1)
+//!
+//! Permission flow (AC-8.4): the first event that would fire a notification
+//! lazily queries `permission_state()`; if `Prompt`, the service calls
+//! `request_permission()` once. The state is cached in an `AtomicU8` so
+//! subsequent fires skip the round-trip. When the resolved state is
+//! `Denied`, the tray entry is STILL recorded — the tray window
+//! continues to drive event surfacing per the AC-8.4 contract.
+//!
+//! Production wiring uses `RealNotifySink`, which holds the `AppHandle`
+//! and calls into `tauri-plugin-notification`. Tests construct
+//! `NotificationService::with_sink(...)` and pass a `RecordingNotifySink`
+//! / `DenyingNotifySink` so they never invoke the real macOS notification
+//! center.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+use terminal_mesh_core::{
+    dedup_key, AttentionKind, AttentionSeverity, DedupArbiter, TerminalEvent,
+    TerminalEventEnvelope,
+};
+
+/// Hard cap on retained tray entries. The tray window renders the
+/// most-recent slice; older entries are dropped when the ring fills.
+pub const MAX_TRAY_ENTRIES: usize = 100;
+
+/// Cached permission state. Stored as `AtomicU8` so concurrent fires
+/// don't race on the lazy first-request flow.
+const PERM_UNKNOWN: u8 = 0;
+const PERM_GRANTED: u8 = 1;
+const PERM_DENIED: u8 = 2;
+
+/// Wire shape for the tray window's "recent events" list. Camel-cased
+/// per project convention.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrayEntry {
+    pub id: String,
+    pub plugin_id: String,
+    pub terminal_id: String,
+    pub kind_name: String,
+    pub severity: String,
+    pub summary: String,
+    pub fired_at_unix_ms: u128,
+    pub suppressed_count: usize,
+}
+
+/// Wire shape for `notification_get_permission_state`. `unknown` until
+/// the first event-driven query; `granted`/`denied` thereafter.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionStateDto {
+    Unknown,
+    Granted,
+    Denied,
+}
+
+/// Trait the production sink (`RealNotifySink`) and test sinks
+/// implement. Keeps the notification service decoupled from
+/// `tauri-plugin-notification` for testability.
+pub trait NotifySink: Send + Sync {
+    /// Fire a native notification. Implementations should be best-
+    /// effort — log on failure, never panic.
+    fn fire(&self, title: &str, body: &str);
+    /// Query the current OS permission state. Called lazily.
+    fn permission_state(&self) -> NotifyPermissionState;
+    /// Request permission. Called once on first fire when
+    /// `permission_state` returns `Prompt`.
+    fn request_permission(&self) -> NotifyPermissionState;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyPermissionState {
+    Prompt,
+    Granted,
+    Denied,
+}
+
+/// Tauri-managed notification surface. Internally `Arc<Mutex>`-shared
+/// so the bridge / tauri commands / terminal_mesh forwarder all hold
+/// the same underlying state via cheap `Clone`.
+#[derive(Clone)]
+pub struct NotificationService {
+    inner: Arc<NotificationInner>,
+}
+
+struct NotificationInner {
+    arbiter: StdMutex<DedupArbiter>,
+    entries: StdMutex<VecDeque<TrayEntry>>,
+    permission: AtomicU8,
+    sink: Arc<dyn NotifySink>,
+}
+
+impl NotificationService {
+    /// Production constructor — wraps a `RealNotifySink` around the
+    /// `AppHandle`. The handle is cheap to clone (it's `Arc`-shared
+    /// inside Tauri).
+    pub fn with_sink(sink: Arc<dyn NotifySink>) -> Self {
+        Self {
+            inner: Arc::new(NotificationInner {
+                arbiter: StdMutex::new(DedupArbiter::for_production()),
+                entries: StdMutex::new(VecDeque::with_capacity(MAX_TRAY_ENTRIES)),
+                permission: AtomicU8::new(PERM_UNKNOWN),
+                sink,
+            }),
+        }
+    }
+
+    /// Snapshot of the recent tray entries (newest first).
+    pub fn list_recent_entries(&self) -> Vec<TrayEntry> {
+        let guard = self.inner.entries.lock().expect("notification entries poisoned");
+        guard.iter().rev().cloned().collect()
+    }
+
+    /// Clear all tray entries (UI "clear all" button).
+    pub fn clear_entries(&self) {
+        let mut guard = self.inner.entries.lock().expect("notification entries poisoned");
+        guard.clear();
+    }
+
+    /// Cached permission state. `Unknown` until the first event-
+    /// driven `on_needs_attention` runs; `Granted`/`Denied` thereafter.
+    pub fn permission_state_dto(&self) -> PermissionStateDto {
+        match self.inner.permission.load(Ordering::SeqCst) {
+            PERM_GRANTED => PermissionStateDto::Granted,
+            PERM_DENIED => PermissionStateDto::Denied,
+            _ => PermissionStateDto::Unknown,
+        }
+    }
+
+    /// Entry point called by `terminal_mesh::forward_events_to_webview`
+    /// for every `NeedsAttention` envelope. Pure side-effect free
+    /// otherwise (no IO except via the sink + the optional `app.emit`
+    /// for the tray refresh notification, which the caller handles).
+    ///
+    /// Returns `true` if the event fired a native notification + a
+    /// fresh tray entry, `false` if it was deduped (suppressed_count
+    /// on the existing entry was bumped) or if permission was denied
+    /// (tray entry recorded; native fire skipped).
+    pub fn on_needs_attention(
+        &self,
+        envelope: &TerminalEventEnvelope,
+    ) -> NotificationDecision {
+        let TerminalEvent::NeedsAttention { ref payload } = envelope.event else {
+            return NotificationDecision::SkippedNonAttention;
+        };
+        let plugin_id = envelope.plugin_id.as_str();
+        let kind_str = kind_name_str(&payload.kind);
+        let key = dedup_key(plugin_id, envelope.terminal_id, &payload.kind);
+
+        // Dedup arbiter under a single mutex so concurrent fires for
+        // the same key don't both pass.
+        let decision = {
+            let mut arb = self.inner.arbiter.lock().expect("dedup arbiter poisoned");
+            arb.try_record(&key, payload.event_id, Instant::now())
+        };
+        match decision {
+            terminal_mesh_core::ArbiterDecision::Suppress { .. } => {
+                // Bump suppressed_count on the most-recent matching
+                // entry if any (the user has visibility into "X more
+                // events of this type were suppressed").
+                let mut guard = self.inner.entries.lock().expect("entries poisoned");
+                if let Some(e) = guard.iter_mut().rev().find(|e| {
+                    e.plugin_id == plugin_id
+                        && e.terminal_id == envelope.terminal_id.to_string()
+                        && e.kind_name == kind_str
+                }) {
+                    e.suppressed_count += 1;
+                }
+                return NotificationDecision::DedupedSuppressed;
+            }
+            terminal_mesh_core::ArbiterDecision::Fire => {}
+        }
+
+        // Lazy permission check / request on the FIRST fire only.
+        let perm = self.ensure_permission_resolved();
+
+        let (summary, severity) = summarize(&payload.kind);
+        let entry = TrayEntry {
+            id: payload.event_id.to_string(),
+            plugin_id: plugin_id.to_string(),
+            terminal_id: envelope.terminal_id.to_string(),
+            kind_name: kind_str.to_string(),
+            severity,
+            summary,
+            fired_at_unix_ms: system_time_to_unix_ms(envelope.timestamp),
+            suppressed_count: 0,
+        };
+        {
+            let mut guard = self.inner.entries.lock().expect("entries poisoned");
+            guard.push_back(entry.clone());
+            while guard.len() > MAX_TRAY_ENTRIES {
+                guard.pop_front();
+            }
+        }
+
+        match perm {
+            NotifyPermissionState::Granted => {
+                self.inner
+                    .sink
+                    .fire(&notification_title(plugin_id, &entry.kind_name), &entry.summary);
+                NotificationDecision::FiredNativeAndTray
+            }
+            NotifyPermissionState::Denied | NotifyPermissionState::Prompt => {
+                // `ensure_permission_resolved` only returns `Prompt`
+                // if the sink itself returned `Prompt` from both
+                // `permission_state` and `request_permission` — which
+                // on macOS shouldn't happen because the OS resolves
+                // to Granted/Denied after the user dismisses the
+                // prompt. Treat as record-without-notify so we don't
+                // lose the event.
+                NotificationDecision::TrayOnlyPermissionDenied
+            }
+        }
+    }
+
+    fn ensure_permission_resolved(&self) -> NotifyPermissionState {
+        let cached = self.inner.permission.load(Ordering::SeqCst);
+        if cached == PERM_GRANTED {
+            return NotifyPermissionState::Granted;
+        }
+        if cached == PERM_DENIED {
+            return NotifyPermissionState::Denied;
+        }
+        // Unknown: query the sink, then maybe request.
+        let mut state = self.inner.sink.permission_state();
+        if matches!(state, NotifyPermissionState::Prompt) {
+            state = self.inner.sink.request_permission();
+        }
+        let cached_value = match state {
+            NotifyPermissionState::Granted => PERM_GRANTED,
+            NotifyPermissionState::Denied => PERM_DENIED,
+            NotifyPermissionState::Prompt => PERM_UNKNOWN,
+        };
+        // CAS to avoid clobbering a concurrent fire that may have
+        // already set the state. We only set if still Unknown.
+        let _ = self.inner.permission.compare_exchange(
+            PERM_UNKNOWN,
+            cached_value,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        state
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationDecision {
+    FiredNativeAndTray,
+    TrayOnlyPermissionDenied,
+    DedupedSuppressed,
+    /// Returned when called with a non-NeedsAttention envelope —
+    /// defensive only; the call site only invokes this method on
+    /// NeedsAttention.
+    SkippedNonAttention,
+}
+
+/// Stable camelCase wire string for the `AttentionKind` discriminant,
+/// matching `kind_name()` from terminal-mesh-core but lower-camel for
+/// the JSON wire shape.
+fn kind_name_str(kind: &AttentionKind) -> &'static str {
+    match kind {
+        AttentionKind::Completion { .. } => "completion",
+        AttentionKind::NonZeroExit { .. } => "nonZeroExit",
+        AttentionKind::PromptWaiting => "promptWaiting",
+        AttentionKind::AgentMarker { .. } => "agentMarker",
+    }
+}
+
+fn severity_name(severity: AttentionSeverity) -> String {
+    match severity {
+        AttentionSeverity::Info => "info".to_string(),
+        AttentionSeverity::NeedsConfirm => "needsConfirm".to_string(),
+        AttentionSeverity::Error => "error".to_string(),
+    }
+}
+
+/// Per `docs/specs/terminal-events.md` §"Summary Strings": derive a
+/// short human-readable summary + severity from the attention kind.
+/// Only `AgentMarker` carries an explicit summary/severity; other
+/// variants get a deterministic short string.
+fn summarize(kind: &AttentionKind) -> (String, String) {
+    match kind {
+        AttentionKind::Completion { exit_code } => (
+            format!("Completed (exit {exit_code})"),
+            severity_name(AttentionSeverity::Info),
+        ),
+        AttentionKind::NonZeroExit { exit_code } => (
+            format!("Exited with code {exit_code}"),
+            severity_name(AttentionSeverity::Error),
+        ),
+        AttentionKind::PromptWaiting => (
+            "Waiting for input".to_string(),
+            severity_name(AttentionSeverity::NeedsConfirm),
+        ),
+        AttentionKind::AgentMarker { summary, severity } => (
+            summary.clone().unwrap_or_else(|| "Agent marker".to_string()),
+            severity_name(*severity),
+        ),
+    }
+}
+
+fn notification_title(plugin_id: &str, kind_name: &str) -> String {
+    format!("{plugin_id}: {kind_name}")
+}
+
+fn system_time_to_unix_ms(t: SystemTime) -> u128 {
+    t.duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+}
+
+// ----- Production sink wrapping tauri-plugin-notification -----
+
+/// Production `NotifySink` that holds a Tauri `AppHandle` and routes
+/// to `tauri-plugin-notification`. Cheap to clone (AppHandle is
+/// internally Arc-shared).
+pub struct RealNotifySink {
+    app: tauri::AppHandle,
+}
+
+impl RealNotifySink {
+    pub fn new(app: tauri::AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl NotifySink for RealNotifySink {
+    fn fire(&self, title: &str, body: &str) {
+        use tauri_plugin_notification::NotificationExt;
+        let res = self
+            .app
+            .notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .show();
+        if let Err(err) = res {
+            tracing::warn!(error = %err, title = %title, "notification fire failed");
+        }
+    }
+
+    fn permission_state(&self) -> NotifyPermissionState {
+        use tauri_plugin_notification::NotificationExt;
+        match self.app.notification().permission_state() {
+            Ok(tauri::plugin::PermissionState::Granted) => NotifyPermissionState::Granted,
+            Ok(tauri::plugin::PermissionState::Denied) => NotifyPermissionState::Denied,
+            Ok(_) => NotifyPermissionState::Prompt,
+            Err(err) => {
+                tracing::warn!(error = %err, "notification permission_state query failed");
+                NotifyPermissionState::Prompt
+            }
+        }
+    }
+
+    fn request_permission(&self) -> NotifyPermissionState {
+        use tauri_plugin_notification::NotificationExt;
+        match self.app.notification().request_permission() {
+            Ok(tauri::plugin::PermissionState::Granted) => NotifyPermissionState::Granted,
+            Ok(tauri::plugin::PermissionState::Denied) => NotifyPermissionState::Denied,
+            Ok(_) => NotifyPermissionState::Prompt,
+            Err(err) => {
+                tracing::warn!(error = %err, "notification request_permission failed");
+                NotifyPermissionState::Prompt
+            }
+        }
+    }
+}
+
+// ----- Tauri commands -----
+
+#[tauri::command]
+pub fn notification_list_recent_tray_entries(
+    service: tauri::State<'_, NotificationService>,
+) -> Vec<TrayEntry> {
+    service.list_recent_entries()
+}
+
+#[tauri::command]
+pub fn notification_clear_tray_entries(service: tauri::State<'_, NotificationService>) {
+    service.clear_entries();
+}
+
+#[tauri::command]
+pub fn notification_get_permission_state(
+    service: tauri::State<'_, NotificationService>,
+) -> PermissionStateDto {
+    service.permission_state_dto()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::thread;
+    use std::time::Duration;
+    use terminal_mesh_core::{
+        AttentionKind, AttentionSeverity, NeedsAttentionPayload, TerminalEvent, TerminalEventEnvelope,
+    };
+    use uuid::Uuid;
+
+    /// In-process sink that records fires + lets tests pre-program
+    /// the permission state.
+    struct RecordingSink {
+        fires: Mutex<Vec<(String, String)>>,
+        permission: Mutex<NotifyPermissionState>,
+    }
+
+    impl RecordingSink {
+        fn new(initial: NotifyPermissionState) -> Arc<Self> {
+            Arc::new(Self {
+                fires: Mutex::new(Vec::new()),
+                permission: Mutex::new(initial),
+            })
+        }
+        fn fire_count(&self) -> usize {
+            self.fires.lock().unwrap().len()
+        }
+    }
+
+    impl NotifySink for RecordingSink {
+        fn fire(&self, title: &str, body: &str) {
+            self.fires
+                .lock()
+                .unwrap()
+                .push((title.to_string(), body.to_string()));
+        }
+        fn permission_state(&self) -> NotifyPermissionState {
+            *self.permission.lock().unwrap()
+        }
+        fn request_permission(&self) -> NotifyPermissionState {
+            *self.permission.lock().unwrap()
+        }
+    }
+
+    fn fake_attention_envelope(
+        terminal_id: Uuid,
+        kind: AttentionKind,
+    ) -> TerminalEventEnvelope {
+        TerminalEventEnvelope::now(
+            terminal_id,
+            TerminalEvent::NeedsAttention {
+                payload: NeedsAttentionPayload {
+                    event_id: Uuid::new_v4(),
+                    dedup_key: String::new(),
+                    kind,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn dedup_arbiter_suppresses_repeat_within_window() {
+        let sink = RecordingSink::new(NotifyPermissionState::Granted);
+        let svc = NotificationService::with_sink(sink.clone());
+        let tid = Uuid::new_v4();
+        let env1 = fake_attention_envelope(tid, AttentionKind::PromptWaiting);
+        let env2 = fake_attention_envelope(tid, AttentionKind::PromptWaiting);
+
+        let d1 = svc.on_needs_attention(&env1);
+        let d2 = svc.on_needs_attention(&env2);
+        assert_eq!(d1, NotificationDecision::FiredNativeAndTray);
+        assert_eq!(d2, NotificationDecision::DedupedSuppressed);
+        assert_eq!(sink.fire_count(), 1, "native fire only once per dedup window");
+        let entries = svc.list_recent_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].suppressed_count, 1);
+    }
+
+    #[test]
+    fn dedup_arbiter_fires_again_after_window_elapses() {
+        // The terminal-mesh-core arbiter uses Instant; we can't fast-
+        // forward time. Sleep just past the 2s window. Accepts the
+        // 2.1s cost for the regression confidence.
+        let sink = RecordingSink::new(NotifyPermissionState::Granted);
+        let svc = NotificationService::with_sink(sink.clone());
+        let tid = Uuid::new_v4();
+        let env1 = fake_attention_envelope(tid, AttentionKind::PromptWaiting);
+        let env2 = fake_attention_envelope(tid, AttentionKind::PromptWaiting);
+
+        let _ = svc.on_needs_attention(&env1);
+        thread::sleep(Duration::from_millis(2100));
+        let d2 = svc.on_needs_attention(&env2);
+        assert_eq!(d2, NotificationDecision::FiredNativeAndTray);
+        assert_eq!(sink.fire_count(), 2);
+    }
+
+    #[test]
+    fn permission_denied_records_tray_entry_without_notify() {
+        let sink = RecordingSink::new(NotifyPermissionState::Denied);
+        let svc = NotificationService::with_sink(sink.clone());
+        let tid = Uuid::new_v4();
+        let env = fake_attention_envelope(tid, AttentionKind::PromptWaiting);
+
+        let d = svc.on_needs_attention(&env);
+        assert_eq!(d, NotificationDecision::TrayOnlyPermissionDenied);
+        assert_eq!(
+            sink.fire_count(),
+            0,
+            "native notification must NOT fire when permission is denied"
+        );
+        assert_eq!(
+            svc.list_recent_entries().len(),
+            1,
+            "tray entry MUST still be recorded so the tray window drives surfacing"
+        );
+        assert!(matches!(svc.permission_state_dto(), PermissionStateDto::Denied));
+    }
+
+    #[test]
+    fn tray_entry_ring_caps_at_max_size() {
+        let sink = RecordingSink::new(NotifyPermissionState::Granted);
+        let svc = NotificationService::with_sink(sink.clone());
+        for _ in 0..(MAX_TRAY_ENTRIES + 10) {
+            let env = fake_attention_envelope(Uuid::new_v4(), AttentionKind::PromptWaiting);
+            let _ = svc.on_needs_attention(&env);
+        }
+        let entries = svc.list_recent_entries();
+        assert_eq!(entries.len(), MAX_TRAY_ENTRIES);
+    }
+
+    #[test]
+    fn clear_entries_empties_tray_ring() {
+        let sink = RecordingSink::new(NotifyPermissionState::Granted);
+        let svc = NotificationService::with_sink(sink.clone());
+        for _ in 0..3 {
+            let env = fake_attention_envelope(Uuid::new_v4(), AttentionKind::PromptWaiting);
+            let _ = svc.on_needs_attention(&env);
+        }
+        assert_eq!(svc.list_recent_entries().len(), 3);
+        svc.clear_entries();
+        assert_eq!(svc.list_recent_entries().len(), 0);
+    }
+
+    #[test]
+    fn permission_state_dto_starts_unknown_then_resolves_on_first_event() {
+        let sink = RecordingSink::new(NotifyPermissionState::Granted);
+        let svc = NotificationService::with_sink(sink.clone());
+        assert!(matches!(svc.permission_state_dto(), PermissionStateDto::Unknown));
+        let env = fake_attention_envelope(Uuid::new_v4(), AttentionKind::PromptWaiting);
+        let _ = svc.on_needs_attention(&env);
+        assert!(matches!(svc.permission_state_dto(), PermissionStateDto::Granted));
+    }
+
+    #[test]
+    fn non_attention_envelope_is_skipped() {
+        let sink = RecordingSink::new(NotifyPermissionState::Granted);
+        let svc = NotificationService::with_sink(sink.clone());
+        let env = TerminalEventEnvelope::now(
+            Uuid::new_v4(),
+            TerminalEvent::Output { bytes: vec![1, 2, 3] },
+        );
+        let d = svc.on_needs_attention(&env);
+        assert_eq!(d, NotificationDecision::SkippedNonAttention);
+        assert_eq!(sink.fire_count(), 0);
+        assert_eq!(svc.list_recent_entries().len(), 0);
+    }
+
+    #[test]
+    fn summary_for_each_attention_kind_is_deterministic() {
+        assert_eq!(summarize(&AttentionKind::Completion { exit_code: 0 }).0, "Completed (exit 0)");
+        assert_eq!(summarize(&AttentionKind::NonZeroExit { exit_code: 7 }).0, "Exited with code 7");
+        assert_eq!(summarize(&AttentionKind::PromptWaiting).0, "Waiting for input");
+        let (s, sev) = summarize(&AttentionKind::AgentMarker {
+            summary: Some("done".into()),
+            severity: AttentionSeverity::Error,
+        });
+        assert_eq!(s, "done");
+        assert_eq!(sev, "error");
+    }
+}
