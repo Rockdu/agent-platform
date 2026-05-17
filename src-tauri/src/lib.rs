@@ -353,6 +353,70 @@ pub fn run() {
                     let notification_service =
                         notification::NotificationService::with_sink(real_sink);
                     app.manage(notification_service);
+
+                    // Round 41 (task22 remediation): menubar tray icon
+                    // — left-click toggles the tray window via
+                    // `Position::TrayBottomCenter` (per AC-8.1). The
+                    // tray-icon API needs the positioner crate's
+                    // `tray-icon` feature enabled in Cargo.toml.
+                    let tray_icon_result = tauri::tray::TrayIconBuilder::with_id("notifications")
+                        .icon(app.default_window_icon().expect("default icon").clone())
+                        .icon_as_template(true)
+                        .show_menu_on_left_click(false)
+                        .on_tray_icon_event(|tray, event| {
+                            let app = tray.app_handle().clone();
+                            // First let the positioner record the tray
+                            // rect for its subsequent move_window call.
+                            tauri_plugin_positioner::on_tray_event(&app, &event);
+                            // Only react to the left-click-release; the
+                            // Click event fires twice (Down + Up) and
+                            // we only want a single toggle per click.
+                            let is_left_click_up = matches!(
+                                event,
+                                tauri::tray::TrayIconEvent::Click {
+                                    button: tauri::tray::MouseButton::Left,
+                                    button_state: tauri::tray::MouseButtonState::Up,
+                                    ..
+                                }
+                            );
+                            if !is_left_click_up {
+                                return;
+                            }
+                            use tauri::Manager;
+                            let Some(window) = app.get_webview_window("tray") else {
+                                tracing::warn!("tray click: tray webview window missing");
+                                return;
+                            };
+                            // Reposition first so the window appears
+                            // at the right spot when shown.
+                            use tauri_plugin_positioner::{Position, WindowExt};
+                            if let Err(err) =
+                                window.move_window(Position::TrayBottomCenter)
+                            {
+                                tracing::warn!(%err, "tray click: move_window failed");
+                            }
+                            let visible = window.is_visible().unwrap_or(false);
+                            match notification::compute_tray_toggle_action(visible) {
+                                notification::TrayToggleAction::Hide => {
+                                    if let Err(err) = window.hide() {
+                                        tracing::warn!(%err, "tray window hide failed");
+                                    }
+                                }
+                                notification::TrayToggleAction::Show => {
+                                    if let Err(err) = window.show() {
+                                        tracing::warn!(%err, "tray window show failed");
+                                    }
+                                    if let Err(err) = window.set_focus() {
+                                        tracing::warn!(%err, "tray window set_focus failed");
+                                    }
+                                }
+                            }
+                        })
+                        .build(app);
+                    match tray_icon_result {
+                        Ok(_tray) => tracing::info!("tray icon registered"),
+                        Err(err) => tracing::error!(%err, "tray icon registration failed"),
+                    }
                 }
                 Err(err) => tracing::error!(%err, "bootstrap failed"),
             }

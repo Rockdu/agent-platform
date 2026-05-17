@@ -268,6 +268,24 @@ pub enum NotificationDecision {
     SkippedNonAttention,
 }
 
+/// task22 Round 41: pure helper extracted from the tray-icon click
+/// handler so the toggle decision (which depends only on the tray
+/// window's current visibility) is unit-testable without spinning up
+/// a Tauri webview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayToggleAction {
+    Show,
+    Hide,
+}
+
+pub fn compute_tray_toggle_action(currently_visible: bool) -> TrayToggleAction {
+    if currently_visible {
+        TrayToggleAction::Hide
+    } else {
+        TrayToggleAction::Show
+    }
+}
+
 /// Stable camelCase wire string for the `AttentionKind` discriminant,
 /// matching `kind_name()` from terminal-mesh-core but lower-camel for
 /// the JSON wire shape.
@@ -565,6 +583,64 @@ mod tests {
         assert_eq!(d, NotificationDecision::SkippedNonAttention);
         assert_eq!(sink.fire_count(), 0);
         assert_eq!(svc.list_recent_entries().len(), 0);
+    }
+
+    // Round 41 (task22 remediation): real-path shape regression.
+    // The terminal-mesh-core actor no longer pre-dedups, so two
+    // back-to-back classifications produce two distinct
+    // `NeedsAttention` envelopes with fresh `event_id`s. The host
+    // `NotificationService` MUST be the single dedup point: one
+    // native fire + one tray entry whose `suppressed_count` reaches
+    // 1 after the second envelope.
+    #[test]
+    fn host_service_dedups_repeated_envelopes_with_fresh_event_ids() {
+        let sink = RecordingSink::new(NotifyPermissionState::Granted);
+        let svc = NotificationService::with_sink(sink.clone());
+        let tid = Uuid::new_v4();
+        // Build TWO envelopes with the SAME (plugin_id, terminal_id,
+        // kind) but FRESH event_ids — this is exactly what the
+        // post-Round-41 actor emits.
+        let env1 = fake_attention_envelope(tid, AttentionKind::Completion { exit_code: 0 });
+        let env2 = fake_attention_envelope(tid, AttentionKind::Completion { exit_code: 0 });
+        // Sanity: event_ids differ (proves the actor would have
+        // pre-deduped before Round 41 because the key matches).
+        let TerminalEvent::NeedsAttention { payload: ref p1 } = env1.event else {
+            unreachable!();
+        };
+        let TerminalEvent::NeedsAttention { payload: ref p2 } = env2.event else {
+            unreachable!();
+        };
+        assert_ne!(p1.event_id, p2.event_id, "fresh event_ids per envelope");
+
+        let d1 = svc.on_needs_attention(&env1);
+        let d2 = svc.on_needs_attention(&env2);
+        assert_eq!(d1, NotificationDecision::FiredNativeAndTray);
+        assert_eq!(d2, NotificationDecision::DedupedSuppressed);
+        assert_eq!(sink.fire_count(), 1, "host arbiter is the single dedup point");
+        let entries = svc.list_recent_entries();
+        assert_eq!(entries.len(), 1, "single tray entry after dedup");
+        assert_eq!(
+            entries[0].suppressed_count, 1,
+            "suppressed_count tracks deduped repeats"
+        );
+    }
+
+    // Round 41 (task22 remediation): unit-testable tray-toggle
+    // decision separated from the live Tauri Window handle.
+    #[test]
+    fn compute_tray_toggle_action_hides_when_visible() {
+        assert_eq!(
+            compute_tray_toggle_action(true),
+            TrayToggleAction::Hide
+        );
+    }
+
+    #[test]
+    fn compute_tray_toggle_action_shows_when_hidden() {
+        assert_eq!(
+            compute_tray_toggle_action(false),
+            TrayToggleAction::Show
+        );
     }
 
     #[test]

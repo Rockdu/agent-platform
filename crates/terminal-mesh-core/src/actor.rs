@@ -20,7 +20,9 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::dedup_arbiter::{ArbiterDecision, DedupArbiter};
+// task22 Round 41: per-actor `DedupArbiter` removed; the host
+// `NotificationService` is now the single notification-dedup point.
+// `dedup_key` is still consumed by host code via `crate::events`.
 use crate::events::{
     dedup_key, AttentionKind, BufferTruncated, NeedsAttentionPayload, TerminalEvent,
     TerminalEventEnvelope, TERMINAL_MESH_PLUGIN_ID,
@@ -229,7 +231,6 @@ async fn processor_task(
     let mut ring = RingBuffer::new();
     let mut osc = OscAgentMarkerParser::new();
     let mut prompt = PromptDetector::default_bash_zsh();
-    let mut arbiter = DedupArbiter::for_production();
     let mut tick = tokio::time::interval(PROMPT_TICK_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut shutdown_requested = false;
@@ -343,7 +344,6 @@ async fn processor_task(
                         }
                         for ev in osc.feed(&bytes) {
                             emit_attention(
-                                &mut arbiter,
                                 terminal_id,
                                 &events_tx,
                                 AttentionKind::AgentMarker {
@@ -356,7 +356,6 @@ async fn processor_task(
                         let tail = ring.read_scrollback(PROMPT_TAIL_BYTES);
                         if prompt.poll(&tail, Instant::now()).is_some() {
                             emit_attention(
-                                &mut arbiter,
                                 terminal_id,
                                 &events_tx,
                                 AttentionKind::PromptWaiting,
@@ -379,7 +378,6 @@ async fn processor_task(
             _ = tick.tick() => {
                 if prompt.tick(Instant::now()).is_some() {
                     emit_attention(
-                        &mut arbiter,
                         terminal_id,
                         &events_tx,
                         AttentionKind::PromptWaiting,
@@ -429,14 +427,15 @@ async fn processor_task(
     let code = child_exit_code.flatten();
     let envelope = TerminalEventEnvelope::now(terminal_id, TerminalEvent::Exit { code });
     let _ = events_tx.send(envelope).await;
-    // Emit Completion / NonZeroExit through the dedup arbiter.
+    // task22 Round 41: emit Completion / NonZeroExit unconditionally
+    // — the host `NotificationService` owns notification dedup.
     if let Some(c) = code {
         let kind = if c == 0 {
             AttentionKind::Completion { exit_code: 0 }
         } else {
             AttentionKind::NonZeroExit { exit_code: c }
         };
-        emit_attention(&mut arbiter, terminal_id, &events_tx, kind).await;
+        emit_attention(terminal_id, &events_tx, kind).await;
     }
     if shutdown_requested {
         let env = TerminalEventEnvelope::now(terminal_id, TerminalEvent::Cancelled);
@@ -485,31 +484,28 @@ fn send_hard_kill(
     }
 }
 
+/// task22 Round 41: emit every classified `NeedsAttention` event
+/// unconditionally. The host `NotificationService` owns dedup; this
+/// helper only handles `dedup_key` formatting and envelope wrapping.
+/// Each call generates a fresh `event_id` so the host arbiter can
+/// distinguish individual events for its suppressed-count tracking.
 async fn emit_attention(
-    arbiter: &mut DedupArbiter,
     terminal_id: Uuid,
     events_tx: &mpsc::Sender<TerminalEventEnvelope>,
     kind: AttentionKind,
 ) {
     let key = dedup_key(TERMINAL_MESH_PLUGIN_ID, terminal_id, &kind);
     let event_id = Uuid::new_v4();
-    match arbiter.try_record(&key, event_id, Instant::now()) {
-        ArbiterDecision::Fire => {
-            let payload = NeedsAttentionPayload {
-                event_id,
-                dedup_key: key,
-                kind,
-            };
-            let env = TerminalEventEnvelope::now(
-                terminal_id,
-                TerminalEvent::NeedsAttention { payload },
-            );
-            let _ = events_tx.send(env).await;
-        }
-        ArbiterDecision::Suppress { .. } => {
-            // Suppressed; not emitted on the user-facing channel.
-        }
-    }
+    let payload = NeedsAttentionPayload {
+        event_id,
+        dedup_key: key,
+        kind,
+    };
+    let env = TerminalEventEnvelope::now(
+        terminal_id,
+        TerminalEvent::NeedsAttention { payload },
+    );
+    let _ = events_tx.send(env).await;
 }
 
 #[cfg(all(test, unix))]
