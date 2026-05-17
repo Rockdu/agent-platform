@@ -7,8 +7,17 @@ import {
   type WorkspaceErrorDto,
   type WorkspaceRecord,
 } from "./workspaces";
+import {
+  getIdePreference,
+  isIdeHandoffErrorDto,
+  openWorkspaceInIde,
+  revealWorkspaceInFinder,
+  setIdePreference,
+  type IdeHandoffErrorDto,
+  type IdePreference,
+} from "./ide-handoff";
 
-type SwitcherMode = "create" | "recent";
+type SwitcherMode = "create" | "recent" | "settings";
 
 type CreateSource =
   | { kind: "auto" }
@@ -45,6 +54,25 @@ export function WorkspaceSwitcherModal({
   const [source, setSource] = useState<CreateSource>({ kind: "auto" });
   const [error, setError] = useState<WorkspaceErrorDto | null>(null);
   const [busy, setBusy] = useState(false);
+  const [ideError, setIdeError] = useState<IdeHandoffErrorDto | null>(null);
+
+  const onCursor = useCallback(async (workspacePath: string) => {
+    setIdeError(null);
+    try {
+      await openWorkspaceInIde(workspacePath);
+    } catch (err) {
+      if (isIdeHandoffErrorDto(err)) setIdeError(err);
+    }
+  }, []);
+
+  const onFinder = useCallback(async (workspacePath: string) => {
+    setIdeError(null);
+    try {
+      await revealWorkspaceInFinder(workspacePath);
+    } catch (err) {
+      if (isIdeHandoffErrorDto(err)) setIdeError(err);
+    }
+  }, []);
 
   // Esc-key close. Bound only while the modal is open so other panes
   // keep their own Esc handlers intact.
@@ -193,6 +221,17 @@ export function WorkspaceSwitcherModal({
           >
             最近使用 ({workspaces.length})
           </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mode === "settings"}
+            className={`workspace-switcher-modal__tab ${
+              mode === "settings" ? "workspace-switcher-modal__tab--active" : ""
+            }`}
+            onClick={() => setMode("settings")}
+          >
+            设置
+          </button>
         </nav>
         <div className="workspace-switcher-modal__body">
           {mode === "create" && (
@@ -212,10 +251,22 @@ export function WorkspaceSwitcherModal({
               workspaces={workspaces}
               openWorkspaceIds={openWorkspaceIds}
               onRowClick={onRowClick}
+              onCursor={onCursor}
+              onFinder={onFinder}
               busy={busy}
             />
           )}
+          {mode === "settings" && <SettingsPane onError={setIdeError} />}
         </div>
+        {ideError && (
+          <p
+            className="workspace-switcher-modal__error"
+            role="alert"
+            data-ide-handoff-error={ideError.kind}
+          >
+            <code>{ideError.kind}</code>: {renderIdeError(ideError)}
+          </p>
+        )}
         {error && (
           <p
             className="workspace-switcher-modal__error"
@@ -334,9 +385,11 @@ function RecentPane(props: {
   workspaces: WorkspaceRecord[];
   openWorkspaceIds: Set<string>;
   onRowClick: (w: WorkspaceRecord) => Promise<void> | void;
+  onCursor: (path: string) => Promise<void> | void;
+  onFinder: (path: string) => Promise<void> | void;
   busy: boolean;
 }) {
-  const { workspaces, openWorkspaceIds, onRowClick, busy } = props;
+  const { workspaces, openWorkspaceIds, onRowClick, onCursor, onFinder, busy } = props;
   if (workspaces.length === 0) {
     return (
       <p className="workspace-switcher-modal__hint">
@@ -348,38 +401,162 @@ function RecentPane(props: {
     <ul className="workspace-switcher-modal__list">
       {workspaces.map((w) => (
         <li key={w.workspaceId}>
-          <button
-            type="button"
-            className="workspace-switcher-modal__row"
-            onClick={() => void onRowClick(w)}
-            disabled={busy}
+          <div
+            className="workspace-switcher-modal__row workspace-switcher-modal__row--composite"
             data-workspace-id={w.workspaceId}
             data-open={openWorkspaceIds.has(w.workspaceId) ? "true" : "false"}
           >
-            <div className="workspace-switcher-modal__row-name">
-              <strong>{w.name}</strong>
-              {openWorkspaceIds.has(w.workspaceId) && (
-                <span className="workspace-switcher-modal__row-badge">
-                  已打开
+            <button
+              type="button"
+              className="workspace-switcher-modal__row-main"
+              onClick={() => void onRowClick(w)}
+              disabled={busy}
+            >
+              <div className="workspace-switcher-modal__row-name">
+                <strong>{w.name}</strong>
+                {openWorkspaceIds.has(w.workspaceId) && (
+                  <span className="workspace-switcher-modal__row-badge">
+                    已打开
+                  </span>
+                )}
+              </div>
+              <code className="workspace-switcher-modal__row-path">{w.path}</code>
+              <div className="workspace-switcher-modal__row-meta">
+                <span>最近使用: {w.lastUsedAt}</span>
+                <span>创建: {w.createdAt}</span>
+                <span>
+                  claude 对话:{" "}
+                  {w.conversationRoundsCount > 0
+                    ? `${w.conversationRoundsCount} 轮`
+                    : "无"}
                 </span>
-              )}
+              </div>
+            </button>
+            <div className="workspace-switcher-modal__row-actions">
+              <button
+                type="button"
+                className="workspace-switcher-modal__row-action"
+                onClick={(e) => {
+                  // Codex AC-4.6: row-level action buttons must NOT
+                  // also trigger the surrounding row open.
+                  e.stopPropagation();
+                  void onCursor(w.path);
+                }}
+                disabled={busy}
+              >
+                Cursor 中打开
+              </button>
+              <button
+                type="button"
+                className="workspace-switcher-modal__row-action"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void onFinder(w.path);
+                }}
+                disabled={busy}
+              >
+                Finder 中显示
+              </button>
             </div>
-            <code className="workspace-switcher-modal__row-path">{w.path}</code>
-            <div className="workspace-switcher-modal__row-meta">
-              <span>最近使用: {w.lastUsedAt}</span>
-              <span>创建: {w.createdAt}</span>
-              <span>
-                claude 对话:{" "}
-                {w.conversationRoundsCount > 0
-                  ? `${w.conversationRoundsCount} 轮`
-                  : "无"}
-              </span>
-            </div>
-          </button>
+          </div>
         </li>
       ))}
     </ul>
   );
+}
+
+function SettingsPane(props: {
+  onError: (e: IdeHandoffErrorDto | null) => void;
+}) {
+  const { onError } = props;
+  const [pref, setPref] = useState<IdePreference | null>(null);
+  const [commandDraft, setCommandDraft] = useState("");
+  const [argsDraft, setArgsDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const p = await getIdePreference();
+        setPref(p);
+        setCommandDraft(p.ideCommand);
+        setArgsDraft(p.ideArgsTemplate.join(","));
+      } catch (err) {
+        if (isIdeHandoffErrorDto(err)) onError(err);
+      }
+    })();
+  }, [onError]);
+
+  const onSave = useCallback(async () => {
+    setBusy(true);
+    setStatus(null);
+    try {
+      const updated = await setIdePreference({
+        ideCommand: commandDraft.trim(),
+        ideArgsTemplate: argsDraft
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s !== ""),
+      });
+      setPref(updated);
+      setStatus("已保存");
+      onError(null);
+    } catch (err) {
+      if (isIdeHandoffErrorDto(err)) onError(err);
+    } finally {
+      setBusy(false);
+    }
+  }, [commandDraft, argsDraft, onError]);
+
+  if (!pref) {
+    return <p className="workspace-switcher-modal__hint">加载中…</p>;
+  }
+  return (
+    <div className="workspace-switcher-modal__settings">
+      <p className="workspace-switcher-modal__hint">
+        “Cursor 中打开” 会调用以下命令并附加工作区路径。可改为 <code>code</code>、
+        <code>zed</code> 或其它 IDE 的 CLI。
+      </p>
+      <label className="workspace-switcher-modal__field">
+        IDE 命令
+        <input
+          type="text"
+          value={commandDraft}
+          onChange={(e) => setCommandDraft(e.target.value)}
+          spellCheck={false}
+        />
+      </label>
+      <label className="workspace-switcher-modal__field">
+        参数模板（用逗号分隔，<code>{"{path}"}</code> 会被替换为工作区路径）
+        <input
+          type="text"
+          value={argsDraft}
+          onChange={(e) => setArgsDraft(e.target.value)}
+          spellCheck={false}
+        />
+      </label>
+      <div className="workspace-switcher-modal__actions">
+        <button type="button" onClick={() => void onSave()} disabled={busy || commandDraft.trim() === ""}>
+          保存
+        </button>
+        {status && <span className="workspace-switcher-modal__hint">{status}</span>}
+      </div>
+    </div>
+  );
+}
+
+function renderIdeError(e: IdeHandoffErrorDto): string {
+  switch (e.kind) {
+    case "ideNotInPath":
+      return `命令 ${e.command} 不在 PATH 中。请检查 IDE 是否已安装并加入 PATH。`;
+    case "notADirectory":
+      return `不是有效目录: ${e.path}`;
+    case "spawnFailed":
+      return `启动 ${e.command} 失败: ${e.message}`;
+    case "io":
+      return `IO 错误 (${e.context}): ${e.message}`;
+  }
 }
 
 function renderErrorMessage(error: WorkspaceErrorDto): string {

@@ -359,6 +359,54 @@
 .workspace-switcher-modal__row:hover {
   background: #252525;
 }
+.workspace-switcher-modal__row--composite {
+  padding: 0;
+  flex-direction: row;
+  align-items: stretch;
+  cursor: default;
+}
+.workspace-switcher-modal__row-main {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: inherit;
+  padding: 10px 12px;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font: inherit;
+}
+.workspace-switcher-modal__row-main:hover {
+  background: #252525;
+}
+.workspace-switcher-modal__row-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-left: 1px solid #2a2a2a;
+}
+.workspace-switcher-modal__row-action {
+  background: #3a3a3a;
+  border: 1px solid #555;
+  color: #ccc;
+  padding: 4px 10px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.workspace-switcher-modal__row-action:hover {
+  background: #4a4a4a;
+  color: #fff;
+}
+.workspace-switcher-modal__settings {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
 .workspace-switcher-modal__row-name {
   display: flex;
   align-items: center;
@@ -430,6 +478,32 @@
 }
 .terminal-mesh-view__status-label {
   font-variant-numeric: tabular-nums;
+}
+.terminal-mesh-view__status-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+.terminal-mesh-view__status-action {
+  background: #3a3a3a;
+  border: 1px solid #555;
+  color: #ccc;
+  padding: 2px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+}
+.terminal-mesh-view__status-action:hover {
+  background: #4a4a4a;
+  color: #fff;
+}
+.terminal-mesh-view__ide-error {
+  margin: 0;
+  padding: 6px 8px;
+  background: #5a1818;
+  color: #ffd0d0;
+  font-size: 11px;
+  border-bottom: 1px solid #1a1a1a;
 }
 .terminal-mesh-view__xterm {
   flex: 1;

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import {
@@ -12,6 +12,12 @@ import {
   type TerminalEventEnvelope,
   type TerminalMeshErrorDto,
 } from "./terminal-mesh";
+import {
+  isIdeHandoffErrorDto,
+  openWorkspaceInIde,
+  revealWorkspaceInFinder,
+  type IdeHandoffErrorDto,
+} from "./ide-handoff";
 
 const INITIAL_SCROLLBACK_BYTES = 64 * 1024;
 
@@ -44,6 +50,27 @@ export function TerminalMeshView({ active, cwd }: TerminalMeshViewProps) {
   const [error, setError] = useState<TerminalMeshErrorDto | null>(null);
   const [ready, setReady] = useState(false);
   const [status, setStatus] = useState<TerminalRunStatus>({ kind: "running" });
+  const [ideError, setIdeError] = useState<IdeHandoffErrorDto | null>(null);
+
+  const onOpenIde = useCallback(async () => {
+    if (!cwd) return;
+    setIdeError(null);
+    try {
+      await openWorkspaceInIde(cwd);
+    } catch (err) {
+      if (isIdeHandoffErrorDto(err)) setIdeError(err);
+    }
+  }, [cwd]);
+
+  const onRevealFinder = useCallback(async () => {
+    if (!cwd) return;
+    setIdeError(null);
+    try {
+      await revealWorkspaceInFinder(cwd);
+    } catch (err) {
+      if (isIdeHandoffErrorDto(err)) setIdeError(err);
+    }
+  }, [cwd]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -211,7 +238,34 @@ export function TerminalMeshView({ active, cwd }: TerminalMeshViewProps) {
         <span className="terminal-mesh-view__status-label">
           {renderStatusLabel(status)}
         </span>
+        {cwd && (
+          <div className="terminal-mesh-view__status-actions">
+            <button
+              type="button"
+              className="terminal-mesh-view__status-action"
+              onClick={() => void onOpenIde()}
+            >
+              Cursor 中打开
+            </button>
+            <button
+              type="button"
+              className="terminal-mesh-view__status-action"
+              onClick={() => void onRevealFinder()}
+            >
+              Finder 中显示
+            </button>
+          </div>
+        )}
       </header>
+      {ideError && (
+        <p
+          className="terminal-mesh-view__ide-error"
+          role="alert"
+          data-ide-handoff-error={ideError.kind}
+        >
+          {ideErrorMessage(ideError)}
+        </p>
+      )}
       {error && (
         <aside
           className="bootstrap-card bootstrap-card--error"
@@ -229,6 +283,19 @@ export function TerminalMeshView({ active, cwd }: TerminalMeshViewProps) {
       )}
     </div>
   );
+}
+
+function ideErrorMessage(e: IdeHandoffErrorDto): string {
+  switch (e.kind) {
+    case "ideNotInPath":
+      return `IDE 命令 ${e.command} 不在 PATH 中,请在 “工作区 → 设置” 修改。`;
+    case "notADirectory":
+      return `不是有效目录: ${e.path}`;
+    case "spawnFailed":
+      return `启动 ${e.command} 失败: ${e.message}`;
+    case "io":
+      return `IO 错误 (${e.context}): ${e.message}`;
+  }
 }
 
 export function renderStatusLabel(status: TerminalRunStatus): string {

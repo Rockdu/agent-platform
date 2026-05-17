@@ -8,6 +8,7 @@ mod claude_discovery;
 mod dev_diagnostics;
 mod dispatcher;
 mod generated;
+mod ide_handoff;
 mod logging;
 mod mcp_config;
 mod plugin_sqlite;
@@ -23,6 +24,7 @@ use mcp_config::McpConfigRegistry;
 use plugin_sqlite::{run_all_plugin_migrations_at_bootstrap, PluginMigrationState};
 use secrets::{AccessTokenCache, SecretsErrorDto, SetupMarker, SetupStatus};
 use sidecar_manager::{SidecarConfig, SidecarManager};
+use ide_handoff::IdePreferenceStore;
 use terminal_mesh::TerminalMeshRegistry;
 use workspaces::WorkspaceRegistry;
 use serde::Serialize;
@@ -264,8 +266,13 @@ pub fn run() {
                     // attach it to the Tauri app state. The workspaces
                     // root is `paths.workspaces` (the same dir
                     // bootstrap::ensure_dirs already created).
+                    let app_data_root = paths
+                        .plugins_root
+                        .parent()
+                        .unwrap_or(&paths.plugins_root)
+                        .to_path_buf();
                     let registry = WorkspaceRegistry::load(
-                        paths.plugins_root.parent().unwrap_or(&paths.plugins_root).to_path_buf(),
+                        app_data_root.clone(),
                         Some(paths.workspaces.clone()),
                     );
                     tracing::info!(
@@ -273,6 +280,18 @@ pub fn run() {
                         "workspaces registry loaded"
                     );
                     app.manage(registry);
+
+                    // Round 32 (task19): load persisted IDE handoff
+                    // preference (default Cursor). Surfaced via
+                    // `ide_get_preference` / `ide_set_preference` and
+                    // consumed by `ide_open_workspace` /
+                    // `ide_reveal_in_finder`.
+                    let ide_store = IdePreferenceStore::load(app_data_root);
+                    tracing::info!(
+                        ide_command = %ide_store.snapshot().ide_command,
+                        "ide preference loaded"
+                    );
+                    app.manage(ide_store);
                 }
                 Err(err) => tracing::error!(%err, "bootstrap failed"),
             }
@@ -311,6 +330,10 @@ pub fn run() {
             workspaces::open_workspace,
             workspaces::close_workspace,
             workspaces::resolve_workspace_for_tab,
+            ide_handoff::ide_get_preference,
+            ide_handoff::ide_set_preference,
+            ide_handoff::ide_open_workspace,
+            ide_handoff::ide_reveal_in_finder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
