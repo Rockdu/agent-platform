@@ -82,7 +82,8 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<SidecarArgs
     })
 }
 
-/// MCP `tools/list` shape — the single tool this sidecar exposes.
+/// MCP `tools/list` shape — the tools this sidecar exposes. The
+/// host bridge enforces auth; the sidecar is a passthrough.
 pub fn tools_list_response() -> Value {
     json!({
         "tools": [
@@ -103,6 +104,14 @@ pub fn tools_list_response() -> Value {
                         }
                     },
                     "required": ["target_tab_id"]
+                }
+            },
+            {
+                "name": "terminal_mesh.list_tabs",
+                "description": "List visible terminal tabs. Orchestrator callers see every tab including the orchestrator slot; regular tabs see only their own.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
                 }
             }
         ]
@@ -128,46 +137,80 @@ struct BridgeReadScrollbackParams<'a> {
     max_bytes: u32,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeListTabsParams<'a> {
+    client_id: &'a str,
+}
+
 /// Translate an MCP `tools/call` request into a bridge JSON-RPC call.
 /// Pure function for testability — does not perform IO. Returns the
-/// JSON-RPC request the caller should send over the socket.
+/// JSON-RPC request the caller should send over the socket. The
+/// dispatch is keyed by the MCP `tool_name` so adding tools is a pure
+/// arm-extension.
 pub fn build_bridge_request(
     client_id: &str,
+    tool_name: &str,
     tool_args: Value,
     request_id: JsonRpcId,
 ) -> Result<JsonRpcMessage, JsonRpcError> {
-    let parsed: ReadScrollbackToolArgs =
-        serde_json::from_value(tool_args).map_err(|e| JsonRpcError {
-            code: -32602,
-            message: format!("invalid tool args: {e}"),
+    match tool_name {
+        "terminal_mesh.read_scrollback" => {
+            let parsed: ReadScrollbackToolArgs =
+                serde_json::from_value(tool_args).map_err(|e| JsonRpcError {
+                    code: -32602,
+                    message: format!("invalid tool args: {e}"),
+                    data: None,
+                })?;
+            let params = serde_json::to_value(BridgeReadScrollbackParams {
+                client_id,
+                target_tab_id: &parsed.target_tab_id,
+                max_bytes: parsed.max_bytes,
+            })
+            .expect("bridge params serialize");
+            Ok(JsonRpcMessage::request(
+                request_id,
+                "terminalMesh.readScrollback",
+                Some(params),
+            ))
+        }
+        "terminal_mesh.list_tabs" => {
+            // The list_tabs tool takes no inputSchema fields beyond
+            // the implicit clientId, so tool_args is ignored.
+            let _ = tool_args;
+            let params = serde_json::to_value(BridgeListTabsParams { client_id })
+                .expect("bridge params serialize");
+            Ok(JsonRpcMessage::request(
+                request_id,
+                "terminalMesh.listTabs",
+                Some(params),
+            ))
+        }
+        other => Err(JsonRpcError {
+            code: -32601,
+            message: format!("unknown tool `{other}`"),
             data: None,
-        })?;
-    let params = serde_json::to_value(BridgeReadScrollbackParams {
-        client_id,
-        target_tab_id: &parsed.target_tab_id,
-        max_bytes: parsed.max_bytes,
-    })
-    .expect("bridge params serialize");
-    Ok(JsonRpcMessage::request(
-        request_id,
-        "terminalMesh.readScrollback",
-        Some(params),
-    ))
+        }),
+    }
 }
 
 /// Translate a bridge JSON-RPC response into the MCP `tools/call`
-/// result envelope: success → `content: [{type: "text", text: data}]`;
+/// result envelope: success → `content: [{type: "text", text: <text>}]`;
 /// error → `isError: true, content: [{type: "text", text: <message>}]`.
+/// `read_scrollback` returns `{data: "..."}` and uses the data string
+/// verbatim; other tools (e.g. `list_tabs`) return structured JSON
+/// and are serialized as a single text content block so MCP clients
+/// receive a parseable JSON payload.
 pub fn translate_bridge_response(response: JsonRpcResponse) -> Value {
     match (response.result, response.error) {
         (Some(result), None) => {
-            let data = result
-                .get("data")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let text = if let Some(data) = result.get("data").and_then(|v| v.as_str()) {
+                data.to_string()
+            } else {
+                serde_json::to_string(&result).unwrap_or_else(|_| "{}".into())
+            };
             json!({
-                "content": [{ "type": "text", "text": data }],
+                "content": [{ "type": "text", "text": text }],
                 "isError": false,
             })
         }
@@ -245,21 +288,9 @@ where
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if tool_name != "terminal_mesh.read_scrollback" {
-                return JsonRpcMessage::Response(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: req.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32601,
-                        message: format!("unknown tool `{tool_name}`"),
-                        data: None,
-                    }),
-                });
-            }
             let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
             let bridge_req =
-                match build_bridge_request(client_id, arguments, JsonRpcId::Number(1)) {
+                match build_bridge_request(client_id, &tool_name, arguments, JsonRpcId::Number(1)) {
                     Ok(r) => r,
                     Err(err) => {
                         return JsonRpcMessage::Response(JsonRpcResponse {
@@ -359,28 +390,61 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_terminal_mesh_read_scrollback() {
+    fn tools_list_returns_both_terminal_mesh_tools() {
         let v = tools_list_response();
         let tools = v.get("tools").and_then(|t| t.as_array()).expect("tools array");
-        assert_eq!(tools.len(), 1);
-        assert_eq!(
-            tools[0].get("name").and_then(|n| n.as_str()),
-            Some("terminal_mesh.read_scrollback")
-        );
-        // Schema must mention target_tab_id (the tab-id-based AC).
-        let schema = tools[0].get("inputSchema").expect("inputSchema present");
-        let props = schema.get("properties").expect("properties");
-        assert!(props.get("target_tab_id").is_some());
+        assert_eq!(tools.len(), 2);
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(names.contains(&"terminal_mesh.read_scrollback"));
+        assert!(names.contains(&"terminal_mesh.list_tabs"));
+
+        // read_scrollback schema must mention target_tab_id.
+        let read_tool = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("terminal_mesh.read_scrollback"))
+            .expect("read_scrollback present");
+        let read_props = read_tool
+            .get("inputSchema")
+            .and_then(|s| s.get("properties"))
+            .expect("read inputSchema.properties");
+        assert!(read_props.get("target_tab_id").is_some());
+
+        // list_tabs schema is an empty-properties object.
+        let list_tool = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("terminal_mesh.list_tabs"))
+            .expect("list_tabs present");
+        assert!(list_tool.get("inputSchema").is_some());
     }
 
     #[test]
-    fn build_bridge_request_forwards_client_id_and_args() {
+    fn tools_list_response_contains_no_privileged_flag_terminology() {
+        // The sidecar wire shape MUST NOT leak host-side privileged-
+        // flag terminology. Privileged scope info stays inside the
+        // host bridge (cross_tab_read flag, capability handle, etc.).
+        let v = tools_list_response();
+        let s = serde_json::to_string(&v).expect("serialize");
+        assert!(!s.contains("cross_tab_read"), "wire leaks privileged flag");
+        assert!(!s.contains("privileged"), "wire leaks privileged keyword");
+        assert!(!s.contains("capability"), "wire leaks capability keyword");
+    }
+
+    #[test]
+    fn build_bridge_request_for_read_scrollback_forwards_client_id_and_args() {
         let tool_args = json!({
             "target_tab_id": "abc-tab",
             "max_bytes": 1234,
         });
-        let req = build_bridge_request("claude:T:terminal-mesh", tool_args, JsonRpcId::Number(7))
-            .expect("build ok");
+        let req = build_bridge_request(
+            "claude:T:terminal-mesh",
+            "terminal_mesh.read_scrollback",
+            tool_args,
+            JsonRpcId::Number(7),
+        )
+        .expect("build ok");
         let JsonRpcMessage::Request(r) = req else {
             panic!("expected Request");
         };
@@ -392,15 +456,56 @@ mod tests {
     }
 
     #[test]
-    fn build_bridge_request_defaults_max_bytes_when_omitted() {
+    fn build_bridge_request_for_read_scrollback_defaults_max_bytes_when_omitted() {
         let tool_args = json!({ "target_tab_id": "abc" });
-        let req = build_bridge_request("claude:T:terminal-mesh", tool_args, JsonRpcId::Number(7))
-            .expect("build ok");
+        let req = build_bridge_request(
+            "claude:T:terminal-mesh",
+            "terminal_mesh.read_scrollback",
+            tool_args,
+            JsonRpcId::Number(7),
+        )
+        .expect("build ok");
         let JsonRpcMessage::Request(r) = req else {
             panic!("expected Request");
         };
         let params = r.params.expect("params");
         assert_eq!(params["maxBytes"], 65536);
+    }
+
+    #[test]
+    fn build_bridge_request_for_list_tabs_forwards_only_client_id() {
+        // list_tabs takes no tool args; only clientId reaches the
+        // bridge.
+        let req = build_bridge_request(
+            "claude:T:terminal-mesh",
+            "terminal_mesh.list_tabs",
+            Value::Null,
+            JsonRpcId::Number(9),
+        )
+        .expect("build ok");
+        let JsonRpcMessage::Request(r) = req else {
+            panic!("expected Request");
+        };
+        assert_eq!(r.method, "terminalMesh.listTabs");
+        let params = r.params.expect("params present");
+        assert_eq!(params["clientId"], "claude:T:terminal-mesh");
+        assert!(
+            params.get("targetTabId").is_none(),
+            "list_tabs must NOT forward read_scrollback fields"
+        );
+        assert!(params.get("maxBytes").is_none());
+    }
+
+    #[test]
+    fn build_bridge_request_rejects_unknown_tool_name() {
+        let err = build_bridge_request(
+            "claude:T:terminal-mesh",
+            "terminal_mesh.not_a_real_tool",
+            Value::Null,
+            JsonRpcId::Number(1),
+        )
+        .expect_err("unknown tool must error");
+        assert_eq!(err.code, -32601);
     }
 
     #[test]
@@ -460,7 +565,60 @@ mod tests {
         };
         assert!(r.result.is_some());
         let result = r.result.unwrap();
-        assert_eq!(result["tools"][0]["name"], "terminal_mesh.read_scrollback");
+        let tool_names: Vec<&str> = result["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(tool_names.contains(&"terminal_mesh.read_scrollback"));
+        assert!(tool_names.contains(&"terminal_mesh.list_tabs"));
+    }
+
+    #[tokio::test]
+    async fn handle_mcp_request_tools_call_list_tabs_forwards_to_bridge_and_returns_json() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: JsonRpcId::Number(10),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "terminal_mesh.list_tabs",
+                "arguments": {}
+            })),
+        };
+        let resp = handle_mcp_request("claude:T:terminal-mesh", req, |bridge_req| async move {
+            let JsonRpcMessage::Request(r) = bridge_req else {
+                panic!("expected Request");
+            };
+            assert_eq!(r.method, "terminalMesh.listTabs");
+            assert_eq!(r.params.as_ref().unwrap()["clientId"], "claude:T:terminal-mesh");
+            assert!(r.params.as_ref().unwrap().get("targetTabId").is_none());
+            Ok(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: JsonRpcId::Number(1),
+                result: Some(json!({
+                    "tabs": [
+                        { "tabId": "abc", "workspaceName": "demo", "status": "Running" }
+                    ]
+                })),
+                error: None,
+            })
+        })
+        .await;
+        let JsonRpcMessage::Response(r) = resp else {
+            panic!("expected Response");
+        };
+        let result = r.result.unwrap();
+        assert_eq!(result["isError"], false);
+        // List-tabs result is a structured JSON payload serialized as
+        // a single text content block (the bridge response has no
+        // "data" string field).
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(text.contains("\"tabs\""));
+        assert!(text.contains("demo"));
+        assert!(text.contains("abc"));
     }
 
     #[tokio::test]

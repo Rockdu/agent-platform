@@ -1310,7 +1310,13 @@ function MultiTerminalContainer() {
 
   const adoptWorkspaceTab = useCallback(
     async (workspace: WorkspaceRecord) => {
-      const tabId = `tab-${workspace.workspaceId}`;
+      // The tab id is the bare workspace UUID so the terminal-mesh
+      // sidecar's `claude:<tab_id>:terminal-mesh` clientId parser
+      // accepts it (the parser requires `tab_id` to be a UUID). The
+      // host-side `TerminalMeshRegistry.tab_index` is format-agnostic
+      // — it keys by string — so this change is invisible at the
+      // backend.
+      const tabId = workspace.workspaceId;
       try {
         const refreshed = await openWorkspace(workspace.workspaceId, tabId);
         setError(null);

@@ -136,6 +136,17 @@ pub struct TerminalSpawnResponse {
     pub terminal_id: String,
 }
 
+/// Scope of a `list_tabs` projection. The orchestrator sees every
+/// recorded tab via `All`; regular workspace clients see only their
+/// own tab via `OwnTab { tab_id }`. The `OwnTab` filter also rejects
+/// orchestrator-kind entries even when the caller's tab id happens
+/// to match — defense-in-depth so a misbehaving regular client
+/// cannot resolve the orchestrator slot through a name collision.
+pub enum ListTabsScope<'a> {
+    All,
+    OwnTab { tab_id: &'a str },
+}
+
 /// Projection of a retained lifecycle snapshot for the
 /// `terminal_mesh.list_tabs` MCP tool. The wire shape is camelCase
 /// per existing frontend convention; the sidecar forwards the
@@ -307,20 +318,33 @@ impl TerminalMeshRegistry {
     }
 
     /// Project the retained snapshot store into a list of entries
-    /// suitable for the `terminal_mesh.list_tabs` MCP tool. When
-    /// `allow_orchestrator` is false, entries whose `tab_kind` is
-    /// `Orchestrator` are filtered out so regular workspace
-    /// clientIds never see the orchestrator tab. The
-    /// `workspace_name` field is left empty in v1 (the registry does
-    /// not own the workspace label; future work can resolve it via
-    /// the workspaces store).
-    pub fn list_tabs(&self, allow_orchestrator: bool) -> Vec<TerminalListTabsEntry> {
+    /// suitable for the `terminal_mesh.list_tabs` MCP tool. Scoping:
+    ///
+    /// - `ListTabsScope::All` returns every recorded tab including
+    ///   the orchestrator slot (orchestrator-only filter bypass).
+    /// - `ListTabsScope::OwnTab { tab_id }` returns at most one
+    ///   entry whose `tab_id == Some(tab_id)`, AND that entry's
+    ///   `tab_kind` MUST be `Workspace`. An orchestrator-kind entry
+    ///   is excluded even when its tab id matches — this is a
+    ///   defense-in-depth check so a regular client cannot resolve
+    ///   the orchestrator slot through a name collision.
+    ///
+    /// The `workspace_name` field is left empty; the bridge enriches
+    /// it via the `WorkspaceRegistry` after projection.
+    pub fn list_tabs(&self, scope: ListTabsScope<'_>) -> Vec<TerminalListTabsEntry> {
         let snapshots = self.snapshots.lock().expect("retained snapshots poisoned");
         let mut out = Vec::with_capacity(snapshots.len());
         for record in snapshots.values() {
             let snap = record.snapshot.lock().expect("snapshot mutex poisoned");
-            if matches!(snap.tab_kind, TabKind::Orchestrator) && !allow_orchestrator {
-                continue;
+            match scope {
+                ListTabsScope::All => {}
+                ListTabsScope::OwnTab { tab_id } => {
+                    let matches_tab = record.tab_id.as_deref() == Some(tab_id);
+                    let is_workspace = matches!(snap.tab_kind, TabKind::Workspace);
+                    if !(matches_tab && is_workspace) {
+                        continue;
+                    }
+                }
             }
             out.push(TerminalListTabsEntry {
                 tab_id: record.tab_id.clone(),
@@ -1152,33 +1176,50 @@ mod tests {
     }
 
     #[test]
-    fn list_tabs_with_orchestrator_includes_orchestrator_tab() {
+    fn list_tabs_with_all_scope_includes_orchestrator_tab() {
         let r = TerminalMeshRegistry::new();
         record_with_workspace_id(&r, "tab-orch", TabKind::Orchestrator, None);
         record_with_workspace_id(&r, "tab-w1", TabKind::Workspace, Some("ws-1"));
         record_with_workspace_id(&r, "tab-w2", TabKind::Workspace, Some("ws-2"));
 
-        let entries = r.list_tabs(true);
+        let entries = r.list_tabs(ListTabsScope::All);
         assert_eq!(entries.len(), 3);
         assert!(entries.iter().any(|e| matches!(e.tab_kind, TabKind::Orchestrator)));
     }
 
     #[test]
-    fn list_tabs_without_orchestrator_excludes_orchestrator_tab() {
+    fn list_tabs_with_own_tab_scope_excludes_other_workspace_tabs() {
         let r = TerminalMeshRegistry::new();
         record_with_workspace_id(&r, "tab-orch", TabKind::Orchestrator, None);
         record_with_workspace_id(&r, "tab-w1", TabKind::Workspace, Some("ws-1"));
         record_with_workspace_id(&r, "tab-w2", TabKind::Workspace, Some("ws-2"));
 
-        let entries = r.list_tabs(false);
-        assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|e| matches!(e.tab_kind, TabKind::Workspace)));
-        assert!(entries
-            .iter()
-            .any(|e| e.workspace_id.as_deref() == Some("ws-1")));
-        assert!(entries
-            .iter()
-            .any(|e| e.workspace_id.as_deref() == Some("ws-2")));
+        let entries = r.list_tabs(ListTabsScope::OwnTab { tab_id: "tab-w1" });
+        assert_eq!(
+            entries.len(),
+            1,
+            "regular client must see ONLY its own tab, not siblings"
+        );
+        let entry = &entries[0];
+        assert_eq!(entry.tab_id.as_deref(), Some("tab-w1"));
+        assert_eq!(entry.workspace_id.as_deref(), Some("ws-1"));
+        assert!(matches!(entry.tab_kind, TabKind::Workspace));
+    }
+
+    #[test]
+    fn list_tabs_with_own_tab_scope_excludes_orchestrator_kind_even_when_id_matches() {
+        // Defense-in-depth: if a regular client claims the orchestrator
+        // tab id, the orchestrator-kind filter still blocks it.
+        let r = TerminalMeshRegistry::new();
+        record_with_workspace_id(&r, "tab-shared", TabKind::Orchestrator, None);
+
+        let entries = r.list_tabs(ListTabsScope::OwnTab {
+            tab_id: "tab-shared",
+        });
+        assert!(
+            entries.is_empty(),
+            "orchestrator-kind entry must NOT pass through OwnTab scope"
+        );
     }
 
     #[test]
@@ -1186,7 +1227,7 @@ mod tests {
         let r = TerminalMeshRegistry::new();
         record_with_workspace_id(&r, "tab-w1", TabKind::Workspace, Some("ws-uuid-42"));
 
-        let entries = r.list_tabs(false);
+        let entries = r.list_tabs(ListTabsScope::All);
         assert_eq!(entries.len(), 1);
         let entry = &entries[0];
         assert_eq!(entry.tab_id.as_deref(), Some("tab-w1"));

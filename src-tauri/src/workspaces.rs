@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::State;
@@ -197,8 +197,12 @@ fn same_directory_identity(_a: &Path, _b: &Path) -> bool {
 }
 
 /// Tauri-managed registry. Backed by `${storage_root}/workspaces.json`.
+/// Internally `Arc<Mutex<...>>`-shared so callers like the host RPC
+/// bridge can hold a clone alongside Tauri's `app.manage` handle and
+/// observe the same state.
+#[derive(Clone)]
 pub struct WorkspaceRegistry {
-    inner: Mutex<RegistryInner>,
+    inner: Arc<Mutex<RegistryInner>>,
 }
 
 struct RegistryInner {
@@ -218,11 +222,11 @@ impl WorkspaceRegistry {
     #[allow(dead_code)]
     pub fn empty(storage_root: PathBuf, workspaces_root: Option<PathBuf>) -> Self {
         Self {
-            inner: Mutex::new(RegistryInner {
+            inner: Arc::new(Mutex::new(RegistryInner {
                 records: HashMap::new(),
                 storage_root,
                 workspaces_root,
-            }),
+            })),
         }
     }
 
@@ -264,11 +268,11 @@ impl WorkspaceRegistry {
             }
         };
         Self {
-            inner: Mutex::new(RegistryInner {
+            inner: Arc::new(Mutex::new(RegistryInner {
                 records,
                 storage_root,
                 workspaces_root,
-            }),
+            })),
         }
     }
 
@@ -341,6 +345,26 @@ impl WorkspaceRegistry {
             r.conversation_rounds_count = count_claude_conversation_rounds(&r.path);
         }
         out
+    }
+
+    /// Friendly-name lookup for the host RPC `terminal_mesh.list_tabs`
+    /// projection enrichment. Returns `None` for malformed UUIDs or
+    /// missing records so the bridge can safely call it on every
+    /// snapshot entry without per-call validation.
+    pub fn lookup_name(&self, workspace_id_str: &str) -> Option<String> {
+        let uuid = Uuid::parse_str(workspace_id_str).ok()?;
+        let guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
+        guard.records.get(&uuid).map(|r| r.name.clone())
+    }
+
+    /// Test-only helper used by sibling-crate tests (e.g. the
+    /// host_rpc bridge tests) to seed a workspace record without
+    /// touching disk or going through the validation-heavy create
+    /// path.
+    #[cfg(test)]
+    pub(crate) fn insert_record_for_tests(&self, record: WorkspaceRecord) {
+        let mut guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
+        guard.records.insert(record.workspace_id, record);
     }
 
     /// Populate a returned `WorkspaceRecord` with a fresh
@@ -716,6 +740,48 @@ mod tests {
             Some(workspaces_root.clone()),
         );
         (storage, home, reg)
+    }
+
+    fn registry_with_one_workspace(name: &str) -> (WorkspaceRegistry, Uuid) {
+        let registry = WorkspaceRegistry::empty(
+            std::path::PathBuf::from("/tmp/workspaces-test"),
+            None,
+        );
+        let id = Uuid::new_v4();
+        let record = WorkspaceRecord {
+            workspace_id: id,
+            name: name.into(),
+            path: std::path::PathBuf::from("/tmp/test-workspace"),
+            created_at: "2025-01-01T00:00:00Z".into(),
+            last_used_at: "2025-01-01T00:00:00Z".into(),
+            open_tab_id: None,
+            conversation_rounds_count: 0,
+        };
+        let mut guard = registry.inner.lock().expect("registry mutex");
+        guard.records.insert(id, record);
+        drop(guard);
+        (registry, id)
+    }
+
+    #[test]
+    fn lookup_name_returns_name_for_known_workspace() {
+        let (registry, id) = registry_with_one_workspace("Alice's Project");
+        let name = registry.lookup_name(&id.to_string());
+        assert_eq!(name.as_deref(), Some("Alice's Project"));
+    }
+
+    #[test]
+    fn lookup_name_returns_none_for_unknown_id() {
+        let (registry, _) = registry_with_one_workspace("ignored");
+        let other = Uuid::new_v4();
+        assert!(registry.lookup_name(&other.to_string()).is_none());
+    }
+
+    #[test]
+    fn lookup_name_returns_none_for_malformed_id() {
+        let (registry, _) = registry_with_one_workspace("ignored");
+        assert!(registry.lookup_name("not-a-uuid").is_none());
+        assert!(registry.lookup_name("").is_none());
     }
 
     #[test]

@@ -317,6 +317,7 @@ pub fn run() {
                     // `--host-rpc-sock <path>` to every sidecar.
                     let mount_registry_handle = app.state::<dispatcher::MountRegistry>().inner().clone();
                     let terminal_registry_handle = app.state::<TerminalMeshRegistry>().inner().clone();
+                    let workspaces_handle = app.state::<WorkspaceRegistry>().inner().clone();
                     let host_rpc_sock_path = match host_rpc::prepare_socket_path(&app_data_root) {
                         Ok(p) => {
                             host_rpc::spawn_bridge(
@@ -325,6 +326,7 @@ pub fn run() {
                                     orchestrator: orchestrator.clone(),
                                     mount_registry: mount_registry_handle,
                                     terminal_registry: terminal_registry_handle,
+                                    workspaces: workspaces_handle,
                                 },
                             );
                             tracing::info!(host_rpc_sock = %p.display(), "host_rpc bridge spawned");

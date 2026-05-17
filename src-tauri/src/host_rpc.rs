@@ -42,8 +42,8 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::dispatcher::MountRegistry;
 use crate::orchestrator::OrchestratorState;
 use crate::terminal_mesh::{
-    cross_tab_read_by_tab, read_tab_scrollback_bounded, TerminalListTabsEntry, TerminalMeshError,
-    TerminalMeshRegistry, MAX_CROSS_TAB_READ_BYTES,
+    cross_tab_read_by_tab, read_tab_scrollback_bounded, ListTabsScope, TerminalListTabsEntry,
+    TerminalMeshError, TerminalMeshRegistry, MAX_CROSS_TAB_READ_BYTES,
 };
 
 /// JSON-RPC error code mapping (private to this module — frontends
@@ -67,6 +67,9 @@ pub struct HostRpcState {
     pub orchestrator: OrchestratorState,
     pub mount_registry: MountRegistry,
     pub terminal_registry: TerminalMeshRegistry,
+    /// Shared with Tauri's app.manage handle (Arc-backed); used by
+    /// `handle_list_tabs` to resolve friendly workspace names.
+    pub workspaces: crate::workspaces::WorkspaceRegistry,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -397,18 +400,34 @@ fn handle_list_tabs(
         });
     }
 
-    // Orchestrator-vs-regular auth filter: the orchestrator sees every
-    // tab (including its own slot); regular workspace callers see only
-    // workspace-kind tabs. The is_orchestrator check mirrors
+    // Scope selection: the orchestrator sees every tab; regular
+    // workspace callers see ONLY their own tab (sibling-workspace
+    // isolation). The is_orchestrator check mirrors
     // `handle_read_scrollback` — both use the recorded orchestrator
     // session's tab id as the identity boundary.
-    let allow_orchestrator = state
+    let is_orchestrator = state
         .orchestrator
         .snapshot()
         .map(|s| s.tab_id == caller_tab_id)
         .unwrap_or(false);
+    let scope = if is_orchestrator {
+        ListTabsScope::All
+    } else {
+        ListTabsScope::OwnTab {
+            tab_id: caller_tab_id.as_str(),
+        }
+    };
 
-    let tabs = state.terminal_registry.list_tabs(allow_orchestrator);
+    let mut tabs = state.terminal_registry.list_tabs(scope);
+    // Enrich with friendly workspace names from the persisted
+    // workspace registry. Unknown / malformed ids stay `None`; the
+    // sidecar tool exposes the `workspaceName` field as optional so
+    // MCP clients tolerate missing values.
+    for entry in tabs.iter_mut() {
+        if let Some(ws_id) = entry.workspace_id.as_deref() {
+            entry.workspace_name = state.workspaces.lookup_name(ws_id);
+        }
+    }
     Ok(json!(ListTabsResult { tabs }))
 }
 
@@ -468,6 +487,10 @@ mod tests {
             orchestrator,
             mount_registry,
             terminal_registry,
+            workspaces: crate::workspaces::WorkspaceRegistry::empty(
+                std::path::PathBuf::from("/tmp/host-rpc-test"),
+                None,
+            ),
         };
         (state, resp.handle)
     }
@@ -743,6 +766,10 @@ mod tests {
             orchestrator,
             mount_registry,
             terminal_registry,
+            workspaces: crate::workspaces::WorkspaceRegistry::empty(
+                std::path::PathBuf::from("/tmp/host-rpc-test"),
+                None,
+            ),
         };
         (state, ws_tab_a, ws_tab_b)
     }
@@ -784,28 +811,73 @@ mod tests {
     }
 
     #[test]
-    fn host_rpc_list_tabs_workspace_client_id_excludes_orchestrator() {
+    fn host_rpc_list_tabs_populates_workspace_name_from_registry() {
+        // Seed the workspace registry with a known name + record a
+        // tab whose workspace_id matches; assert the bridge response
+        // carries the friendly name in workspaceName.
+        use crate::workspaces::WorkspaceRecord;
+        let orch_tab = make_uuid_tab_id();
+        let (mut state, _ws_tab_a, _ws_tab_b) = bridge_state_for_list_tabs(&orch_tab);
+
+        let real_ws_id = Uuid::new_v4();
+        state.workspaces.insert_record_for_tests(WorkspaceRecord {
+            workspace_id: real_ws_id,
+            name: "Alice's Project".into(),
+            path: std::path::PathBuf::from("/tmp/alice"),
+            created_at: "2025-01-01T00:00:00Z".into(),
+            last_used_at: "2025-01-01T00:00:00Z".into(),
+            open_tab_id: None,
+            conversation_rounds_count: 0,
+        });
+
+        // Record a tab bound to that workspace id.
+        let id = Uuid::new_v4();
+        let tab_id = make_uuid_tab_id();
+        let (tx, _rx) = mpsc::channel::<terminal_mesh_core::ActorCommand>(1);
+        let buf = Arc::new(StdMutex::new(String::new()));
+        state.terminal_registry.record(
+            id,
+            tx,
+            buf,
+            Some(tab_id.clone()),
+            crate::workspace_lifecycle::TabKind::Workspace,
+            Some(real_ws_id.to_string()),
+        );
+
+        let params = json!({
+            "clientId": format!("claude:{tab_id}:terminal-mesh"),
+        });
+        let v = dispatch_method(&state, "terminalMesh.listTabs", params)
+            .expect("regular workspace client may list its own tab");
+        let tabs = v["tabs"].as_array().expect("tabs is an array");
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0]["workspaceName"], "Alice's Project");
+        assert_eq!(tabs[0]["workspaceId"], real_ws_id.to_string());
+    }
+
+    #[test]
+    fn host_rpc_list_tabs_workspace_client_id_returns_only_own_tab() {
         let orch_tab = make_uuid_tab_id();
         let (state, ws_tab_a, _ws_tab_b) = bridge_state_for_list_tabs(&orch_tab);
-        // A regular workspace clientId uses one of the recorded
-        // workspace tab ids so it parses; the auth filter sees the
-        // tab id != orchestrator tab id and skips the orchestrator
-        // entry.
+        // Regular workspace client must see ONLY its own tab. Sibling
+        // workspace tabs and the orchestrator slot are both filtered.
         let params = json!({
             "clientId": format!("claude:{ws_tab_a}:terminal-mesh"),
         });
         let v = dispatch_method(&state, "terminalMesh.listTabs", params)
-            .expect("regular workspace client may list workspace tabs");
+            .expect("regular workspace client may list its own tab");
         let tabs = v["tabs"].as_array().expect("tabs is an array");
-        assert_eq!(tabs.len(), 2, "orchestrator entry must be filtered out");
+        assert_eq!(
+            tabs.len(),
+            1,
+            "regular workspace client must see ONLY its own tab (no siblings, no orchestrator)"
+        );
+        assert_eq!(tabs[0]["tabId"], ws_tab_a);
+        assert_eq!(tabs[0]["workspaceId"], "workspace-A");
+        assert_eq!(tabs[0]["tabKind"], "Workspace");
+        // Sibling workspace-B must NOT appear.
         for tab in tabs {
-            assert_eq!(tab["tabKind"], "Workspace");
+            assert_ne!(tab["workspaceId"], "workspace-B");
         }
-        let ws_ids: Vec<&str> = tabs
-            .iter()
-            .filter_map(|t| t["workspaceId"].as_str())
-            .collect();
-        assert!(ws_ids.contains(&"workspace-A"));
-        assert!(ws_ids.contains(&"workspace-B"));
     }
 }
