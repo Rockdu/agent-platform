@@ -7,7 +7,10 @@ export interface SshLocation {
   user: string | null;
   host: string;
   port: number | null;
-  canonicalRemotePath: string | null;
+  /// Remote cwd. Required because `docs/specs/transport.md`
+  /// §6.1/§6.2 include it in the remote duplicate-identity tuple —
+  /// the wire shape MUST always carry a remote cwd.
+  canonicalRemotePath: string;
 }
 
 export interface ContainerLocation {
@@ -110,6 +113,39 @@ export async function resolveWorkspaceForTab(
   tabId: string,
 ): Promise<WorkspaceRecord | null> {
   return await invoke<WorkspaceRecord | null>("resolve_workspace_for_tab", {
+    tabId,
+  });
+}
+
+/// Auto-launch error DTO mirroring
+/// `src-tauri/src/workspace_launch_scheduler.rs::AutoLaunchErrorDto`.
+export type AutoLaunchErrorDto =
+  | { kind: "autoLaunchDisabled"; workspaceId: string }
+  | { kind: "remoteWorkspaceNotEligible"; workspaceId: string }
+  | { kind: "workspaceNotFound"; workspaceId: string };
+
+export function isAutoLaunchErrorDto(value: unknown): value is AutoLaunchErrorDto {
+  if (typeof value !== "object" || value === null) return false;
+  const k = (value as { kind?: unknown }).kind;
+  return (
+    k === "autoLaunchDisabled" ||
+    k === "remoteWorkspaceNotEligible" ||
+    k === "workspaceNotFound"
+  );
+}
+
+/// Enqueue the workspace into the host-side
+/// `WorkspaceLaunchScheduler`. The scheduler enforces the
+/// concurrency cap (default 4) and FIFO ordering across all
+/// auto-launch requests; this call returns as soon as the entry is
+/// queued, NOT when the spawn finishes. The eventual terminal_id is
+/// surfaced via the lifecycle snapshot subscription.
+export async function requestWorkspaceAutoLaunch(
+  workspaceId: string,
+  tabId: string,
+): Promise<void> {
+  await invoke<void>("request_workspace_auto_launch", {
+    workspaceId,
     tabId,
   });
 }

@@ -96,6 +96,11 @@ export interface WorkspaceLifecycleSnapshot {
   status: TabStatus;
   doneReason: DoneReason | null;
   lastActivityAtUnixMs: number;
+  /// `true` while the workspace is waiting in the host-side launch
+  /// scheduler queue (concurrency cap is saturated). The rail row
+  /// renders a `等待启动` badge instead of the default Running badge
+  /// when this is true.
+  pendingLaunch: boolean;
 }
 
 // Single envelope shape shared between the initial `workspace_

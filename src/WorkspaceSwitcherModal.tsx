@@ -385,8 +385,7 @@ function renderRemoteLocation(w: WorkspaceRecord): string {
   const { ssh, container } = w.location;
   const user = ssh.user ? `${ssh.user}@` : "";
   const port = ssh.port ? `:${ssh.port}` : "";
-  const path = ssh.canonicalRemotePath ?? "";
-  const base = `ssh://${user}${ssh.host}${port}${path}`;
+  const base = `ssh://${user}${ssh.host}${port}${ssh.canonicalRemotePath}`;
   return container
     ? `${base} (container ${container.containerId})`
     : base;

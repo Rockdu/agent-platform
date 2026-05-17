@@ -32,6 +32,7 @@ export const DEFAULT_LIFECYCLE_SNAPSHOT: WorkspaceLifecycleSnapshot = {
   status: "Running",
   doneReason: null,
   lastActivityAtUnixMs: 0,
+  pendingLaunch: false,
 };
 
 /**

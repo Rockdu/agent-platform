@@ -19,6 +19,7 @@ mod plugin_sqlite;
 mod secrets;
 mod sidecar_manager;
 mod terminal_mesh;
+mod workspace_launch_scheduler;
 mod workspace_lifecycle;
 mod workspaces;
 
@@ -32,6 +33,10 @@ use sidecar_manager::{SidecarConfig, SidecarManager};
 use ide_handoff::IdePreferenceStore;
 use orchestrator::{OrchestratorBootstrap, OrchestratorState};
 use terminal_mesh::TerminalMeshRegistry;
+use workspace_launch_scheduler::{
+    LaunchExecutor, PendingLaunch, WorkspaceLaunchScheduler, DEFAULT_LAUNCH_CAP,
+};
+use workspace_lifecycle::{on_pending_launch_changed, TabKind};
 use workspaces::WorkspaceRegistry;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -161,6 +166,107 @@ fn hash_password(password: &str) -> Vec<u8> {
         .hash_password_into(password.as_bytes(), salt, &mut out)
         .expect("argon2 hash_password_into");
     out
+}
+
+/// Production executor for `WorkspaceLaunchScheduler`. Holds the
+/// Tauri `AppHandle` and the registry handles needed to actually
+/// spawn `claude --dangerously-skip-permissions` in the workspace's
+/// local cwd. The executor's `execute` invocation runs synchronously
+/// (on the scheduler's calling thread) but the spawn work itself
+/// happens inside a tokio task so the scheduler returns immediately.
+///
+/// `scheduler_self` is filled in post-construction via `init_scheduler`
+/// because the executor and the scheduler reference each other; the
+/// executor needs to call `notify_launch_settled` when its tokio
+/// task finishes. `OnceLock` keeps the initialization race-free even
+/// though we expect a single bootstrap-time fill.
+struct RealLaunchExecutor {
+    app_handle: tauri::AppHandle,
+    terminal_registry: TerminalMeshRegistry,
+    scheduler_self: std::sync::OnceLock<WorkspaceLaunchScheduler>,
+}
+
+impl RealLaunchExecutor {
+    fn new(app_handle: tauri::AppHandle, terminal_registry: TerminalMeshRegistry) -> Self {
+        Self {
+            app_handle,
+            terminal_registry,
+            scheduler_self: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn init_scheduler(&self, sched: WorkspaceLaunchScheduler) {
+        let _ = self.scheduler_self.set(sched);
+    }
+}
+
+impl LaunchExecutor for RealLaunchExecutor {
+    fn execute(&self, launch: PendingLaunch) {
+        let app = self.app_handle.clone();
+        let registry = self.terminal_registry.clone();
+        let scheduler = self.scheduler_self.get().cloned();
+        tokio::spawn(async move {
+            // Resolve the discovered `claude` binary from the
+            // bootstrap-time cache. If discovery is not Ready, log
+            // and settle without spawning so the scheduler slot
+            // drains cleanly; the frontend will surface the
+            // discovery error through the existing onboarding path.
+            let claude_path: Option<PathBuf> = app
+                .try_state::<DiscoveryCache>()
+                .and_then(|c| c.snapshot())
+                .and_then(|r| r.ok().map(|rec| rec.path));
+            let workspace_id = launch.workspace_id;
+            let tab_id = launch.tab_id.clone();
+            match claude_path {
+                Some(path) => {
+                    let spec = terminal_mesh_core::TerminalSpec {
+                        terminal_id: uuid::Uuid::new_v4(),
+                        command: path,
+                        args: launch.claude_argv.clone(),
+                        cwd: Some(launch.local_path.clone()),
+                        env: Vec::new(),
+                        cols: 80,
+                        rows: 24,
+                    };
+                    let spawn_result = terminal_mesh::spawn_into_registry(
+                        spec,
+                        &app,
+                        &registry,
+                        Some(tab_id.clone()),
+                        TabKind::Workspace,
+                        Some(workspace_id.to_string()),
+                    );
+                    match spawn_result {
+                        Ok(terminal_id) => {
+                            // Now that the terminal is recorded,
+                            // clear the pending flag (no-op if the
+                            // snapshot defaulted to false already)
+                            // and let the rail row reflect Running.
+                            on_pending_launch_changed(&registry, &app, terminal_id, false);
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                %workspace_id,
+                                %tab_id,
+                                %err,
+                                "auto-launch spawn_into_registry failed"
+                            );
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        %workspace_id,
+                        %tab_id,
+                        "auto-launch skipped: claude discovery not ready"
+                    );
+                }
+            }
+            if let Some(sched) = scheduler {
+                sched.notify_launch_settled(workspace_id);
+            }
+        });
+    }
 }
 
 #[tauri::command]
@@ -307,6 +413,26 @@ pub fn run() {
                     // `orchestrator_launch_claude` / `_status`.
                     let orchestrator = OrchestratorState::new();
                     app.manage(orchestrator.clone());
+
+                    // Auto-launch scheduler: gates how many claude
+                    // processes can spawn at once on Local workspace
+                    // open (default cap = 4 per spec). The executor
+                    // and scheduler reference each other so the
+                    // settle callback can drain the next pending
+                    // entry; OnceLock breaks the chicken-and-egg.
+                    let scheduler_terminal_registry =
+                        app.state::<TerminalMeshRegistry>().inner().clone();
+                    let real_executor = std::sync::Arc::new(RealLaunchExecutor::new(
+                        app.handle().clone(),
+                        scheduler_terminal_registry,
+                    ));
+                    let scheduler = WorkspaceLaunchScheduler::new(
+                        DEFAULT_LAUNCH_CAP,
+                        real_executor.clone(),
+                    );
+                    real_executor.init_scheduler(scheduler.clone());
+                    app.manage(scheduler);
+
                     // Round 38 (task21 remediation): spawn the host
                     // RPC bridge for sidecar back-channel calls. The
                     // bridge clones the same internally-Arc'd state
@@ -460,6 +586,7 @@ pub fn run() {
             workspaces::open_workspace,
             workspaces::close_workspace,
             workspaces::resolve_workspace_for_tab,
+            workspace_launch_scheduler::request_workspace_auto_launch,
             ide_handoff::ide_get_preference,
             ide_handoff::ide_set_preference,
             ide_handoff::ide_open_workspace,

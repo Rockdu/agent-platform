@@ -48,6 +48,7 @@ import {
   listWorkspaces,
   localPath,
   openWorkspace,
+  requestWorkspaceAutoLaunch,
   type WorkspaceErrorDto,
   type WorkspaceRecord,
 } from "./workspaces";
@@ -1123,9 +1124,16 @@ function WorkspaceRailRow(props: WorkspaceRailRowProps) {
   const icon = transportKindIcon(snapshot.transportKind);
   const transportLabel = transportKindLabel(snapshot.transportKind);
   const isDone = snapshot.status === "Done";
+  // Pending wins over Running because a workspace can be queued
+  // (waiting for a launch slot) even though its snapshot status is
+  // still Running by default. Done wins over Pending because a Done
+  // tab cannot also be pending — pendingLaunch is cleared whenever
+  // the launch settles or the tab is closed.
   const badge: DoneBadgeInfo = isDone
     ? doneReasonBadgeInfo(snapshot.doneReason)
-    : { label: "Running", modifier: "running" };
+    : snapshot.pendingLaunch
+      ? { label: "等待启动", modifier: "pending-launch" }
+      : { label: "Running", modifier: "running" };
   const rowTitle = badge.tooltip
     ? `${tab.workspacePath} — ${badge.tooltip}`
     : tab.workspacePath;
@@ -1337,6 +1345,23 @@ function MultiTerminalContainer() {
         });
         setActive(tabId);
         void refreshWorkspaces();
+        // Auto-launch claude when the profile asks for it AND the
+        // workspace is Local. Fire-and-forget: the backend
+        // scheduler returns immediately after enqueueing; the
+        // eventual terminal_id arrives via the lifecycle
+        // subscription. Remote / disabled-auto-launch paths are
+        // typed-rejected on the backend, so swallow those without
+        // surfacing a user-facing error.
+        if (
+          refreshed.profile.autoLaunchClaude &&
+          refreshed.location.kind === "local"
+        ) {
+          void requestWorkspaceAutoLaunch(refreshed.workspaceId, tabId).catch(
+            (err) => {
+              console.warn("auto-launch enqueue failed", err);
+            },
+          );
+        }
       } catch (err) {
         if (isWorkspaceErrorDto(err)) setError(err);
       }

@@ -72,6 +72,15 @@ pub struct WorkspaceLifecycleSnapshot {
     /// (output, attention, user-initiated stdin); read by the inner
     /// rail to FIFO-order Running and Done sections.
     pub last_activity_at_unix_ms: i64,
+    /// `true` while this tab's workspace is sitting in the
+    /// `WorkspaceLaunchScheduler` pending queue (the global
+    /// concurrency cap is saturated and this workspace is waiting
+    /// for a slot). Cleared the moment the launch settles or the
+    /// pending entry is canceled. Surfaces a `等待启动` badge in the
+    /// inner rail so users can distinguish "running" from "waiting
+    /// in line".
+    #[serde(default)]
+    pub pending_launch: bool,
 }
 
 impl WorkspaceLifecycleSnapshot {
@@ -99,6 +108,7 @@ impl WorkspaceLifecycleSnapshot {
             status: TabStatus::Running,
             done_reason: None,
             last_activity_at_unix_ms: now_unix_ms(),
+            pending_launch: false,
         }
     }
 }
@@ -245,6 +255,43 @@ pub fn on_user_stdin(
     terminal_id: Uuid,
 ) {
     if let Some(updated) = update_snapshot_for_user_stdin(registry, terminal_id) {
+        emit_lifecycle_updated(app, terminal_id, &updated);
+    }
+}
+
+/// Registry-side helper that sets the snapshot's `pending_launch`
+/// flag and returns the updated snapshot if the field changed. Used
+/// by the `WorkspaceLaunchScheduler` integration to surface "waiting
+/// in line" state in the inner rail. Returns `None` when the
+/// retained record is gone or the flag value would not change.
+pub fn update_snapshot_for_pending_launch(
+    registry: &crate::terminal_mesh::TerminalMeshRegistry,
+    terminal_id: Uuid,
+    pending: bool,
+) -> Option<WorkspaceLifecycleSnapshot> {
+    let mut changed = false;
+    let updated = registry.update_snapshot(terminal_id, |snap| {
+        if snap.pending_launch != pending {
+            snap.pending_launch = pending;
+            changed = true;
+        }
+    })?;
+    if changed {
+        Some(updated)
+    } else {
+        None
+    }
+}
+
+/// End-to-end pending-launch entry point: flip the flag and emit
+/// `lifecycle://updated` so the rail row's Pending badge reconciles.
+pub fn on_pending_launch_changed(
+    registry: &crate::terminal_mesh::TerminalMeshRegistry,
+    app: &AppHandle,
+    terminal_id: Uuid,
+    pending: bool,
+) {
+    if let Some(updated) = update_snapshot_for_pending_launch(registry, terminal_id, pending) {
         emit_lifecycle_updated(app, terminal_id, &updated);
     }
 }
@@ -600,5 +647,70 @@ mod tests {
         .unwrap();
         assert!(json.contains("\"kind\":\"TaskComplete\""), "got {json}");
         assert!(json.contains("\"summary\":\"shipped\""), "got {json}");
+    }
+
+    #[test]
+    fn update_snapshot_for_pending_launch_marks_snapshot_pending() {
+        use crate::terminal_mesh::TerminalMeshRegistry;
+        use terminal_mesh_core::ActorCommand;
+        use tokio::sync::mpsc;
+
+        let registry = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        registry.record(id, tx, scrollback, None, TabKind::Workspace, None);
+        let baseline = registry.snapshot_for_terminal(id).expect("recorded");
+        assert!(!baseline.pending_launch);
+
+        let updated = update_snapshot_for_pending_launch(&registry, id, true)
+            .expect("first flip must return Some");
+        assert!(updated.pending_launch);
+        let reread = registry.snapshot_for_terminal(id).expect("still present");
+        assert!(reread.pending_launch);
+    }
+
+    #[test]
+    fn update_snapshot_for_pending_launch_no_change_returns_none() {
+        use crate::terminal_mesh::TerminalMeshRegistry;
+        use terminal_mesh_core::ActorCommand;
+        use tokio::sync::mpsc;
+
+        let registry = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        registry.record(id, tx, scrollback, None, TabKind::Workspace, None);
+
+        // Snapshot starts with pending_launch = false; calling with false is
+        // a no-op and must NOT emit a redundant lifecycle://updated.
+        let result = update_snapshot_for_pending_launch(&registry, id, false);
+        assert!(result.is_none(), "no-op flip must return None");
+    }
+
+    #[test]
+    fn update_snapshot_for_pending_launch_clears_flag_when_settled() {
+        use crate::terminal_mesh::TerminalMeshRegistry;
+        use terminal_mesh_core::ActorCommand;
+        use tokio::sync::mpsc;
+
+        let registry = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        registry.record(id, tx, scrollback, None, TabKind::Workspace, None);
+
+        update_snapshot_for_pending_launch(&registry, id, true).expect("set");
+        let cleared = update_snapshot_for_pending_launch(&registry, id, false)
+            .expect("clearing must return Some");
+        assert!(!cleared.pending_launch);
+    }
+
+    #[test]
+    fn update_snapshot_for_pending_launch_for_unknown_terminal_returns_none() {
+        use crate::terminal_mesh::TerminalMeshRegistry;
+        let registry = TerminalMeshRegistry::new();
+        let result = update_snapshot_for_pending_launch(&registry, Uuid::new_v4(), true);
+        assert!(result.is_none());
     }
 }

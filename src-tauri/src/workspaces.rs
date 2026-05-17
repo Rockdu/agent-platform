@@ -43,8 +43,13 @@ pub struct SshLocation {
     pub host: String,
     /// Canonicalizes to 22 when `None`.
     pub port: Option<u16>,
-    /// Remote cwd used as the wrapper's `$AM_REMOTE_CWD`.
-    pub canonical_remote_path: Option<String>,
+    /// Remote cwd used as the wrapper's `$AM_REMOTE_CWD`. Required
+    /// because `docs/specs/transport.md` §6.1/§6.2 include it in the
+    /// remote duplicate-identity tuple — the persisted shape MUST
+    /// always carry a remote cwd. The initial value is whatever the
+    /// user typed; the SSH transport may canonicalize it post-connect
+    /// and rewrite this field in place.
+    pub canonical_remote_path: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -482,6 +487,15 @@ impl WorkspaceRegistry {
         guard.records.get(&uuid).map(|r| r.name.clone())
     }
 
+    /// Full-record lookup by `Uuid` for callers (e.g. the auto-launch
+    /// scheduler) that need the `WorkspaceLocation` and `WorkspaceProfile`
+    /// fields, not just the friendly name. Returns a `clone()` so the
+    /// caller does not hold the registry mutex.
+    pub fn find_by_id(&self, workspace_id: Uuid) -> Option<WorkspaceRecord> {
+        let guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
+        guard.records.get(&workspace_id).cloned()
+    }
+
     /// Test-only helper used by sibling-crate tests (e.g. the
     /// host_rpc bridge tests) to seed a workspace record without
     /// touching disk or going through the validation-heavy create
@@ -849,8 +863,14 @@ pub fn open_workspace(
 pub fn close_workspace(
     workspace_id: String,
     registry: State<'_, WorkspaceRegistry>,
+    scheduler: State<'_, crate::workspace_launch_scheduler::WorkspaceLaunchScheduler>,
 ) -> Result<(), WorkspaceErrorDto> {
     let id = parse_workspace_id(&workspace_id)?;
+    // Removing a queued auto-launch entry frees the slot without
+    // consuming it. In-flight launches are not cancelable at this
+    // layer; the user's close still succeeds and the eventual settle
+    // just drains nothing.
+    let _was_pending = scheduler.cancel(id);
     registry
         .close_workspace(id)
         .map_err(|e| WorkspaceErrorDto::from(&e))
@@ -1470,7 +1490,7 @@ mod tests {
                     user: Some("alice".into()),
                     host: "host.example".into(),
                     port: Some(2222),
-                    canonical_remote_path: Some("/home/alice/work".into()),
+                    canonical_remote_path: "/home/alice/work".into(),
                 },
                 container: Some(ContainerLocation {
                     container_id: "ctr-7".into(),
@@ -1542,6 +1562,44 @@ mod tests {
         );
     }
 
+    /// Pins the spec invariant that every persisted Remote record
+    /// carries a `canonical_remote_path` — `docs/specs/transport.md`
+    /// §6.1 lists it as required and §6.2 uses it in the remote
+    /// duplicate-identity tuple. A stored Remote record missing the
+    /// field must fail to deserialize so a corrupt or hand-edited
+    /// file does not produce an identity-less Remote record.
+    #[test]
+    fn stored_record_remote_missing_canonical_path_fails_deserialization() {
+        let blob = serde_json::json!({
+            "workspace_id": Uuid::new_v4().to_string(),
+            "name": "remote-no-path",
+            "location": {
+                "kind": "remote",
+                "ssh": {
+                    "user": "alice",
+                    "host": "host.example",
+                    "port": 22
+                },
+                "container": null
+            },
+            "profile": {
+                "autoLaunchClaude": false,
+                "claudeArgv": []
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_used_at": "2026-01-01T00:00:00Z",
+            "open_tab_id": null
+        });
+        let err = serde_json::from_value::<StoredWorkspaceRecord>(blob)
+            .expect_err("Remote record without canonical_remote_path must fail to deserialize");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("canonicalRemotePath")
+                || msg.contains("canonical_remote_path"),
+            "error should mention the missing field; got: {msg}"
+        );
+    }
+
     /// Canonical-duplicate detection must skip `Remote` records so a
     /// Remote SSH workspace whose nominal path happens to match a
     /// Local path does not falsely block creation.
@@ -1561,9 +1619,7 @@ mod tests {
                     user: None,
                     host: "host.example".into(),
                     port: None,
-                    canonical_remote_path: Some(
-                        local_dir.to_string_lossy().into_owned(),
-                    ),
+                    canonical_remote_path: local_dir.to_string_lossy().into_owned(),
                 },
                 container: None,
             },

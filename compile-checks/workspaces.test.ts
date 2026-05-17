@@ -109,6 +109,34 @@ export function _probe_remote_location_round_trip(): void {
   void localPath(remote);
 }
 
+// Pins the spec invariant that `canonicalRemotePath` is required on
+// every Remote SshLocation (docs/specs/transport.md §6.1/§6.2). An
+// object literal that omits the field must fail the WorkspaceRecord
+// shape check at compile time.
+export function _probe_invalid_remote_record_missing_canonical_path(): void {
+  const remote: WorkspaceRecord = {
+    workspaceId: "u",
+    name: "n",
+    location: {
+      kind: "remote",
+      ssh: {
+        user: "alice",
+        host: "host.example",
+        port: 22,
+        // @ts-expect-error `canonicalRemotePath` is required on SshLocation
+        canonicalRemotePath: null,
+      },
+      container: null,
+    },
+    profile: { autoLaunchClaude: false, claudeArgv: [] },
+    createdAt: "2026-01-01T00:00:00Z",
+    lastUsedAt: "2026-01-01T00:00:00Z",
+    openTabId: null,
+    conversationRoundsCount: 0,
+  };
+  void remote;
+}
+
 export function _probe_invalid_error_dto_kind(): void {
   const e: WorkspaceErrorDto = {
     // @ts-expect-error kind must be one of the named WorkspaceErrorDto variants
