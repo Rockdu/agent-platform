@@ -10,6 +10,12 @@ export interface WorkspaceRecord {
   createdAt: string;
   lastUsedAt: string;
   openTabId: string | null;
+  /// Best-effort claude conversation rounds count derived from
+  /// scanning `<path>/.claude/` for `*.jsonl` files at command
+  /// return time. NOT persisted in `workspaces.json` — purely
+  /// computed for display. Always present on the wire (defaults
+  /// to 0 when `.claude/` is missing).
+  conversationRoundsCount: number;
 }
 
 export type WorkspaceErrorDto =

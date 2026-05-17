@@ -16,6 +16,7 @@ export function _probe_record_shape(r: WorkspaceRecord): string {
     r.createdAt,
     r.lastUsedAt,
     r.openTabId ?? "<closed>",
+    r.conversationRoundsCount,
   ].join("|");
 }
 
@@ -51,6 +52,22 @@ export function _probe_invalid_record_missing_path(): void {
   const r: WorkspaceRecord = {
     workspaceId: "u",
     name: "n",
+    createdAt: "2026-01-01T00:00:00Z",
+    lastUsedAt: "2026-01-01T00:00:00Z",
+    openTabId: null,
+    conversationRoundsCount: 0,
+  };
+  void r;
+}
+
+// task18 round-31 probe: conversationRoundsCount is required on the
+// wire shape (computed at command return time, never absent).
+export function _probe_invalid_record_missing_conversation_count(): void {
+  // @ts-expect-error `conversationRoundsCount` is required on WorkspaceRecord
+  const r: WorkspaceRecord = {
+    workspaceId: "u",
+    name: "n",
+    path: "/tmp/x",
     createdAt: "2026-01-01T00:00:00Z",
     lastUsedAt: "2026-01-01T00:00:00Z",
     openTabId: null,

@@ -29,6 +29,14 @@ pub struct WorkspaceRecord {
     pub created_at: String,
     pub last_used_at: String,
     pub open_tab_id: Option<String>,
+    /// Best-effort claude conversation rounds count derived from
+    /// scanning `<path>/.claude/` for `*.jsonl` files at command
+    /// return time. Computed, not persisted — `StoredWorkspaceRecord`
+    /// excludes this field deliberately so the registry never
+    /// becomes an authoritative cache. Defaults to 0 when `.claude/`
+    /// is missing or unreadable.
+    #[serde(default)]
+    pub conversation_rounds_count: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +130,9 @@ struct StoredWorkspaceRecord {
 
 impl From<&WorkspaceRecord> for StoredWorkspaceRecord {
     fn from(r: &WorkspaceRecord) -> Self {
+        // `conversation_rounds_count` is computed at command return
+        // time and intentionally dropped here — the disk shape is
+        // not an authoritative cache.
         Self {
             workspace_id: r.workspace_id,
             name: r.name.clone(),
@@ -142,6 +153,11 @@ impl From<StoredWorkspaceRecord> for WorkspaceRecord {
             created_at: s.created_at,
             last_used_at: s.last_used_at,
             open_tab_id: s.open_tab_id,
+            // Caller is expected to populate via
+            // `count_claude_conversation_rounds(&record.path)`
+            // before returning to the frontend; default 0 here so
+            // an unpopulated record is still serializable.
+            conversation_rounds_count: 0,
         }
     }
 }
@@ -318,9 +334,22 @@ impl WorkspaceRegistry {
     pub fn list(&self) -> Vec<WorkspaceRecord> {
         let guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
         let mut out: Vec<WorkspaceRecord> = guard.records.values().cloned().collect();
+        drop(guard);
         // Sort descending by `last_used_at` (string-comparable RFC3339).
         out.sort_by(|a, b| b.last_used_at.cmp(&a.last_used_at));
+        for r in out.iter_mut() {
+            r.conversation_rounds_count = count_claude_conversation_rounds(&r.path);
+        }
         out
+    }
+
+    /// Populate a returned `WorkspaceRecord` with a fresh
+    /// `conversation_rounds_count` derived from its path. Used by
+    /// every Tauri-command return path to keep the wire shape
+    /// up-to-date without persisting the count.
+    fn with_conversation_count(&self, mut record: WorkspaceRecord) -> WorkspaceRecord {
+        record.conversation_rounds_count = count_claude_conversation_rounds(&record.path);
+        record
     }
 
     /// Inject the workspaces-root override at runtime so test setups
@@ -368,10 +397,11 @@ impl WorkspaceRegistry {
             created_at: now.clone(),
             last_used_at: now,
             open_tab_id: None,
+            conversation_rounds_count: 0,
         };
         guard.records.insert(record.workspace_id, record.clone());
         Self::persist(&guard)?;
-        Ok(record)
+        Ok(self.with_conversation_count(record))
     }
 
     pub fn register_workspace(&self, path: &Path) -> Result<WorkspaceRecord, WorkspaceError> {
@@ -406,10 +436,11 @@ impl WorkspaceRegistry {
             created_at: now.clone(),
             last_used_at: now,
             open_tab_id: None,
+            conversation_rounds_count: 0,
         };
         guard.records.insert(record.workspace_id, record.clone());
         Self::persist(&guard)?;
-        Ok(record)
+        Ok(self.with_conversation_count(record))
     }
 
     pub fn open_workspace(
@@ -438,7 +469,7 @@ impl WorkspaceRegistry {
         };
         guard.records.insert(workspace_id, updated.clone());
         Self::persist(&guard)?;
-        Ok(updated)
+        Ok(self.with_conversation_count(updated))
     }
 
     pub fn close_workspace(&self, workspace_id: Uuid) -> Result<(), WorkspaceError> {
@@ -456,11 +487,13 @@ impl WorkspaceRegistry {
 
     pub fn resolve_for_tab(&self, tab_id: &str) -> Option<WorkspaceRecord> {
         let guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
-        guard
+        let found = guard
             .records
             .values()
             .find(|r| r.open_tab_id.as_deref() == Some(tab_id))
-            .cloned()
+            .cloned();
+        drop(guard);
+        found.map(|r| self.with_conversation_count(r))
     }
 }
 
@@ -521,6 +554,46 @@ pub fn validate_workspace_name(name: &str) -> Result<(), WorkspaceError> {
         }
     }
     Ok(())
+}
+
+/// Best-effort count of `.jsonl` files under `<workspace>/.claude/`.
+/// Used to populate `WorkspaceRecord::conversation_rounds_count` at
+/// command return time. Bounded by a directory-visit budget so a
+/// pathological workspace (e.g. one that user-pointed at `/`) can't
+/// stall the registry. Returns 0 when `.claude/` is missing or
+/// unreadable.
+const CLAUDE_SCAN_DIR_BUDGET: usize = 256;
+
+pub fn count_claude_conversation_rounds(workspace_path: &Path) -> u32 {
+    let root = workspace_path.join(".claude");
+    if !root.is_dir() {
+        return 0;
+    }
+    let mut stack: Vec<PathBuf> = vec![root];
+    let mut count: u32 = 0;
+    let mut visited: usize = 0;
+    while let Some(dir) = stack.pop() {
+        if visited >= CLAUDE_SCAN_DIR_BUDGET {
+            break;
+        }
+        visited += 1;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else { continue };
+            let p = entry.path();
+            if file_type.is_dir() {
+                stack.push(p);
+            } else if file_type.is_file()
+                && p.extension().and_then(|s| s.to_str()) == Some("jsonl")
+            {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    count
 }
 
 fn default_workspaces_root() -> Option<PathBuf> {
@@ -1013,6 +1086,59 @@ mod tests {
                 "wire-only camelCase key `{k}` leaked to disk in {entry:?}"
             );
         }
+        // conversation_rounds_count is computed at command return
+        // time only — never persisted, regardless of case.
+        for k in ["conversation_rounds_count", "conversationRoundsCount"] {
+            assert!(
+                entry.get(k).is_none(),
+                "computed-only key `{k}` leaked to disk in {entry:?}"
+            );
+        }
+    }
+
+    /// Codex round-30 task18 contract: helper returns 0 for a fresh
+    /// workspace dir with no `.claude/`.
+    #[test]
+    fn count_claude_conversation_rounds_returns_zero_when_no_dot_claude() {
+        let (_storage, home, _reg) = fresh_registry();
+        let bare = home.path().join("bare-workspace");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(count_claude_conversation_rounds(&bare), 0);
+    }
+
+    /// Codex round-30 task18 contract: helper recursively counts
+    /// `*.jsonl` files under `.claude/`, skipping non-jsonl siblings.
+    #[test]
+    fn count_claude_conversation_rounds_counts_nested_jsonl_files() {
+        let (_storage, home, _reg) = fresh_registry();
+        let ws = home.path().join("claude-ws");
+        std::fs::create_dir_all(ws.join(".claude/projects/foo")).unwrap();
+        std::fs::create_dir_all(ws.join(".claude/other")).unwrap();
+        std::fs::create_dir_all(ws.join(".claude/extra")).unwrap();
+        std::fs::write(ws.join(".claude/projects/foo/a.jsonl"), b"{}").unwrap();
+        std::fs::write(ws.join(".claude/projects/foo/b.jsonl"), b"{}").unwrap();
+        std::fs::write(ws.join(".claude/other/c.jsonl"), b"{}").unwrap();
+        std::fs::write(ws.join(".claude/extra/d.txt"), b"not jsonl").unwrap();
+        assert_eq!(count_claude_conversation_rounds(&ws), 3);
+    }
+
+    /// `list_workspaces` populates `conversation_rounds_count` at
+    /// return time from the workspace's `.claude/` directory.
+    #[test]
+    fn list_workspaces_populates_conversation_rounds_count() {
+        let (_storage, _home, reg) = fresh_registry();
+        let created = reg.create_workspace("counted").expect("create");
+        // Seed two .jsonl files under the auto-created workspace.
+        let claude = created.path.join(".claude/projects/counted");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("a.jsonl"), b"{}").unwrap();
+        std::fs::write(claude.join("b.jsonl"), b"{}").unwrap();
+        let listed = reg.list();
+        let found = listed
+            .iter()
+            .find(|r| r.workspace_id == created.workspace_id)
+            .expect("present");
+        assert_eq!(found.conversation_rounds_count, 2);
     }
 
     #[test]

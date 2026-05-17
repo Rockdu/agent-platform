@@ -30,14 +30,13 @@ import {
 import { TerminalMeshView } from "./TerminalMeshView";
 import {
   closeWorkspace,
-  createWorkspace,
   isWorkspaceErrorDto,
   listWorkspaces,
   openWorkspace,
-  registerWorkspace,
   type WorkspaceErrorDto,
   type WorkspaceRecord,
 } from "./workspaces";
+import { WorkspaceSwitcherModal } from "./WorkspaceSwitcherModal";
 import "@xterm/xterm/css/xterm.css";
 import "./App.css";
 
@@ -811,15 +810,21 @@ interface OpenTab {
   workspacePath: string;
 }
 
+type HostModal = "workspace-switcher" | null;
+
 function MultiTerminalContainer() {
   // task17: every open terminal tab is bound to exactly one
   // persisted workspace. The host registry enforces
   // one-workspace-one-tab via `open_workspace`/`close_workspace`,
   // and we spawn each PTY at that workspace's canonical path.
+  // task18: workspace creation and recent-list adoption live in a
+  // host-coordinated modal (WorkspaceSwitcherModal); the container
+  // only owns the tab array + open/close/focus calls.
   const [workspaces, setWorkspaces] = useState<WorkspaceRecord[]>([]);
   const [tabs, setTabs] = useState<OpenTab[]>([]);
   const [active, setActive] = useState<string>("");
   const [error, setError] = useState<WorkspaceErrorDto | null>(null);
+  const [activeModal, setActiveModal] = useState<HostModal>(null);
 
   const refreshWorkspaces = useCallback(async () => {
     try {
@@ -863,37 +868,10 @@ function MultiTerminalContainer() {
     [refreshWorkspaces],
   );
 
-  const onCreateWorkspace = useCallback(async () => {
-    const name = window.prompt("新工作区名称（仅字母、数字、汉字、-、_、.、空格，最多 64 字符）");
-    if (!name) return;
-    try {
-      const created = await createWorkspace(name);
-      await adoptWorkspaceTab(created);
-    } catch (err) {
-      if (isWorkspaceErrorDto(err)) setError(err);
-    }
-  }, [adoptWorkspaceTab]);
-
-  const onRegisterDirectory = useCallback(async () => {
-    try {
-      const picked = await openFileDialog({
-        multiple: false,
-        directory: true,
-        title: "选择已有工作区目录",
-      });
-      if (picked === null) return;
-      const path = Array.isArray(picked) ? picked[0] : picked;
-      if (typeof path !== "string" || path === "") return;
-      const registered = await registerWorkspace(path);
-      await adoptWorkspaceTab(registered);
-    } catch (err) {
-      if (isWorkspaceErrorDto(err)) setError(err);
-    }
-  }, [adoptWorkspaceTab]);
-
-  const onOpenExisting = useCallback(
+  const onPickExistingFromModal = useCallback(
     async (workspace: WorkspaceRecord) => {
-      // If already open as a tab locally, just focus it.
+      // Recent-list click: focus if already mounted locally, else
+      // adopt as a fresh tab.
       const existing = tabs.find((t) => t.workspaceId === workspace.workspaceId);
       if (existing) {
         setActive(existing.tabId);
@@ -932,52 +910,49 @@ function MultiTerminalContainer() {
     tabs[tabs.length - 1]?.tabId ??
     null;
 
-  const unopenedWorkspaces = workspaces.filter(
-    (w) => !tabs.some((t) => t.workspaceId === w.workspaceId),
-  );
+  const openWorkspaceIds = new Set(tabs.map((t) => t.workspaceId));
 
   return (
     <section className="terminal-mesh-container">
       <nav className="terminal-mesh-container__strip" role="tablist">
         {tabs.map((t) => (
-          <button
+          // task18: each tab is a wrapper <div> containing a label
+          // <button role="tab"> + a sibling close <button>. Prior
+          // markup nested a <span role="button"> inside the tab
+          // button, which is invalid interactive markup.
+          <div
             key={t.tabId}
-            type="button"
-            role="tab"
-            aria-selected={activeId === t.tabId}
             className={`terminal-mesh-container__tab ${
               activeId === t.tabId ? "terminal-mesh-container__tab--active" : ""
             }`}
-            onClick={() => setActive(t.tabId)}
-            title={t.workspacePath}
           >
-            <span>{t.workspaceName}</span>
-            <span
-              role="button"
-              aria-label={`关闭 ${t.workspaceName}`}
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeId === t.tabId}
+              className="terminal-mesh-container__tab-label"
+              onClick={() => setActive(t.tabId)}
+              title={t.workspacePath}
+            >
+              {t.workspaceName}
+            </button>
+            <button
+              type="button"
               className="terminal-mesh-container__close"
-              onClick={(e) => {
-                e.stopPropagation();
-                void closeTab(t.tabId);
-              }}
+              aria-label={`关闭 ${t.workspaceName}`}
+              onClick={() => void closeTab(t.tabId)}
             >
               ×
-            </span>
-          </button>
+            </button>
+          </div>
         ))}
         <button
           type="button"
           className="terminal-mesh-container__add"
-          onClick={() => void onCreateWorkspace()}
+          onClick={() => setActiveModal("workspace-switcher")}
+          aria-label="打开工作区"
         >
-          + 新工作区
-        </button>
-        <button
-          type="button"
-          className="terminal-mesh-container__add"
-          onClick={() => void onRegisterDirectory()}
-        >
-          📂 添加目录
+          +
         </button>
       </nav>
       {error && (
@@ -994,28 +969,13 @@ function MultiTerminalContainer() {
       )}
       {tabs.length === 0 && (
         <section className="placeholder">
-          <p>
-            还没有打开任何工作区。点击 “+ 新工作区” 创建一个新目录,
-            或 “📂 添加目录” 选择已有目录。
-          </p>
-          {unopenedWorkspaces.length > 0 && (
-            <>
-              <p className="placeholder__hint">最近使用的工作区：</p>
-              <ul>
-                {unopenedWorkspaces.slice(0, 5).map((w) => (
-                  <li key={w.workspaceId}>
-                    <button
-                      type="button"
-                      onClick={() => void onOpenExisting(w)}
-                    >
-                      {w.name}
-                    </button>{" "}
-                    <code>{w.path}</code>
-                  </li>
-                ))}
-              </ul>
-            </>
-          )}
+          <p>还没有打开任何工作区。</p>
+          <button
+            type="button"
+            onClick={() => setActiveModal("workspace-switcher")}
+          >
+            打开工作区
+          </button>
         </section>
       )}
       <div className="terminal-mesh-container__body">
@@ -1027,6 +987,14 @@ function MultiTerminalContainer() {
           />
         ))}
       </div>
+      <WorkspaceSwitcherModal
+        open={activeModal === "workspace-switcher"}
+        workspaces={workspaces}
+        openWorkspaceIds={openWorkspaceIds}
+        onPickExisting={onPickExistingFromModal}
+        onAdopt={adoptWorkspaceTab}
+        onClose={() => setActiveModal(null)}
+      />
     </section>
   );
 }
