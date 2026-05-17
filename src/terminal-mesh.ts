@@ -54,7 +54,8 @@ export type TerminalMeshErrorDto =
   | { kind: "notFound"; terminalId: string }
   | { kind: "invalidTerminalId"; raw: string; message: string }
   | { kind: "spawn"; message: string }
-  | { kind: "io"; context: string; message: string };
+  | { kind: "io"; context: string; message: string }
+  | { kind: "permissionDenied"; message: string };
 
 export function isTerminalMeshErrorDto(
   value: unknown,
@@ -62,7 +63,11 @@ export function isTerminalMeshErrorDto(
   if (typeof value !== "object" || value === null) return false;
   const k = (value as { kind?: unknown }).kind;
   return (
-    k === "notFound" || k === "invalidTerminalId" || k === "spawn" || k === "io"
+    k === "notFound" ||
+    k === "invalidTerminalId" ||
+    k === "spawn" ||
+    k === "io" ||
+    k === "permissionDenied"
   );
 }
 

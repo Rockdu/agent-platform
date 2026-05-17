@@ -43,6 +43,15 @@ pub enum TerminalMeshError {
 
     #[error("io error in `{context}`: {message}")]
     Io { context: String, message: String },
+
+    /// task21 / AC-3.3: the calling capability is valid but lacks the
+    /// privilege required for the requested action. Today only the cross-tab
+    /// scrollback read uses this; the calling capability's MountEntry
+    /// `cross_tab_read_flag` is `false`. The DTO surface intentionally
+    /// names this `permissionDenied` (not `crossTabReadDenied`) so the wire
+    /// shape does not leak the privileged-flag terminology.
+    #[error("permission denied: {message}")]
+    PermissionDenied { message: String },
 }
 
 impl From<ActorError> for TerminalMeshError {
@@ -67,6 +76,7 @@ pub enum TerminalMeshErrorDto {
     InvalidTerminalId { raw: String, message: String },
     Spawn { message: String },
     Io { context: String, message: String },
+    PermissionDenied { message: String },
 }
 
 impl From<&TerminalMeshError> for TerminalMeshErrorDto {
@@ -84,6 +94,9 @@ impl From<&TerminalMeshError> for TerminalMeshErrorDto {
             },
             TerminalMeshError::Io { context, message } => Self::Io {
                 context: context.clone(),
+                message: message.clone(),
+            },
+            TerminalMeshError::PermissionDenied { message } => Self::PermissionDenied {
                 message: message.clone(),
             },
         }
@@ -441,6 +454,100 @@ pub fn terminal_scrollback(
     Ok(guard[idx..].to_string())
 }
 
+/// task21 / AC-3.3: hard cap on a single cross-tab scrollback read,
+/// independent of the caller-requested `max_bytes`. Documented as the
+/// bounded-read max-bytes contract surfaced to the orchestrator's
+/// terminal-mesh MCP sidecar; the dispatcher's `cross_tab_read_flag`
+/// authorization is the gate, this constant is the size cap. 256 KB
+/// chosen as 4× the per-PTY scrollback retention so a single read can
+/// always cover at least one full buffer plus headroom.
+pub const MAX_CROSS_TAB_READ_BYTES: usize = 256 * 1024;
+
+/// task21 / AC-3.3: pure inner helper used by both the Tauri command
+/// shim and unit tests. Separated so tests can drive the auth path
+/// without standing up a Tauri app. Returns the most-recent slice of
+/// the target's scrollback bounded by `min(max_bytes,
+/// MAX_CROSS_TAB_READ_BYTES)`, UTF-8 char-boundary safe at the start.
+///
+/// Authorization (per AC-3.3 negative test): a `MountEntry` with
+/// `cross_tab_read_flag = false` ALWAYS returns
+/// `TerminalMeshError::PermissionDenied`, regardless of the target id.
+/// The DTO `kind` is `permissionDenied` so the privileged-flag term
+/// does not leak into wire shapes.
+pub fn cross_tab_read_inner(
+    mount_registry: &crate::dispatcher::MountRegistry,
+    terminal_registry: &TerminalMeshRegistry,
+    capability_handle: &str,
+    target_terminal_id: &str,
+    max_bytes: usize,
+) -> Result<String, TerminalMeshError> {
+    // 1. Validate the capability and surface the (Rust-only) MountEntry.
+    let entry = crate::dispatcher::authorize_capability_handle(
+        mount_registry,
+        capability_handle,
+        "terminal-mesh",
+    )
+    .map_err(|dto| TerminalMeshError::PermissionDenied {
+        message: format!("capability rejected: {dto}"),
+    })?;
+
+    // 2. Gate on the Rust-only cross_tab_read_flag.
+    if !entry.cross_tab_read_flag {
+        return Err(TerminalMeshError::PermissionDenied {
+            message: "capability lacks cross-tab read privilege".into(),
+        });
+    }
+
+    // 3. Resolve the target scrollback or NotFound.
+    let id = parse_terminal_id(target_terminal_id)?;
+    let scrollback = terminal_registry
+        .lookup_scrollback(id)
+        .ok_or_else(|| TerminalMeshError::NotFound {
+            terminal_id: id.to_string(),
+        })?;
+
+    // 4. Bound the read: caller's max_bytes, capped by the hard ceiling.
+    let want = max_bytes.min(MAX_CROSS_TAB_READ_BYTES);
+    let guard = scrollback.lock().expect("scrollback mutex poisoned");
+    if guard.len() <= want {
+        return Ok(guard.clone());
+    }
+    let drop_bytes = guard.len() - want;
+    let mut idx = drop_bytes;
+    while !guard.is_char_boundary(idx) {
+        idx += 1;
+        if idx >= guard.len() {
+            return Ok(String::new());
+        }
+    }
+    Ok(guard[idx..].to_string())
+}
+
+/// task21 / AC-3.3 Tauri command: orchestrator-side cross-tab scrollback
+/// read. Routes through [`cross_tab_read_inner`]; failure DTOs are the
+/// standard `TerminalMeshErrorDto` (kind `permissionDenied` for denied
+/// reads, `notFound` for unknown targets, `invalidTerminalId` for
+/// malformed UUIDs). The capability handle is the orchestrator's
+/// `terminal-mesh` mount handle minted by
+/// [`crate::dispatcher::insert_orchestrator_mount`].
+#[tauri::command]
+pub fn terminal_mesh_cross_tab_read_scrollback(
+    capability: String,
+    target_terminal_id: String,
+    max_bytes: u32,
+    registry: State<'_, TerminalMeshRegistry>,
+    mount_registry: State<'_, crate::dispatcher::MountRegistry>,
+) -> Result<String, TerminalMeshErrorDto> {
+    cross_tab_read_inner(
+        &mount_registry,
+        &registry,
+        &capability,
+        &target_terminal_id,
+        max_bytes as usize,
+    )
+    .map_err(|e| TerminalMeshErrorDto::from(&e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,5 +707,171 @@ mod tests {
         // tasks don't see channel-closed mid-test.
         drop(keepalive_receivers);
         drop(keepalive_statuses);
+    }
+
+    // ----- task21 / AC-3.3: cross-tab read privileged capability -----
+
+    /// Helper: stand up a TerminalMeshRegistry with one terminal whose
+    /// scrollback contains `body`. Returns (registry, terminal_id).
+    fn registry_with_one_scrollback(body: &str) -> (TerminalMeshRegistry, Uuid) {
+        let registry = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let buf = StdArc::new(StdMutex::new(body.to_string()));
+        registry.record(id, tx, buf);
+        (registry, id)
+    }
+
+    #[test]
+    fn cross_tab_read_returns_scrollback_when_cross_tab_read_flag_true() {
+        let (term_registry, target_id) = registry_with_one_scrollback("hello world");
+        let mount_registry = crate::dispatcher::MountRegistry::new();
+        let resp = crate::dispatcher::insert_orchestrator_mount(
+            &mount_registry,
+            "terminal-mesh",
+            Some("tab-orch"),
+        );
+        let out = cross_tab_read_inner(
+            &mount_registry,
+            &term_registry,
+            &resp.handle,
+            &target_id.to_string(),
+            8192,
+        )
+        .expect("orchestrator handle can read scrollback");
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn cross_tab_read_returns_permission_denied_when_flag_false() {
+        // AC-3.3 negative test: regular-tab handle is rejected even when
+        // pointed at the same target. (Mount example-notes as a stand-in
+        // for "any manifested non-orchestrator plugin"; the auth check
+        // matches plugin_id="terminal-mesh", so use the orchestrator
+        // path to set up a deliberately wrong-plugin handle below.)
+        let (term_registry, target_id) = registry_with_one_scrollback("secret");
+        let mount_registry = crate::dispatcher::MountRegistry::new();
+        // Mount terminal-mesh WITHOUT the privileged flag via the
+        // generic insert_mount path (mirrors what a regular tab's
+        // terminal-mesh capability would look like if one were ever
+        // minted; today regular tabs don't mount terminal-mesh, but
+        // the auth check must still deny if they did).
+        let mount_id = Uuid::new_v4();
+        let nonce = crate::dispatcher::fresh_nonce_bytes();
+        let handle = crate::dispatcher::encode_handle(mount_id, &nonce);
+        crate::dispatcher::insert_mount(
+            &mount_registry,
+            "terminal-mesh",
+            mount_id,
+            crate::dispatcher::hash_nonce(&nonce),
+            vec![],
+            Some("tab-regular".into()),
+        );
+
+        let err = cross_tab_read_inner(
+            &mount_registry,
+            &term_registry,
+            &handle,
+            &target_id.to_string(),
+            8192,
+        )
+        .unwrap_err();
+        match err {
+            TerminalMeshError::PermissionDenied { message } => {
+                assert!(
+                    message.contains("cross-tab read privilege"),
+                    "unexpected permission_denied message: {message}"
+                );
+            }
+            other => panic!("expected PermissionDenied; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_tab_read_returns_at_most_hard_max_bytes() {
+        // Pre-populate a scrollback larger than the hard cap; request
+        // an absurdly-large max_bytes; assert the returned slice is
+        // exactly MAX_CROSS_TAB_READ_BYTES (UTF-8 safe at the start).
+        let big = "A".repeat(MAX_CROSS_TAB_READ_BYTES + 4096);
+        let (term_registry, target_id) = registry_with_one_scrollback(&big);
+        let mount_registry = crate::dispatcher::MountRegistry::new();
+        let resp = crate::dispatcher::insert_orchestrator_mount(
+            &mount_registry,
+            "terminal-mesh",
+            None,
+        );
+        let out = cross_tab_read_inner(
+            &mount_registry,
+            &term_registry,
+            &resp.handle,
+            &target_id.to_string(),
+            usize::MAX,
+        )
+        .expect("orchestrator handle reads with hard cap");
+        assert_eq!(out.len(), MAX_CROSS_TAB_READ_BYTES);
+        assert!(out.is_char_boundary(0));
+    }
+
+    #[test]
+    fn cross_tab_read_returns_at_most_caller_requested_max_bytes() {
+        // Caller-requested < hard cap → caller-requested wins.
+        let body = "B".repeat(64 * 1024);
+        let (term_registry, target_id) = registry_with_one_scrollback(&body);
+        let mount_registry = crate::dispatcher::MountRegistry::new();
+        let resp = crate::dispatcher::insert_orchestrator_mount(
+            &mount_registry,
+            "terminal-mesh",
+            None,
+        );
+        let out = cross_tab_read_inner(
+            &mount_registry,
+            &term_registry,
+            &resp.handle,
+            &target_id.to_string(),
+            4096,
+        )
+        .expect("orchestrator handle reads with caller cap");
+        assert!(out.len() <= 4096, "got {} bytes", out.len());
+    }
+
+    #[test]
+    fn cross_tab_read_returns_not_found_for_unknown_target() {
+        let term_registry = TerminalMeshRegistry::new();
+        let mount_registry = crate::dispatcher::MountRegistry::new();
+        let resp = crate::dispatcher::insert_orchestrator_mount(
+            &mount_registry,
+            "terminal-mesh",
+            None,
+        );
+        let unknown = Uuid::new_v4();
+        let err = cross_tab_read_inner(
+            &mount_registry,
+            &term_registry,
+            &resp.handle,
+            &unknown.to_string(),
+            8192,
+        )
+        .unwrap_err();
+        match err {
+            TerminalMeshError::NotFound { terminal_id } => {
+                assert_eq!(terminal_id, unknown.to_string());
+            }
+            other => panic!("expected NotFound; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_tab_read_returns_permission_denied_for_malformed_handle() {
+        let (term_registry, target_id) = registry_with_one_scrollback("x");
+        let mount_registry = crate::dispatcher::MountRegistry::new();
+        let err = cross_tab_read_inner(
+            &mount_registry,
+            &term_registry,
+            "not-a-handle",
+            &target_id.to_string(),
+            8192,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TerminalMeshError::PermissionDenied { .. }));
     }
 }

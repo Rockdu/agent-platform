@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::claude_discovery::DiscoveryCache;
 use crate::dev_diagnostics::workspace_root_for_dev;
+use crate::dispatcher::MountRegistry;
 use crate::mcp_config::{self, McpConfigKind};
 use crate::terminal_mesh::{spawn_into_registry, TerminalMeshRegistry};
 
@@ -32,6 +33,16 @@ pub struct OrchestratorSession {
     pub terminal_id: Uuid,
     pub tab_id: String,
     pub mcp_config_path: PathBuf,
+    /// task21 / AC-3.3: opaque capability handle for the orchestrator's
+    /// privileged `terminal-mesh` mount (cross_tab_read_flag = true in
+    /// `MountRegistry`). `#[serde(skip)]` — never crosses the IPC
+    /// boundary, never reaches React state. The Rust-only field lets
+    /// `orchestrator_shutdown` unmount the privileged entry alongside
+    /// the PTY + MCP-config cleanup, and lets a future MCP-sidecar
+    /// wiring task (post-task21) deliver the handle to the orchestrator's
+    /// terminal-mesh sidecar without re-minting.
+    #[serde(skip)]
+    pub terminal_mesh_capability: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +211,7 @@ pub fn orchestrator_launch_claude(
     state: State<'_, OrchestratorState>,
     discovery: State<'_, DiscoveryCache>,
     registry: State<'_, TerminalMeshRegistry>,
+    mount_registry: State<'_, MountRegistry>,
     bootstrap: State<'_, OrchestratorBootstrap>,
 ) -> Result<OrchestratorStatus, OrchestratorErrorDto> {
     // Require claude discovery before holding the launch mutex so
@@ -220,6 +232,7 @@ pub fn orchestrator_launch_claude(
             spawn_orchestrator_claude(
                 &app,
                 &registry,
+                &mount_registry,
                 &agent_platform_root,
                 &app_data_root,
                 &claude_path,
@@ -237,6 +250,7 @@ pub fn orchestrator_launch_claude(
 pub(crate) fn spawn_orchestrator_claude(
     app: &AppHandle,
     registry: &TerminalMeshRegistry,
+    mount_registry: &MountRegistry,
     agent_platform_root: &std::path::Path,
     app_data_root: &std::path::Path,
     claude_path: &std::path::Path,
@@ -278,11 +292,26 @@ pub(crate) fn spawn_orchestrator_claude(
     };
 
     match spawn_into_registry(spec, app, registry) {
-        Ok(terminal_id) => Ok(OrchestratorSession {
-            terminal_id,
-            tab_id,
-            mcp_config_path,
-        }),
+        Ok(terminal_id) => {
+            // task21 / AC-3.3: mint the orchestrator's privileged
+            // `terminal-mesh` mount with `cross_tab_read_flag = true`.
+            // The handle is stashed on the (Rust-only) session field;
+            // it never crosses the IPC boundary because the field is
+            // `#[serde(skip)]`. Host-internal grant — does not depend
+            // on the terminal-mesh frontend plugin manifest.
+            let resp = crate::dispatcher::insert_orchestrator_mount(
+                mount_registry,
+                "terminal-mesh",
+                Some(&tab_id),
+            );
+            let terminal_mesh_capability = Some(resp.handle);
+            Ok(OrchestratorSession {
+                terminal_id,
+                tab_id,
+                mcp_config_path,
+                terminal_mesh_capability,
+            })
+        }
         Err(e) => {
             // Clean up the just-written MCP config so the next
             // attempt doesn't trip the startup_gc / orphan-config
@@ -299,9 +328,10 @@ pub(crate) fn spawn_orchestrator_claude(
 pub fn orchestrator_shutdown(
     state: State<'_, OrchestratorState>,
     registry: State<'_, TerminalMeshRegistry>,
+    mount_registry: State<'_, MountRegistry>,
     bootstrap: State<'_, OrchestratorBootstrap>,
 ) -> Result<(), OrchestratorErrorDto> {
-    shutdown_session(&state, &registry, &bootstrap.app_data_root);
+    shutdown_session(&state, &registry, &mount_registry, &bootstrap.app_data_root);
     Ok(())
 }
 
@@ -311,6 +341,7 @@ pub fn orchestrator_shutdown(
 pub(crate) fn shutdown_session(
     state: &OrchestratorState,
     registry: &TerminalMeshRegistry,
+    mount_registry: &MountRegistry,
     app_data_root: &std::path::Path,
 ) {
     let Some(session) = state.take_session() else {
@@ -329,7 +360,21 @@ pub(crate) fn shutdown_session(
     // 2. Evict the registry entry so a subsequent launch rotates
     //    cleanly without a stale terminal_id collision check.
     registry.forget(session.terminal_id);
-    // 3. Delete the per-tab MCP config; missing file is acceptable.
+    // 3. task21 / AC-3.3: unmount the privileged terminal-mesh
+    //    capability so a relaunch mints a fresh handle (rotating
+    //    the cross_tab_read grant on the new mount_id). Best-effort:
+    //    if the capability is already gone the unmount errors are
+    //    swallowed (relaunch will recover).
+    if let Some(handle) = session.terminal_mesh_capability.as_deref() {
+        if let Err(err) = crate::dispatcher::unmount_inner(mount_registry, handle, Some(&session.tab_id)) {
+            tracing::warn!(
+                error_kind = %err.kind,
+                tab_id = %session.tab_id,
+                "orchestrator: privileged terminal-mesh unmount failed during shutdown; ignoring"
+            );
+        }
+    }
+    // 4. Delete the per-tab MCP config; missing file is acceptable.
     mcp_config::delete_config(app_data_root, &session.tab_id);
     tracing::info!(
         tab_id = %session.tab_id,
@@ -349,6 +394,7 @@ mod tests {
             terminal_id: Uuid::new_v4(),
             tab_id: "tab-abc".into(),
             mcp_config_path: PathBuf::from("/tmp/orch.json"),
+            terminal_mesh_capability: None,
         };
         s.record_session(session.clone());
         let snap = s.snapshot().expect("present after record");
@@ -372,6 +418,7 @@ mod tests {
                 terminal_id: Uuid::nil(),
                 tab_id: "t".into(),
                 mcp_config_path: PathBuf::from("/tmp/x"),
+                terminal_mesh_capability: None,
             },
         };
         let v: serde_json::Value = serde_json::to_value(&s).unwrap();
@@ -414,6 +461,7 @@ mod tests {
             terminal_id: Uuid::new_v4(),
             tab_id: "tab-race".into(),
             mcp_config_path: PathBuf::from("/tmp/race.json"),
+            terminal_mesh_capability: None,
         };
 
         let mut handles = Vec::new();
@@ -462,6 +510,7 @@ mod tests {
                     terminal_id: first_session_id,
                     tab_id: "tab-1".into(),
                     mcp_config_path: PathBuf::from("/tmp/1.json"),
+                    terminal_mesh_capability: None,
                 })
             })
             .expect("first launch ok");
@@ -480,6 +529,7 @@ mod tests {
                     terminal_id: second_session_id,
                     tab_id: "tab-2".into(),
                     mcp_config_path: PathBuf::from("/tmp/2.json"),
+                    terminal_mesh_capability: None,
                 })
             })
             .expect("second launch ok");
@@ -514,14 +564,16 @@ mod tests {
             terminal_id: Uuid::new_v4(),
             tab_id: tab_id.into(),
             mcp_config_path: config_path.clone(),
+            terminal_mesh_capability: None,
         });
         assert!(state.snapshot().is_some());
 
         let registry = TerminalMeshRegistry::new();
+        let mount_registry = MountRegistry::new();
         // No registered entry — the lookup_command_tx + forget paths
         // must be tolerant of this.
 
-        shutdown_session(&state, &registry, &app_data_root);
+        shutdown_session(&state, &registry, &mount_registry, &app_data_root);
 
         assert!(state.snapshot().is_none(), "state cleared");
         assert!(!config_path.exists(), "config file deleted");
@@ -534,7 +586,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = OrchestratorState::new();
         let registry = TerminalMeshRegistry::new();
-        shutdown_session(&state, &registry, tmp.path());
+        let mount_registry = MountRegistry::new();
+        shutdown_session(&state, &registry, &mount_registry, tmp.path());
         assert!(state.snapshot().is_none());
     }
 
@@ -551,6 +604,7 @@ mod tests {
             terminal_id: stale_id,
             tab_id: "tab-stale".into(),
             mcp_config_path: PathBuf::from("/tmp/stale.json"),
+            terminal_mesh_capability: None,
         });
         let registry = TerminalMeshRegistry::new(); // empty — stale_id not registered
         let discovery = DiscoveryCache::empty();
@@ -582,6 +636,7 @@ mod tests {
             terminal_id: live_id,
             tab_id: "tab-live".into(),
             mcp_config_path: PathBuf::from("/tmp/live.json"),
+            terminal_mesh_capability: None,
         });
         let registry = TerminalMeshRegistry::new();
         // Insert via the internal path: tests in this module are in

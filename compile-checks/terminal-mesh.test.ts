@@ -59,7 +59,23 @@ export function _probe_error_dto_discrimination(e: TerminalMeshErrorDto): string
       return `spawn:${e.message}`;
     case "io":
       return `io:${e.context}:${e.message}`;
+    case "permissionDenied":
+      return `permissionDenied:${e.message}`;
   }
+}
+
+// task21 / AC-3.3 negative serialization probe: the wire shape of
+// TerminalMeshErrorDto names the denial `permissionDenied`. It must
+// NOT carry a `crossTabRead`-flavored field; the privileged flag
+// stays in Rust-side MountEntry.
+export function _probe_permission_denied_has_no_cross_tab_read_field(): void {
+  const e: TerminalMeshErrorDto = {
+    kind: "permissionDenied",
+    message: "capability lacks cross-tab read privilege",
+    // @ts-expect-error `crossTabRead` is not part of the wire shape
+    crossTabRead: true,
+  };
+  void e;
 }
 
 export function _probe_is_terminal_mesh_error_dto_narrows(): void {

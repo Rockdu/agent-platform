@@ -336,6 +336,7 @@ pub fn run() {
             terminal_mesh::terminal_resize,
             terminal_mesh::terminal_shutdown,
             terminal_mesh::terminal_scrollback,
+            terminal_mesh::terminal_mesh_cross_tab_read_scrollback,
             workspaces::list_workspaces,
             workspaces::create_workspace,
             workspaces::register_workspace,
