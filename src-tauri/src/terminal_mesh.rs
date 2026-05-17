@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use terminal_mesh_core::{
     ActorCommand, ActorError, BufferTruncated, TerminalActor, TerminalEvent,
     TerminalEventEnvelope, TerminalHandle, TerminalSpec,
@@ -131,7 +131,7 @@ impl TerminalMeshRegistry {
         }
     }
 
-    fn record(
+    pub(crate) fn record(
         &self,
         id: Uuid,
         command_tx: mpsc::Sender<ActorCommand>,
@@ -147,7 +147,7 @@ impl TerminalMeshRegistry {
         );
     }
 
-    fn lookup_command_tx(&self, id: Uuid) -> Option<mpsc::Sender<ActorCommand>> {
+    pub fn lookup_command_tx(&self, id: Uuid) -> Option<mpsc::Sender<ActorCommand>> {
         let guard = self.inner.lock().expect("TerminalMeshRegistry poisoned");
         guard.get(&id).map(|s| s.command_tx.clone())
     }
@@ -157,9 +157,17 @@ impl TerminalMeshRegistry {
         guard.get(&id).map(|s| s.scrollback.clone())
     }
 
-    fn forget(&self, id: Uuid) {
+    pub fn forget(&self, id: Uuid) {
         let mut guard = self.inner.lock().expect("TerminalMeshRegistry poisoned");
         guard.remove(&id);
+    }
+
+    /// True if `id` is currently registered (i.e., the actor has not
+    /// naturally exited and `forget` has not been called yet). Used
+    /// by `orchestrator_status` to detect a stale recorded session.
+    pub fn contains(&self, id: Uuid) -> bool {
+        let guard = self.inner.lock().expect("TerminalMeshRegistry poisoned");
+        guard.contains_key(&id)
     }
 
     #[allow(dead_code)]
@@ -311,6 +319,14 @@ async fn forward_events_to_webview(
             tracing::warn!(%id, %err, "terminal event emit failed");
         }
     }
+    // The actor's event channel closed: the PTY exited naturally (or
+    // crashed) and no more events will arrive. Evict the registry
+    // entry so liveness checks (e.g. `orchestrator_status`) observe
+    // the missing terminal and clear stale recorded sessions.
+    // Idempotent with the explicit `terminal_shutdown` path.
+    if let Some(registry) = app.try_state::<TerminalMeshRegistry>() {
+        registry.forget(id);
+    }
 }
 
 async fn forward_status_to_webview(
@@ -443,6 +459,19 @@ mod tests {
         r.forget(id);
         assert!(r.lookup_command_tx(id).is_none());
         assert_eq!(r.active_count(), 0);
+    }
+
+    #[test]
+    fn terminal_registry_contains_returns_false_after_forget() {
+        let r = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let buf = StdArc::new(StdMutex::new(String::new()));
+        assert!(!r.contains(id), "unknown id must report not-contained");
+        r.record(id, tx, buf);
+        assert!(r.contains(id), "after record, contains true");
+        r.forget(id);
+        assert!(!r.contains(id), "after forget, contains false");
     }
 
     #[test]

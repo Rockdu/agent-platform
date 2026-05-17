@@ -61,3 +61,22 @@ export function _probe_invalid_session_missing_path(): void {
   };
   void s;
 }
+
+// Round 36 / Codex round-35 finding 3: the orchestrator's
+// `TerminalMeshView.cwd` is the AgentPlatform root (where workspaces
+// live), distinct from the discovered `claude` binary path that
+// `ClaudeReadyFooter` displays. This probe pins the prop separation
+// so a future refactor that conflates them trips at compile time.
+export function _probe_orchestrator_cwd_separate_from_claude_path(
+  agentPlatformPath: string,
+  claudeBinaryPath: string,
+): { cwd: string; workspaceName: string; binaryPath: string } {
+  // Cwd MUST come from the bootstrap-provided AgentPlatform root,
+  // NOT from the claude binary path. The workspace name is the
+  // fixed "Orchestrator" label for the privileged tab.
+  return {
+    cwd: agentPlatformPath,
+    workspaceName: "Orchestrator",
+    binaryPath: claudeBinaryPath,
+  };
+}

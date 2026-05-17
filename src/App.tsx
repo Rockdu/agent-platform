@@ -32,6 +32,7 @@ import {
   getOrchestratorStatus,
   isOrchestratorErrorDto,
   launchOrchestratorClaude,
+  shutdownOrchestrator,
   type OrchestratorErrorDto,
   type OrchestratorStatus,
 } from "./orchestrator";
@@ -225,7 +226,13 @@ export default function App() {
       </nav>
 
       <main className="tab-body">
-        {active.kind === "host" && <OrchestratorPlaceholder />}
+        {active.kind === "host" && (
+          <OrchestratorPlaceholder
+            agentPlatformPath={
+              bootstrap.kind === "ok" ? bootstrap.paths.agent_platform : null
+            }
+          />
+        )}
         {active.kind === "plugin" && (
           <PluginBody
             pluginId={active.pluginId}
@@ -343,13 +350,23 @@ function TabButton(props: {
   );
 }
 
-function OrchestratorPlaceholder() {
+function OrchestratorPlaceholder({
+  agentPlatformPath,
+}: {
+  agentPlatformPath: string | null;
+}) {
   const [status, setStatus] = useState<ClaudeDiscoveryStatus | null>(null);
   const [error, setError] = useState<ClaudeDiscoveryErrorDto | null>(null);
   const [busy, setBusy] = useState(false);
   const [orchStatus, setOrchStatus] = useState<OrchestratorStatus | null>(null);
   const [orchError, setOrchError] =
     useState<OrchestratorErrorDto | null>(null);
+  // Bumped on `关闭` to force the launch effect to re-run after the
+  // backend has cleared its session. Combined with `key={terminalId}`
+  // on TerminalMeshView this guarantees a full xterm remount on
+  // relaunch instead of a stale re-subscribe.
+  const [orchVersion, setOrchVersion] = useState(0);
+  const [orchBusy, setOrchBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -396,7 +413,24 @@ function OrchestratorPlaceholder() {
     return () => {
       cancelled = true;
     };
-  }, [status]);
+  }, [status, orchVersion]);
+
+  const onCloseOrchestrator = useCallback(async () => {
+    setOrchBusy(true);
+    try {
+      await shutdownOrchestrator();
+      setOrchStatus(null);
+      setOrchError(null);
+      // Bump the version so the launch effect re-runs against the
+      // now-cleared backend state, producing a fresh session with
+      // rotated tab_id / terminal_id / mcp_config_path.
+      setOrchVersion((v) => v + 1);
+    } catch (err) {
+      if (isOrchestratorErrorDto(err)) setOrchError(err);
+    } finally {
+      setOrchBusy(false);
+    }
+  }, []);
 
   const onRedo = useCallback(async () => {
     setBusy(true);
@@ -447,10 +481,23 @@ function OrchestratorPlaceholder() {
     return (
       <section className="orchestrator-pane">
         <header className="orchestrator-pane__header">
-          <h2>Orchestrator</h2>
-          <p className="placeholder__hint">
-            特权单实例 tab — 自动启动 <code>claude</code> 并预配所有 MVP 平台 MCP 服务器。
-          </p>
+          <div>
+            <h2>Orchestrator</h2>
+            <p className="placeholder__hint">
+              特权单实例 tab — 自动启动 <code>claude</code> 并预配所有 MVP 平台 MCP 服务器。
+            </p>
+          </div>
+          {orchStatus?.kind === "ready" && (
+            <button
+              type="button"
+              className="orchestrator-pane__close"
+              onClick={() => void onCloseOrchestrator()}
+              disabled={orchBusy}
+              aria-label="关闭 orchestrator session"
+            >
+              {orchBusy ? "关闭中…" : "关闭"}
+            </button>
+          )}
         </header>
         {orchError && (
           <aside
@@ -467,9 +514,17 @@ function OrchestratorPlaceholder() {
         )}
         <div className="orchestrator-pane__terminal">
           {orchStatus?.kind === "ready" ? (
+            // `cwd` MUST be the AgentPlatform root (where workspaces
+            // live), NOT the discovered `claude` binary path — the
+            // per-tab settings panel surfaces this as the working
+            // directory and threads it to Cursor/Finder shortcuts.
+            // The claude binary path stays in the ClaudeReadyFooter
+            // below. `key={terminalId}` forces a fresh xterm mount
+            // when the orchestrator is relaunched with a new session.
             <TerminalMeshView
+              key={orchStatus.session.terminalId}
               active
-              cwd={status.record.path}
+              cwd={agentPlatformPath ?? status.record.path}
               workspaceName="Orchestrator"
               existingTerminalId={orchStatus.session.terminalId}
             />
