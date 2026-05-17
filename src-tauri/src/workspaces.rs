@@ -526,7 +526,11 @@ impl WorkspaceRegistry {
         guard.workspaces_root = Some(root);
     }
 
-    pub fn create_workspace(&self, name: &str) -> Result<WorkspaceRecord, WorkspaceError> {
+    pub fn create_workspace(
+        &self,
+        name: &str,
+        auto_launch_claude: bool,
+    ) -> Result<WorkspaceRecord, WorkspaceError> {
         validate_workspace_name(name)?;
         let mut guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
         let workspaces_root = guard
@@ -556,11 +560,13 @@ impl WorkspaceRegistry {
             });
         }
         let now = now_rfc3339();
+        let mut profile = WorkspaceProfile::default_local();
+        profile.auto_launch_claude = auto_launch_claude;
         let record = WorkspaceRecord {
             workspace_id: Uuid::new_v4(),
             name: name.to_string(),
             location: WorkspaceLocation::Local { path: canonical },
-            profile: WorkspaceProfile::default_local(),
+            profile,
             created_at: now.clone(),
             last_used_at: now,
             open_tab_id: None,
@@ -571,7 +577,11 @@ impl WorkspaceRegistry {
         Ok(self.with_conversation_count(record))
     }
 
-    pub fn register_workspace(&self, path: &Path) -> Result<WorkspaceRecord, WorkspaceError> {
+    pub fn register_workspace(
+        &self,
+        path: &Path,
+        auto_launch_claude: bool,
+    ) -> Result<WorkspaceRecord, WorkspaceError> {
         let meta = std::fs::metadata(path).map_err(|_| WorkspaceError::NotADirectory {
             path: path.to_path_buf(),
         })?;
@@ -596,11 +606,13 @@ impl WorkspaceRegistry {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| canonical.display().to_string());
         let now = now_rfc3339();
+        let mut profile = WorkspaceProfile::default_local();
+        profile.auto_launch_claude = auto_launch_claude;
         let record = WorkspaceRecord {
             workspace_id: Uuid::new_v4(),
             name,
             location: WorkspaceLocation::Local { path: canonical },
-            profile: WorkspaceProfile::default_local(),
+            profile,
             created_at: now.clone(),
             last_used_at: now,
             open_tab_id: None,
@@ -830,20 +842,22 @@ pub fn list_workspaces(
 #[tauri::command]
 pub fn create_workspace(
     name: String,
+    auto_launch_claude: bool,
     registry: State<'_, WorkspaceRegistry>,
 ) -> Result<WorkspaceRecord, WorkspaceErrorDto> {
     registry
-        .create_workspace(&name)
+        .create_workspace(&name, auto_launch_claude)
         .map_err(|e| WorkspaceErrorDto::from(&e))
 }
 
 #[tauri::command]
 pub fn register_workspace(
     path: String,
+    auto_launch_claude: bool,
     registry: State<'_, WorkspaceRegistry>,
 ) -> Result<WorkspaceRecord, WorkspaceErrorDto> {
     registry
-        .register_workspace(Path::new(&path))
+        .register_workspace(Path::new(&path), auto_launch_claude)
         .map_err(|e| WorkspaceErrorDto::from(&e))
 }
 
@@ -864,6 +878,7 @@ pub fn close_workspace(
     workspace_id: String,
     registry: State<'_, WorkspaceRegistry>,
     scheduler: State<'_, crate::workspace_launch_scheduler::WorkspaceLaunchScheduler>,
+    terminal_registry: State<'_, crate::terminal_mesh::TerminalMeshRegistry>,
 ) -> Result<(), WorkspaceErrorDto> {
     let id = parse_workspace_id(&workspace_id)?;
     // Removing a queued auto-launch entry frees the slot without
@@ -871,6 +886,15 @@ pub fn close_workspace(
     // layer; the user's close still succeeds and the eventual settle
     // just drains nothing.
     let _was_pending = scheduler.cancel(id);
+    // Pull the workspace's tab_id (if any) so we can also clear the
+    // pending-launch placeholder. The placeholder only exists for
+    // the queued-but-not-yet-spawned window; clearing eagerly avoids
+    // leaving a phantom Pending entry visible after close.
+    if let Some(rec) = registry.find_by_id(id) {
+        if let Some(t) = rec.open_tab_id.as_deref() {
+            let _ = terminal_registry.clear_pending_for_tab(t);
+        }
+    }
     registry
         .close_workspace(id)
         .map_err(|e| WorkspaceErrorDto::from(&e))
@@ -1006,7 +1030,7 @@ mod tests {
     #[test]
     fn create_workspace_creates_dir_under_workspaces_root() {
         let (_storage, home, reg) = fresh_registry();
-        let rec = reg.create_workspace("demo").expect("create");
+        let rec = reg.create_workspace("demo", true).expect("create");
         let target = home.path().join("AgentPlatform").join("workspaces").join("demo");
         assert!(target.is_dir());
         let canonical = std::fs::canonicalize(&target).unwrap();
@@ -1020,8 +1044,8 @@ mod tests {
     #[test]
     fn create_workspace_rejects_duplicate_name_via_already_exists() {
         let (_storage, _home, reg) = fresh_registry();
-        reg.create_workspace("twin").expect("first");
-        let err = reg.create_workspace("twin").unwrap_err();
+        reg.create_workspace("twin", true).expect("first");
+        let err = reg.create_workspace("twin", true).unwrap_err();
         match err {
             WorkspaceError::WorkspaceAlreadyExists { .. } => {}
             other => panic!("expected WorkspaceAlreadyExists; got {other:?}"),
@@ -1035,7 +1059,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let canary = dir.join("README.md");
         std::fs::write(&canary, b"untouched").unwrap();
-        let rec = reg.register_workspace(&dir).expect("register");
+        let rec = reg.register_workspace(&dir, true).expect("register");
         assert_eq!(
             rec.local_path(),
             Some(std::fs::canonicalize(&dir).unwrap().as_path())
@@ -1049,13 +1073,13 @@ mod tests {
     fn register_workspace_rejects_non_directory_or_missing_path() {
         let (_storage, home, reg) = fresh_registry();
         let missing = home.path().join("does-not-exist");
-        match reg.register_workspace(&missing).unwrap_err() {
+        match reg.register_workspace(&missing, true).unwrap_err() {
             WorkspaceError::NotADirectory { .. } => {}
             other => panic!("expected NotADirectory for missing; got {other:?}"),
         }
         let file = home.path().join("a-file.txt");
         std::fs::write(&file, b"x").unwrap();
-        match reg.register_workspace(&file).unwrap_err() {
+        match reg.register_workspace(&file, true).unwrap_err() {
             WorkspaceError::NotADirectory { .. } => {}
             other => panic!("expected NotADirectory for file; got {other:?}"),
         }
@@ -1064,13 +1088,13 @@ mod tests {
     #[test]
     fn canonical_duplicate_rejected_for_register_after_create() {
         let (_storage, _home, reg) = fresh_registry();
-        let created = reg.create_workspace("alpha").expect("create");
+        let created = reg.create_workspace("alpha", true).expect("create");
         // Try to register the same canonical path again.
         let created_path = created
             .local_path()
             .expect("local workspace has path")
             .to_path_buf();
-        let err = reg.register_workspace(&created_path).unwrap_err();
+        let err = reg.register_workspace(&created_path, true).unwrap_err();
         match err {
             WorkspaceError::CanonicalDuplicate {
                 existing_workspace_id,
@@ -1087,8 +1111,8 @@ mod tests {
     fn persistence_round_trip() {
         let (storage, home, reg) = fresh_registry();
         let workspaces_root = home.path().join("AgentPlatform").join("workspaces");
-        reg.create_workspace("one").unwrap();
-        reg.create_workspace("two").unwrap();
+        reg.create_workspace("one", true).unwrap();
+        reg.create_workspace("two", true).unwrap();
         // Drop and reload from the same storage_root.
         drop(reg);
         let reg2 = WorkspaceRegistry::load(
@@ -1105,7 +1129,7 @@ mod tests {
     #[test]
     fn open_then_close_clears_open_tab_id() {
         let (_storage, _home, reg) = fresh_registry();
-        let rec = reg.create_workspace("ws").unwrap();
+        let rec = reg.create_workspace("ws", true).unwrap();
         let after_open = reg.open_workspace(rec.workspace_id, "tab-1").unwrap();
         assert_eq!(after_open.open_tab_id.as_deref(), Some("tab-1"));
         reg.close_workspace(rec.workspace_id).unwrap();
@@ -1117,7 +1141,7 @@ mod tests {
     #[test]
     fn open_when_already_open_by_different_tab_returns_already_open() {
         let (_storage, _home, reg) = fresh_registry();
-        let rec = reg.create_workspace("ws").unwrap();
+        let rec = reg.create_workspace("ws", true).unwrap();
         reg.open_workspace(rec.workspace_id, "tab-a").unwrap();
         match reg.open_workspace(rec.workspace_id, "tab-b").unwrap_err() {
             WorkspaceError::AlreadyOpen { existing_tab_id } => {
@@ -1133,7 +1157,7 @@ mod tests {
     #[test]
     fn close_when_not_open_is_idempotent() {
         let (_storage, _home, reg) = fresh_registry();
-        let rec = reg.create_workspace("ws").unwrap();
+        let rec = reg.create_workspace("ws", true).unwrap();
         // Close without prior open — should succeed and remain closed.
         reg.close_workspace(rec.workspace_id).unwrap();
         reg.close_workspace(rec.workspace_id).unwrap();
@@ -1156,7 +1180,7 @@ mod tests {
     #[test]
     fn resolve_for_tab_returns_open_record() {
         let (_storage, _home, reg) = fresh_registry();
-        let rec = reg.create_workspace("ws").unwrap();
+        let rec = reg.create_workspace("ws", true).unwrap();
         assert!(reg.resolve_for_tab("tab-1").is_none());
         reg.open_workspace(rec.workspace_id, "tab-1").unwrap();
         let r = reg.resolve_for_tab("tab-1").expect("resolved");
@@ -1185,11 +1209,11 @@ mod tests {
         let (_storage, home, reg) = fresh_registry();
         let real = home.path().join("real-workspace");
         std::fs::create_dir_all(&real).unwrap();
-        let created = reg.register_workspace(&real).expect("register real");
+        let created = reg.register_workspace(&real, true).expect("register real");
 
         let alias = home.path().join("alias-link");
         symlink(&real, &alias).unwrap();
-        let err = reg.register_workspace(&alias).unwrap_err();
+        let err = reg.register_workspace(&alias, true).unwrap_err();
         match err {
             WorkspaceError::CanonicalDuplicate {
                 existing_workspace_id,
@@ -1230,10 +1254,10 @@ mod tests {
             _ => false,
         };
 
-        let created = reg.register_workspace(&mixed).expect("register mixed");
+        let created = reg.register_workspace(&mixed, true).expect("register mixed");
 
         if case_insensitive {
-            let err = reg.register_workspace(&lower).unwrap_err();
+            let err = reg.register_workspace(&lower, true).unwrap_err();
             match err {
                 WorkspaceError::CanonicalDuplicate {
                     existing_workspace_id,
@@ -1264,7 +1288,7 @@ mod tests {
     fn open_persist_reload_reopen_with_fresh_tab_id_succeeds() {
         let (storage, home, reg) = fresh_registry();
         let workspaces_root = home.path().join("AgentPlatform").join("workspaces");
-        let created = reg.create_workspace("restart-demo").expect("create");
+        let created = reg.create_workspace("restart-demo", true).expect("create");
         let opened = reg
             .open_workspace(created.workspace_id, "tab-old")
             .expect("open original");
@@ -1299,7 +1323,7 @@ mod tests {
     #[test]
     fn persisted_json_uses_snake_case_keys() {
         let (storage, _home, reg) = fresh_registry();
-        let _ = reg.create_workspace("snake").expect("create");
+        let _ = reg.create_workspace("snake", true).expect("create");
         let body = std::fs::read_to_string(storage.path().join("workspaces.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let workspaces = v
@@ -1399,7 +1423,7 @@ mod tests {
     #[test]
     fn list_workspaces_populates_conversation_rounds_count() {
         let (_storage, _home, reg) = fresh_registry();
-        let created = reg.create_workspace("counted").expect("create");
+        let created = reg.create_workspace("counted", true).expect("create");
         // Seed two .jsonl files under the auto-created workspace.
         let claude = created
             .local_path()
@@ -1419,9 +1443,9 @@ mod tests {
     #[test]
     fn list_sorted_descending_by_last_used_at() {
         let (_storage, _home, reg) = fresh_registry();
-        let a = reg.create_workspace("a").unwrap();
+        let a = reg.create_workspace("a", true).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let b = reg.create_workspace("b").unwrap();
+        let b = reg.create_workspace("b", true).unwrap();
         // `b` was created later → should be first when sorted desc by
         // last_used_at. The RFC3339 helper has second resolution, so
         // we slept >1s to guarantee a different timestamp.
@@ -1600,6 +1624,49 @@ mod tests {
         );
     }
 
+    /// `create_workspace(name, false)` must persist
+    /// `WorkspaceProfile.auto_launch_claude = false` so a reload sees
+    /// the opt-out state. Pins the create-form checkbox plumbing.
+    #[test]
+    fn create_workspace_persists_auto_launch_false_when_opted_out() {
+        let (storage, home, reg) = fresh_registry();
+        let workspaces_root = home.path().join("AgentPlatform").join("workspaces");
+        let rec = reg
+            .create_workspace("opt-out", false)
+            .expect("create with opt-out");
+        assert!(!rec.profile.auto_launch_claude, "in-memory record");
+        drop(reg);
+        let reloaded = WorkspaceRegistry::load(
+            storage.path().to_path_buf(),
+            Some(workspaces_root),
+        );
+        let after = reloaded.find_by_id(rec.workspace_id).expect("present");
+        assert!(
+            !after.profile.auto_launch_claude,
+            "auto_launch_claude=false must survive a registry reload"
+        );
+    }
+
+    /// Symmetric: `register_workspace(path, true)` preserves the
+    /// checked-by-default behavior.
+    #[test]
+    fn register_workspace_persists_auto_launch_true_by_default() {
+        let (storage, home, reg) = fresh_registry();
+        let dir = home.path().join("default-on");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = reg
+            .register_workspace(&dir, true)
+            .expect("register opted in");
+        assert!(rec.profile.auto_launch_claude);
+        drop(reg);
+        let reloaded = WorkspaceRegistry::load(
+            storage.path().to_path_buf(),
+            Some(home.path().join("AgentPlatform").join("workspaces")),
+        );
+        let after = reloaded.find_by_id(rec.workspace_id).expect("present");
+        assert!(after.profile.auto_launch_claude);
+    }
+
     /// Canonical-duplicate detection must skip `Remote` records so a
     /// Remote SSH workspace whose nominal path happens to match a
     /// Local path does not falsely block creation.
@@ -1633,7 +1700,7 @@ mod tests {
 
         // Registering a Local workspace at the same nominal path must
         // succeed (the Remote record is not a duplicate of a Local).
-        let local_rec = reg.register_workspace(&local_dir).expect("register local");
+        let local_rec = reg.register_workspace(&local_dir, true).expect("register local");
         assert_ne!(local_rec.workspace_id, remote_id);
         assert!(matches!(
             local_rec.location,

@@ -54,6 +54,10 @@ export function WorkspaceSwitcherModal({
   const [error, setError] = useState<WorkspaceErrorDto | null>(null);
   const [busy, setBusy] = useState(false);
   const [ideError, setIdeError] = useState<IdeHandoffErrorDto | null>(null);
+  // Per the product spec the auto-launch checkbox defaults CHECKED.
+  // Persisted into WorkspaceProfile.auto_launch_claude on the chosen
+  // create/register path.
+  const [autoLaunchClaude, setAutoLaunchClaude] = useState(true);
 
   const onCursor = useCallback(async (workspacePath: string) => {
     setIdeError(null);
@@ -132,7 +136,7 @@ export function WorkspaceSwitcherModal({
           setError({ kind: "invalidName", reason: "请输入工作区名称" });
           return;
         }
-        created = await createWorkspace(trimmed);
+        created = await createWorkspace(trimmed, autoLaunchClaude);
       } else {
         if (!source.pickedPath) {
           setError({
@@ -141,7 +145,7 @@ export function WorkspaceSwitcherModal({
           });
           return;
         }
-        created = await registerWorkspace(source.pickedPath);
+        created = await registerWorkspace(source.pickedPath, autoLaunchClaude);
       }
       if (created) {
         await onAdopt(created);
@@ -152,7 +156,7 @@ export function WorkspaceSwitcherModal({
     } finally {
       setBusy(false);
     }
-  }, [name, source, onAdopt, onClose]);
+  }, [name, source, onAdopt, onClose, autoLaunchClaude]);
 
   const onRowClick = useCallback(
     async (w: WorkspaceRecord) => {
@@ -243,6 +247,8 @@ export function WorkspaceSwitcherModal({
               onConfirm={onConfirmCreate}
               onCancel={onClose}
               busy={busy}
+              autoLaunchClaude={autoLaunchClaude}
+              setAutoLaunchClaude={setAutoLaunchClaude}
             />
           )}
           {mode === "recent" && (
@@ -289,6 +295,8 @@ function CreatePane(props: {
   onConfirm: () => Promise<void> | void;
   onCancel: () => void;
   busy: boolean;
+  autoLaunchClaude: boolean;
+  setAutoLaunchClaude: (v: boolean) => void;
 }) {
   const {
     name,
@@ -299,6 +307,8 @@ function CreatePane(props: {
     onConfirm,
     onCancel,
     busy,
+    autoLaunchClaude,
+    setAutoLaunchClaude,
   } = props;
   return (
     <form
@@ -361,6 +371,15 @@ function CreatePane(props: {
           )}
         </div>
       )}
+      <label className="workspace-switcher-modal__field workspace-switcher-modal__auto-launch">
+        <input
+          type="checkbox"
+          checked={autoLaunchClaude}
+          onChange={(e) => setAutoLaunchClaude(e.target.checked)}
+          disabled={busy}
+        />{" "}
+        创建后自动启动 claude（带 <code>--dangerously-skip-permissions</code>）
+      </label>
       <div className="workspace-switcher-modal__actions">
         <button type="button" onClick={onCancel} disabled={busy}>
           取消

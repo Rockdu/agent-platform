@@ -19,6 +19,7 @@ import {
   type IdeHandoffErrorDto,
 } from "./ide-handoff";
 import { IdePreferencePane } from "./IdePreferencePane";
+import type { AutoLaunchErrorDto } from "./workspaces";
 
 const INITIAL_SCROLLBACK_BYTES = 64 * 1024;
 
@@ -69,6 +70,17 @@ export interface TerminalMeshViewProps {
   /// resume affordance so clicking 下一条指令 actually lands focus
   /// inside the terminal.
   focusNonce?: number;
+  /// Typed auto-launch error for this workspace tab. When set the
+  /// pane renders an error banner above the terminal so the user
+  /// sees why claude failed to start instead of getting a silently
+  /// empty terminal.
+  autoLaunchError?: AutoLaunchErrorDto | null;
+  /// Set to `true` for workspace tabs whose primary terminal command
+  /// is being scheduled via `WorkspaceLaunchScheduler`. While true,
+  /// the component MUST NOT call `spawnTerminal`; the scheduler
+  /// owns the spawn and the live terminal_id will be plumbed in via
+  /// `existingTerminalId` once the scheduler records it.
+  awaitingAutoLaunch?: boolean;
 }
 
 export function TerminalMeshView({
@@ -79,6 +91,8 @@ export function TerminalMeshView({
   tabId,
   workspaceId,
   focusNonce,
+  autoLaunchError,
+  awaitingAutoLaunch,
 }: TerminalMeshViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -149,9 +163,17 @@ export function TerminalMeshView({
 
     (async () => {
       try {
-        // Round 35 (task20): orchestrator path bypasses spawn — the
-        // host already created the PTY and recorded it in the
-        // terminal registry. We just subscribe.
+        // Workspace tabs in the auto-launch flow do NOT spawn their
+        // own PTY here — the host-side scheduler owns the spawn,
+        // and the live terminal_id arrives later via the lifecycle
+        // subscription as a fresh `existingTerminalId` value. Until
+        // then this branch parks until the next setup pass.
+        if (awaitingAutoLaunch && !existingTerminalId) {
+          return;
+        }
+        // The orchestrator path bypasses spawn — the host already
+        // created the PTY and recorded it in the terminal registry.
+        // We just subscribe.
         const terminalId: string =
           existingTerminalId ??
           (
@@ -362,9 +384,27 @@ export function TerminalMeshView({
           </p>
         </aside>
       )}
+      {autoLaunchError && (
+        <aside
+          className="bootstrap-card bootstrap-card--error"
+          role="alert"
+          data-auto-launch-error={autoLaunchError.kind}
+        >
+          <h3>自动启动 claude 失败</h3>
+          <p>
+            <code>{autoLaunchError.kind}</code>
+            {autoLaunchError.kind === "claudeDiscoveryNotReady" &&
+              ` · ${autoLaunchError.discoveryKind}: ${autoLaunchError.message}`}
+          </p>
+        </aside>
+      )}
       <div ref={containerRef} className="terminal-mesh-view__xterm" />
       {!ready && !error && (
-        <p className="placeholder__hint">正在启动终端…</p>
+        <p className="placeholder__hint">
+          {awaitingAutoLaunch && !existingTerminalId
+            ? "等待 claude 启动…"
+            : "正在启动终端…"}
+        </p>
       )}
       {settingsOpen && cwd && (
         <WorkspaceSettingsPanel

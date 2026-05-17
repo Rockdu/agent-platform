@@ -213,6 +213,15 @@ pub struct TerminalMeshRegistry {
     /// `tab_index` so snapshot lookups by tab_id continue to work
     /// after the live session has been torn down.
     snapshot_tab_index: Arc<StdMutex<HashMap<String, Uuid>>>,
+    /// Auto-launch queue placeholder map. Holds a synthetic snapshot
+    /// keyed by `tab_id` for workspaces whose claude PTY has been
+    /// enqueued in `WorkspaceLaunchScheduler` but not yet spawned.
+    /// `snapshot_for_tab` and `lifecycle_entry_for_tab` fall back to
+    /// this map when neither live nor retained store knows the tab,
+    /// so the rail row can surface `pending_launch=true` BEFORE the
+    /// terminal_id exists. `record()` drains the entry when the
+    /// real PTY arrives.
+    pending_snapshots_by_tab: Arc<StdMutex<HashMap<String, WorkspaceLifecycleSnapshot>>>,
 }
 
 impl Default for TerminalMeshRegistry {
@@ -228,7 +237,43 @@ impl TerminalMeshRegistry {
             tab_index: Arc::new(StdMutex::new(HashMap::new())),
             snapshots: Arc::new(StdMutex::new(HashMap::new())),
             snapshot_tab_index: Arc::new(StdMutex::new(HashMap::new())),
+            pending_snapshots_by_tab: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    /// Install a pending-launch placeholder snapshot keyed by
+    /// `tab_id`. Called by `request_workspace_auto_launch` after the
+    /// scheduler reports `Pending`. The placeholder is overwritten on
+    /// subsequent calls (idempotent).
+    pub fn set_pending_for_tab(&self, tab_id: String, snapshot: WorkspaceLifecycleSnapshot) {
+        let mut guard = self
+            .pending_snapshots_by_tab
+            .lock()
+            .expect("pending_snapshots_by_tab poisoned");
+        guard.insert(tab_id, snapshot);
+    }
+
+    /// Drop the pending-launch placeholder for `tab_id`. Called by
+    /// `close_workspace` after `scheduler.cancel` so a queued
+    /// workspace that the user closes does not leave a phantom
+    /// pending entry. Returns the dropped snapshot if any.
+    pub fn clear_pending_for_tab(&self, tab_id: &str) -> Option<WorkspaceLifecycleSnapshot> {
+        let mut guard = self
+            .pending_snapshots_by_tab
+            .lock()
+            .expect("pending_snapshots_by_tab poisoned");
+        guard.remove(tab_id)
+    }
+
+    /// Consume and return the pending placeholder so `record()` can
+    /// hand off any user-visible fields (e.g. preserved
+    /// `workspace_id`) into the live snapshot. Returns `None` when no
+    /// placeholder existed.
+    pub fn take_pending_snapshot_for_tab(
+        &self,
+        tab_id: &str,
+    ) -> Option<WorkspaceLifecycleSnapshot> {
+        self.clear_pending_for_tab(tab_id)
     }
 
     pub(crate) fn record(
@@ -261,6 +306,14 @@ impl TerminalMeshRegistry {
         }
 
         // Retained snapshot state (survives natural actor exit).
+        // If a pending-launch placeholder existed for this tab (the
+        // auto-launch case), drain it now and let `pending_launch`
+        // start false on the live snapshot — the scheduler will fire
+        // `on_pending_launch_changed(..., false)` shortly anyway, but
+        // taking it here makes the placeholder map self-cleaning.
+        let _drained_placeholder = tab_id
+            .as_deref()
+            .and_then(|t| self.take_pending_snapshot_for_tab(t));
         {
             let mut snapshots = self.snapshots.lock().expect("retained snapshots poisoned");
             if let Some(t) = tab_id.as_deref() {
@@ -308,13 +361,24 @@ impl TerminalMeshRegistry {
     /// kept for unit tests + any caller that does not need terminal_id.
     #[allow(dead_code)]
     pub fn snapshot_for_tab(&self, tab_id: &str) -> Option<WorkspaceLifecycleSnapshot> {
-        let snap_idx = self
-            .snapshot_tab_index
+        {
+            let snap_idx = self
+                .snapshot_tab_index
+                .lock()
+                .expect("snapshot_tab_index poisoned");
+            if let Some(terminal_id) = snap_idx.get(tab_id).copied() {
+                drop(snap_idx);
+                return self.snapshot_for_terminal(terminal_id);
+            }
+        }
+        // No live or retained entry: fall back to the pending-launch
+        // placeholder so the rail row sees `pending_launch=true`
+        // BEFORE the scheduler actually spawns the terminal.
+        let pending = self
+            .pending_snapshots_by_tab
             .lock()
-            .expect("snapshot_tab_index poisoned");
-        let terminal_id = snap_idx.get(tab_id).copied()?;
-        drop(snap_idx);
-        self.snapshot_for_terminal(terminal_id)
+            .expect("pending_snapshots_by_tab poisoned");
+        pending.get(tab_id).cloned()
     }
 
     /// Project the retained snapshot store into a list of entries
@@ -368,14 +432,31 @@ impl TerminalMeshRegistry {
         &self,
         tab_id: &str,
     ) -> Option<(Uuid, WorkspaceLifecycleSnapshot)> {
-        let snap_idx = self
-            .snapshot_tab_index
+        {
+            let snap_idx = self
+                .snapshot_tab_index
+                .lock()
+                .expect("snapshot_tab_index poisoned");
+            if let Some(terminal_id) = snap_idx.get(tab_id).copied() {
+                drop(snap_idx);
+                let snapshot = self.snapshot_for_terminal(terminal_id)?;
+                return Some((terminal_id, snapshot));
+            }
+        }
+        // Pending-launch placeholder fallback. The frontend hook
+        // keys its terminal-id cache on the returned id; for a
+        // workspace whose tab_id is the bare workspace UUID this
+        // parses cleanly, and the eventual `lifecycle://updated`
+        // event from the scheduler's placeholder emit uses the same
+        // derived id so the hook can deduplicate.
+        let pending = self
+            .pending_snapshots_by_tab
             .lock()
-            .expect("snapshot_tab_index poisoned");
-        let terminal_id = snap_idx.get(tab_id).copied()?;
-        drop(snap_idx);
-        let snapshot = self.snapshot_for_terminal(terminal_id)?;
-        Some((terminal_id, snapshot))
+            .expect("pending_snapshots_by_tab poisoned");
+        let snapshot = pending.get(tab_id).cloned()?;
+        drop(pending);
+        let synthetic_id = Uuid::parse_str(tab_id).unwrap_or(Uuid::nil());
+        Some((synthetic_id, snapshot))
     }
 
     /// Apply `mutator` to the retained snapshot under the lock and
@@ -1894,5 +1975,74 @@ mod tests {
         let term_registry = TerminalMeshRegistry::new();
         let err = read_tab_scrollback_bounded(&term_registry, "tab-missing", 8192).unwrap_err();
         assert!(matches!(err, TerminalMeshError::NotFound { .. }));
+    }
+
+    /// `set_pending_for_tab` then `snapshot_for_tab` returns the
+    /// placeholder snapshot so the rail row can surface
+    /// `pending_launch=true` before any terminal is spawned.
+    #[test]
+    fn set_pending_for_tab_makes_snapshot_for_tab_return_placeholder() {
+        let r = TerminalMeshRegistry::new();
+        let tab_id = Uuid::new_v4().to_string();
+        let mut placeholder =
+            WorkspaceLifecycleSnapshot::fresh_local_with_workspace_id(TabKind::Workspace, None);
+        placeholder.pending_launch = true;
+        r.set_pending_for_tab(tab_id.clone(), placeholder.clone());
+
+        let got = r.snapshot_for_tab(&tab_id).expect("placeholder present");
+        assert!(got.pending_launch);
+        assert!(matches!(got.tab_kind, TabKind::Workspace));
+    }
+
+    /// `record()` for a tab that has a pending placeholder must drain
+    /// the placeholder so a subsequent `clear_pending_for_tab` returns
+    /// `None` and `snapshot_for_tab` reads the live snapshot.
+    #[test]
+    fn record_consumes_pending_placeholder() {
+        let r = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let tab_id = Uuid::new_v4().to_string();
+        let mut placeholder =
+            WorkspaceLifecycleSnapshot::fresh_local_with_workspace_id(TabKind::Workspace, None);
+        placeholder.pending_launch = true;
+        r.set_pending_for_tab(tab_id.clone(), placeholder);
+
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let buf = StdArc::new(StdMutex::new(String::new()));
+        r.record(
+            id,
+            tx,
+            buf,
+            Some(tab_id.clone()),
+            TabKind::Workspace,
+            None,
+        );
+
+        // Placeholder drained; live snapshot exists with default
+        // pending_launch=false (the scheduler's post-spawn callback
+        // would also set it to false but we test the seam here).
+        assert!(
+            r.clear_pending_for_tab(&tab_id).is_none(),
+            "record() must have drained the placeholder"
+        );
+        let live = r.snapshot_for_tab(&tab_id).expect("live snapshot present");
+        assert!(!live.pending_launch);
+    }
+
+    /// `clear_pending_for_tab` removes the placeholder so a queued
+    /// workspace closed before it spawned does not leak a phantom
+    /// Pending row.
+    #[test]
+    fn clear_pending_for_tab_drops_placeholder() {
+        let r = TerminalMeshRegistry::new();
+        let tab_id = Uuid::new_v4().to_string();
+        let mut placeholder =
+            WorkspaceLifecycleSnapshot::fresh_local_with_workspace_id(TabKind::Workspace, None);
+        placeholder.pending_launch = true;
+        r.set_pending_for_tab(tab_id.clone(), placeholder);
+
+        let dropped = r.clear_pending_for_tab(&tab_id);
+        assert!(dropped.is_some(), "clear must return the dropped snapshot");
+        assert!(r.snapshot_for_tab(&tab_id).is_none());
     }
 }

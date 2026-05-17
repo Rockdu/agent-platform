@@ -3,8 +3,10 @@
 // src-tauri/src/workspaces.rs::{WorkspaceRecord, WorkspaceErrorDto}.
 
 import {
+  createWorkspace,
   isWorkspaceErrorDto,
   localPath,
+  registerWorkspace,
   type WorkspaceErrorDto,
   type WorkspaceRecord,
 } from "../src/workspaces";
@@ -107,6 +109,19 @@ export function _probe_remote_location_round_trip(): void {
     conversationRoundsCount: 0,
   };
   void localPath(remote);
+}
+
+// Pins the create-form contract: `createWorkspace` and
+// `registerWorkspace` MUST require the auto-launch boolean so a
+// future caller cannot accidentally drop the user's checkbox state.
+export function _probe_create_workspace_requires_auto_launch_arg(): void {
+  // Correct usage — must compile cleanly.
+  void createWorkspace("name", true);
+  void registerWorkspace("/tmp/path", false);
+  // @ts-expect-error createWorkspace requires the autoLaunchClaude arg
+  void createWorkspace("name");
+  // @ts-expect-error registerWorkspace requires the autoLaunchClaude arg
+  void registerWorkspace("/tmp/path");
 }
 
 // Pins the spec invariant that `canonicalRemotePath` is required on

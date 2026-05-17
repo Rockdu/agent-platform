@@ -44,11 +44,13 @@ import {
 } from "./orchestrator";
 import {
   closeWorkspace,
+  isAutoLaunchErrorDto,
   isWorkspaceErrorDto,
   listWorkspaces,
   localPath,
   openWorkspace,
   requestWorkspaceAutoLaunch,
+  type AutoLaunchErrorDto,
   type WorkspaceErrorDto,
   type WorkspaceRecord,
 } from "./workspaces";
@@ -1048,6 +1050,13 @@ interface OpenTab {
   workspaceId: string;
   workspaceName: string;
   workspacePath: string;
+  /// `true` when this tab's claude PTY is being scheduled via
+  /// `WorkspaceLaunchScheduler`. The tab's `TerminalMeshView` MUST
+  /// NOT call `spawnTerminal` while this is true and no live
+  /// `existingTerminalId` has been resolved — the scheduler owns
+  /// the spawn and the live terminal_id arrives via the lifecycle
+  /// subscription.
+  awaitingAutoLaunch: boolean;
 }
 
 type HostModal = "workspace-switcher" | null;
@@ -1200,16 +1209,15 @@ interface RailSectionsProps {
   // bump a per-tab focus nonce so `TerminalMeshView` will move
   // keyboard focus into the terminal on the next active render.
   onResume: (tabId: string) => void;
+  // Snapshot map lifted to the parent so the same lifecycle hook
+  // instance feeds both the rail row badges AND the per-tab
+  // `existingTerminalId` resolution for the primary-terminal
+  // ownership path.
+  snapshotByTabId: Readonly<Record<string, WorkspaceLifecycleSnapshot>>;
 }
 
 function RailSections(props: RailSectionsProps) {
-  const { tabs, activeId, onSelect, onClose, onResume } = props;
-  // Memoize the tab-id array so the lifecycle hook's effect doesn't
-  // re-run on every render. `tabs` is the parent's React state and
-  // only changes reference when a tab is opened or closed, so the
-  // memo recomputes precisely when the tab set actually changes.
-  const tabIds = useMemo(() => tabs.map((t) => t.tabId), [tabs]);
-  const { snapshotByTabId } = useWorkspaceLifecycleStatuses(tabIds);
+  const { tabs, activeId, onSelect, onClose, onResume, snapshotByTabId } = props;
 
   // Partition by snapshot status; filter to Workspace-kind tabs only
   // so the orchestrator slot never leaks into the workspace rail —
@@ -1286,6 +1294,12 @@ function MultiTerminalContainer() {
   const [tabs, setTabs] = useState<OpenTab[]>([]);
   const [active, setActive] = useState<string>("");
   const [error, setError] = useState<WorkspaceErrorDto | null>(null);
+  // Per-tab auto-launch error. Surfaces inside the workspace pane so
+  // the user sees why claude failed to start instead of getting a
+  // silently-empty terminal.
+  const [autoLaunchErrorByTabId, setAutoLaunchErrorByTabId] = useState<
+    Record<string, AutoLaunchErrorDto>
+  >({});
   const [activeModal, setActiveModal] = useState<HostModal>(null);
   // Per-tab focus nonce: bumped whenever the user clicks the Done-
   // row 下一条指令 affordance. `TerminalMeshView` watches its own
@@ -1329,6 +1343,9 @@ function MultiTerminalContainer() {
       try {
         const refreshed = await openWorkspace(workspace.workspaceId, tabId);
         setError(null);
+        const willAutoLaunch =
+          refreshed.profile.autoLaunchClaude &&
+          refreshed.location.kind === "local";
         setTabs((prev) => {
           if (prev.some((t) => t.workspaceId === refreshed.workspaceId)) {
             return prev;
@@ -1340,6 +1357,7 @@ function MultiTerminalContainer() {
               workspaceId: refreshed.workspaceId,
               workspaceName: refreshed.name,
               workspacePath: localPath(refreshed) ?? "",
+              awaitingAutoLaunch: willAutoLaunch,
             },
           ];
         });
@@ -1358,7 +1376,14 @@ function MultiTerminalContainer() {
         ) {
           void requestWorkspaceAutoLaunch(refreshed.workspaceId, tabId).catch(
             (err) => {
-              console.warn("auto-launch enqueue failed", err);
+              if (isAutoLaunchErrorDto(err)) {
+                setAutoLaunchErrorByTabId((prev) => ({
+                  ...prev,
+                  [tabId]: err,
+                }));
+              } else {
+                console.warn("auto-launch enqueue failed", err);
+              }
             },
           );
         }
@@ -1413,6 +1438,15 @@ function MultiTerminalContainer() {
 
   const openWorkspaceIds = new Set(tabs.map((t) => t.workspaceId));
 
+  // Lifted lifecycle hook: feeds both the rail badges AND the
+  // per-tab `existingTerminalId` resolution that lets auto-launched
+  // workspaces attach to the scheduler's PTY instead of spawning a
+  // second one. The hook is memoized on `tabIds` so it only re-runs
+  // when the tab set actually changes.
+  const tabIds = useMemo(() => tabs.map((t) => t.tabId), [tabs]);
+  const { snapshotByTabId, terminalIdByTabId } =
+    useWorkspaceLifecycleStatuses(tabIds);
+
   return (
     <section className="terminal-mesh-container">
       <aside
@@ -1426,6 +1460,7 @@ function MultiTerminalContainer() {
           onSelect={setActive}
           onClose={(id) => void closeTab(id)}
           onResume={focusTerminal}
+          snapshotByTabId={snapshotByTabId}
         />
         <button
           type="button"
@@ -1470,6 +1505,11 @@ function MultiTerminalContainer() {
               tabId={t.tabId}
               workspaceId={t.workspaceId}
               focusNonce={focusNonceByTabId[t.tabId]}
+              autoLaunchError={autoLaunchErrorByTabId[t.tabId] ?? null}
+              awaitingAutoLaunch={t.awaitingAutoLaunch}
+              existingTerminalId={
+                t.awaitingAutoLaunch ? terminalIdByTabId[t.tabId] : undefined
+              }
             />
           ))}
         </div>

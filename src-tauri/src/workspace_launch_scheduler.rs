@@ -26,9 +26,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, State};
 use uuid::Uuid;
 
+use crate::claude_discovery::{ClaudeDiscoveryError, DiscoveryCache};
+use crate::terminal_mesh::TerminalMeshRegistry;
+use crate::workspace_lifecycle::{
+    emit_lifecycle_updated, TabKind, WorkspaceLifecycleSnapshot,
+};
 use crate::workspaces::{WorkspaceLocation, WorkspaceRegistry};
 
 pub const DEFAULT_LAUNCH_CAP: usize = 4;
@@ -197,6 +202,11 @@ pub enum AutoLaunchErrorDto {
     RemoteWorkspaceNotEligible { workspace_id: String },
     /// Workspace id does not parse or no record matches.
     WorkspaceNotFound { workspace_id: String },
+    /// `DiscoveryCache` is not in the Ready state (claude binary not
+    /// found, not executable, or version-probe failed). The frontend
+    /// MUST surface this to the user instead of silently dropping the
+    /// auto-launch — the spec forbids the silent fallback path.
+    ClaudeDiscoveryNotReady { discovery_kind: String, message: String },
 }
 
 /// Pure logic for `request_workspace_auto_launch`. Decides whether to
@@ -235,24 +245,73 @@ pub fn try_build_pending_launch(
     })
 }
 
+/// Pure helper: claude discovery must be in the Ready state before a
+/// launch can be enqueued. Extracted from the Tauri command so unit
+/// tests can exercise the rejection paths without a Tauri harness.
+pub fn try_check_discovery_ready(
+    snapshot: Option<Result<crate::claude_discovery::ClaudePathRecord, ClaudeDiscoveryError>>,
+) -> Result<(), AutoLaunchErrorDto> {
+    match snapshot {
+        Some(Ok(_)) => Ok(()),
+        Some(Err(err)) => Err(AutoLaunchErrorDto::ClaudeDiscoveryNotReady {
+            discovery_kind: discovery_error_kind(&err).into(),
+            message: err.to_string(),
+        }),
+        None => Err(AutoLaunchErrorDto::ClaudeDiscoveryNotReady {
+            discovery_kind: "not_run".into(),
+            message: "claude discovery has not run yet".into(),
+        }),
+    }
+}
+
+fn discovery_error_kind(err: &ClaudeDiscoveryError) -> &'static str {
+    match err {
+        ClaudeDiscoveryError::ClaudeNotFound { .. } => "claude_not_found",
+        ClaudeDiscoveryError::NotExecutable { .. } => "not_executable",
+        ClaudeDiscoveryError::VersionProbeFailed { .. } => "version_probe_failed",
+        ClaudeDiscoveryError::Io { .. } => "io",
+    }
+}
+
 #[tauri::command]
 pub fn request_workspace_auto_launch(
+    app: AppHandle,
     workspace_id: String,
     tab_id: String,
     registry: State<'_, WorkspaceRegistry>,
     scheduler: State<'_, WorkspaceLaunchScheduler>,
+    discovery: State<'_, DiscoveryCache>,
+    terminal_registry: State<'_, TerminalMeshRegistry>,
 ) -> Result<(), AutoLaunchErrorDto> {
-    let record = match Uuid::parse_str(&workspace_id).ok() {
-        Some(id) => registry.find_by_id(id),
-        None => None,
-    };
+    // Reject up front when claude discovery is not Ready so the
+    // frontend can show the typed error. Per the spec there is NO
+    // silent fallback for this case.
+    try_check_discovery_ready(discovery.snapshot())?;
+    let workspace_uuid = Uuid::parse_str(&workspace_id).ok();
+    let record = workspace_uuid.and_then(|id| registry.find_by_id(id));
     let launch = try_build_pending_launch(
         &workspace_id,
-        tab_id,
+        tab_id.clone(),
         record.as_ref(),
         now_unix_ms(),
     )?;
+    let workspace_uuid = launch.workspace_id;
     scheduler.enqueue(launch);
+    // If the workspace landed in Pending (cap saturated), install a
+    // tab-id-keyed placeholder snapshot so the rail row surfaces
+    // `pending_launch=true` BEFORE the terminal is spawned. The
+    // executor's spawn path drains the placeholder via
+    // `record() -> take_pending_snapshot_for_tab`.
+    if scheduler.state(workspace_uuid) == SchedulerState::Pending {
+        let mut placeholder = WorkspaceLifecycleSnapshot::fresh_local_with_workspace_id(
+            TabKind::Workspace,
+            Some(workspace_uuid.to_string()),
+        );
+        placeholder.pending_launch = true;
+        terminal_registry.set_pending_for_tab(tab_id.clone(), placeholder.clone());
+        let synthetic_terminal_id = Uuid::parse_str(&tab_id).unwrap_or(Uuid::nil());
+        emit_lifecycle_updated(&app, synthetic_terminal_id, &placeholder);
+    }
     Ok(())
 }
 
@@ -505,6 +564,47 @@ mod tests {
                 assert_eq!(workspace_id, id.to_string());
             }
             other => panic!("expected AutoLaunchDisabled; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_check_discovery_ready_passes_for_ok_snapshot() {
+        use crate::claude_discovery::ClaudePathRecord;
+        let snap = Some(Ok(ClaudePathRecord {
+            path: PathBuf::from("/usr/local/bin/claude"),
+            version: Some("9.9.9".into()),
+            discovered_at: "2026-01-01T00:00:00Z".into(),
+        }));
+        try_check_discovery_ready(snap).expect("ready state must pass");
+    }
+
+    #[test]
+    fn try_check_discovery_ready_fails_for_absent_snapshot() {
+        let err = try_check_discovery_ready(None).unwrap_err();
+        match err {
+            AutoLaunchErrorDto::ClaudeDiscoveryNotReady { discovery_kind, message } => {
+                assert_eq!(discovery_kind, "not_run");
+                assert!(
+                    message.contains("not run"),
+                    "message should explain not-run state; got: {message}"
+                );
+            }
+            other => panic!("expected ClaudeDiscoveryNotReady; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_check_discovery_ready_fails_for_not_found_error() {
+        use crate::claude_discovery::ClaudeDiscoveryError;
+        let snap = Some(Err(ClaudeDiscoveryError::ClaudeNotFound {
+            probed: vec!["/usr/local/bin/claude".into()],
+        }));
+        let err = try_check_discovery_ready(snap).unwrap_err();
+        match err {
+            AutoLaunchErrorDto::ClaudeDiscoveryNotReady { discovery_kind, .. } => {
+                assert_eq!(discovery_kind, "claude_not_found");
+            }
+            other => panic!("expected ClaudeDiscoveryNotReady; got {other:?}"),
         }
     }
 

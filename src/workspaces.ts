@@ -87,12 +87,24 @@ export async function listWorkspaces(): Promise<WorkspaceRecord[]> {
   return await invoke<WorkspaceRecord[]>("list_workspaces");
 }
 
-export async function createWorkspace(name: string): Promise<WorkspaceRecord> {
-  return await invoke<WorkspaceRecord>("create_workspace", { name });
+export async function createWorkspace(
+  name: string,
+  autoLaunchClaude: boolean,
+): Promise<WorkspaceRecord> {
+  return await invoke<WorkspaceRecord>("create_workspace", {
+    name,
+    autoLaunchClaude,
+  });
 }
 
-export async function registerWorkspace(path: string): Promise<WorkspaceRecord> {
-  return await invoke<WorkspaceRecord>("register_workspace", { path });
+export async function registerWorkspace(
+  path: string,
+  autoLaunchClaude: boolean,
+): Promise<WorkspaceRecord> {
+  return await invoke<WorkspaceRecord>("register_workspace", {
+    path,
+    autoLaunchClaude,
+  });
 }
 
 export async function openWorkspace(
@@ -122,7 +134,8 @@ export async function resolveWorkspaceForTab(
 export type AutoLaunchErrorDto =
   | { kind: "autoLaunchDisabled"; workspaceId: string }
   | { kind: "remoteWorkspaceNotEligible"; workspaceId: string }
-  | { kind: "workspaceNotFound"; workspaceId: string };
+  | { kind: "workspaceNotFound"; workspaceId: string }
+  | { kind: "claudeDiscoveryNotReady"; discoveryKind: string; message: string };
 
 export function isAutoLaunchErrorDto(value: unknown): value is AutoLaunchErrorDto {
   if (typeof value !== "object" || value === null) return false;
@@ -130,7 +143,8 @@ export function isAutoLaunchErrorDto(value: unknown): value is AutoLaunchErrorDt
   return (
     k === "autoLaunchDisabled" ||
     k === "remoteWorkspaceNotEligible" ||
-    k === "workspaceNotFound"
+    k === "workspaceNotFound" ||
+    k === "claudeDiscoveryNotReady"
   );
 }
 
