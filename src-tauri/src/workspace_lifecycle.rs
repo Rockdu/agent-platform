@@ -103,10 +103,7 @@ pub struct LifecycleUpdateEvent {
 
 /// Emit `LIFECYCLE_UPDATED_TOPIC` with the supplied snapshot. The
 /// notification-driven update path calls this AFTER applying the
-/// mutation under `TerminalMeshRegistry::update_snapshot`. The helper
-/// is declared here so the wiring change in the notification surface
-/// becomes a pure call-site change.
-#[allow(dead_code)]
+/// mutation under `TerminalMeshRegistry::update_snapshot`.
 pub fn emit_lifecycle_updated(
     app: &AppHandle,
     terminal_id: Uuid,
@@ -131,7 +128,6 @@ pub fn emit_lifecycle_updated(
 /// `AgentMarker` deliberately return `None` so general agent activity
 /// does not flicker tabs into Done — only Completion / NonZeroExit /
 /// Disconnect / TaskComplete trigger the transition.
-#[allow(dead_code)]
 pub fn done_reason_from_attention(kind: &AttentionKind) -> Option<DoneReason> {
     match kind {
         AttentionKind::Completion { .. } => Some(DoneReason::CleanCompletion),
@@ -144,6 +140,64 @@ pub fn done_reason_from_attention(kind: &AttentionKind) -> Option<DoneReason> {
         }),
         AttentionKind::PromptWaiting => None,
         AttentionKind::AgentMarker { .. } => None,
+    }
+}
+
+/// Apply a `NeedsAttention` event to the lifecycle snapshot in place.
+/// Always refreshes `last_activity_at_unix_ms` so FIFO ordering in the
+/// inner rail reflects signal arrival; additionally transitions to
+/// `Done` with the matching `DoneReason` when the kind classifies to
+/// one. Pure function — the caller (typically `on_terminal_attention`)
+/// owns the lock + emit responsibilities.
+pub fn apply_attention_to_snapshot(
+    snap: &mut WorkspaceLifecycleSnapshot,
+    kind: &AttentionKind,
+    now_unix_ms: i64,
+) {
+    snap.last_activity_at_unix_ms = now_unix_ms;
+    if let Some(reason) = done_reason_from_attention(kind) {
+        snap.status = TabStatus::Done;
+        snap.done_reason = Some(reason);
+    }
+}
+
+/// Registry-side half of the notification path: classify, mutate the
+/// retained snapshot, and return the new value. Orchestrator-routed
+/// terminals are skipped because the orchestrator slot lives in the
+/// outer-tab strip, not the workspace Running/Done rail. Returns
+/// `None` when no mutation should fire (orchestrator skip, or no
+/// retained record because the tab was fully cleared via `forget`).
+pub fn update_snapshot_for_attention(
+    registry: &crate::terminal_mesh::TerminalMeshRegistry,
+    terminal_id: Uuid,
+    kind: &AttentionKind,
+    is_orchestrator: bool,
+) -> Option<WorkspaceLifecycleSnapshot> {
+    if is_orchestrator {
+        return None;
+    }
+    let now = now_unix_ms();
+    registry.update_snapshot(terminal_id, |snap| {
+        apply_attention_to_snapshot(snap, kind, now);
+    })
+}
+
+/// End-to-end notification-path entry point: classify, mutate, and
+/// emit `lifecycle://updated` so the inner-rail React hook can
+/// reconcile. Thin wrapper over `update_snapshot_for_attention` +
+/// `emit_lifecycle_updated` — the split exists so unit tests can
+/// exercise the registry mutation without a Tauri `AppHandle`.
+pub fn on_terminal_attention(
+    registry: &crate::terminal_mesh::TerminalMeshRegistry,
+    app: &AppHandle,
+    terminal_id: Uuid,
+    kind: &AttentionKind,
+    is_orchestrator: bool,
+) {
+    if let Some(updated) =
+        update_snapshot_for_attention(registry, terminal_id, kind, is_orchestrator)
+    {
+        emit_lifecycle_updated(app, terminal_id, &updated);
     }
 }
 
@@ -217,6 +271,149 @@ mod tests {
             Some(DoneReason::TaskComplete { summary }) => assert_eq!(summary, "shipped"),
             other => panic!("expected TaskComplete, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn apply_attention_to_snapshot_transitions_to_done_for_each_done_triggering_kind() {
+        use terminal_mesh_core::AttentionKind;
+
+        let cases = [
+            (
+                AttentionKind::Completion { exit_code: 0 },
+                DoneReason::CleanCompletion,
+            ),
+            (
+                AttentionKind::NonZeroExit { exit_code: 42 },
+                DoneReason::NonZeroExit { code: 42 },
+            ),
+            (AttentionKind::Disconnect, DoneReason::Disconnected),
+            (
+                AttentionKind::TaskComplete {
+                    summary: "shipped".into(),
+                },
+                DoneReason::TaskComplete {
+                    summary: "shipped".into(),
+                },
+            ),
+        ];
+
+        for (kind, expected_reason) in cases {
+            let mut snap = WorkspaceLifecycleSnapshot::fresh_local(TabKind::Workspace);
+            assert!(matches!(snap.status, TabStatus::Running));
+            apply_attention_to_snapshot(&mut snap, &kind, 1_700_000_000_111);
+            assert!(matches!(snap.status, TabStatus::Done), "kind={kind:?}");
+            assert_eq!(snap.done_reason, Some(expected_reason), "kind={kind:?}");
+            assert_eq!(snap.last_activity_at_unix_ms, 1_700_000_000_111);
+        }
+    }
+
+    #[test]
+    fn apply_attention_to_snapshot_bumps_activity_without_changing_status_for_non_done_kinds() {
+        use terminal_mesh_core::{AttentionKind, AttentionSeverity};
+
+        for kind in [
+            AttentionKind::PromptWaiting,
+            AttentionKind::AgentMarker {
+                summary: Some("partial progress".into()),
+                severity: AttentionSeverity::Info,
+            },
+        ] {
+            let mut snap = WorkspaceLifecycleSnapshot::fresh_local(TabKind::Workspace);
+            let baseline = snap.last_activity_at_unix_ms;
+            apply_attention_to_snapshot(&mut snap, &kind, baseline + 5_000);
+            assert!(matches!(snap.status, TabStatus::Running), "kind={kind:?}");
+            assert!(snap.done_reason.is_none(), "kind={kind:?}");
+            assert_eq!(snap.last_activity_at_unix_ms, baseline + 5_000);
+        }
+    }
+
+    #[test]
+    fn apply_attention_to_snapshot_overwrites_earlier_done_reason_on_new_signal() {
+        use terminal_mesh_core::AttentionKind;
+
+        let mut snap = WorkspaceLifecycleSnapshot::fresh_local(TabKind::Workspace);
+        apply_attention_to_snapshot(
+            &mut snap,
+            &AttentionKind::Completion { exit_code: 0 },
+            1,
+        );
+        assert_eq!(snap.done_reason, Some(DoneReason::CleanCompletion));
+
+        apply_attention_to_snapshot(
+            &mut snap,
+            &AttentionKind::NonZeroExit { exit_code: 9 },
+            2,
+        );
+        assert_eq!(
+            snap.done_reason,
+            Some(DoneReason::NonZeroExit { code: 9 }),
+            "later Done-triggering signal must overwrite earlier reason"
+        );
+        assert_eq!(snap.last_activity_at_unix_ms, 2);
+    }
+
+    #[test]
+    fn update_snapshot_for_attention_skips_when_orchestrator() {
+        use crate::terminal_mesh::TerminalMeshRegistry;
+        use terminal_mesh_core::{ActorCommand, AttentionKind};
+        use tokio::sync::mpsc;
+
+        let registry = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        registry.record(id, tx, scrollback, None, TabKind::Orchestrator);
+        let before = registry.snapshot_for_terminal(id).expect("recorded");
+
+        let result = update_snapshot_for_attention(
+            &registry,
+            id,
+            &AttentionKind::Completion { exit_code: 0 },
+            true,
+        );
+
+        assert!(result.is_none(), "orchestrator path must skip the mutation");
+        let after = registry.snapshot_for_terminal(id).expect("still present");
+        assert!(matches!(after.status, TabStatus::Running));
+        assert_eq!(
+            before.last_activity_at_unix_ms,
+            after.last_activity_at_unix_ms,
+            "snapshot must NOT be touched when is_orchestrator=true"
+        );
+    }
+
+    #[test]
+    fn update_snapshot_for_attention_mutates_workspace_snapshot_to_done() {
+        use crate::terminal_mesh::TerminalMeshRegistry;
+        use terminal_mesh_core::{ActorCommand, AttentionKind};
+        use tokio::sync::mpsc;
+
+        let registry = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        registry.record(id, tx, scrollback, None, TabKind::Workspace);
+
+        let updated = update_snapshot_for_attention(
+            &registry,
+            id,
+            &AttentionKind::TaskComplete {
+                summary: "merged".into(),
+            },
+            false,
+        )
+        .expect("workspace path must mutate and return the snapshot");
+
+        assert!(matches!(updated.status, TabStatus::Done));
+        assert_eq!(
+            updated.done_reason,
+            Some(DoneReason::TaskComplete {
+                summary: "merged".into(),
+            })
+        );
+
+        let reread = registry.snapshot_for_terminal(id).expect("still present");
+        assert!(matches!(reread.status, TabStatus::Done));
     }
 
     #[test]

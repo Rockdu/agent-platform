@@ -280,7 +280,6 @@ impl TerminalMeshRegistry {
     /// writer today; it calls `emit_lifecycle_updated` with the
     /// returned snapshot. Returns `None` if `terminal_id` has no
     /// retained record (already fully cleared via `forget`).
-    #[allow(dead_code)]
     pub fn update_snapshot<F>(
         &self,
         terminal_id: Uuid,
@@ -518,25 +517,38 @@ async fn forward_events_to_webview(
         // tray-entry ring, and native macOS notifications. The
         // service is best-effort; if the host hasn't managed it
         // (test paths, bootstrap failure) skip silently.
-        if matches!(env.event, TerminalEvent::NeedsAttention { .. }) {
+        if let TerminalEvent::NeedsAttention { payload } = &env.event {
+            // Resolve whether this terminal is the orchestrator's
+            // claude PTY so the notification service can format
+            // AgentMarker events with the semantic-summary "claude:"
+            // prefix. Best-effort — when there's no recorded
+            // orchestrator session, this is `false` and the regular
+            // path applies.
+            let is_orchestrator = app
+                .try_state::<crate::orchestrator::OrchestratorState>()
+                .and_then(|s| s.snapshot())
+                .map(|sess| sess.terminal_id == env.terminal_id)
+                .unwrap_or(false);
             if let Some(service) = app.try_state::<crate::notification::NotificationService>() {
-                // task23 / AC-3.5: resolve whether this terminal is
-                // the orchestrator's claude PTY so the notification
-                // service can format AgentMarker events with the
-                // semantic-summary "claude:" prefix. Best-effort —
-                // when there's no recorded orchestrator session, this
-                // is `false` and the regular path applies.
-                let is_orchestrator = app
-                    .try_state::<crate::orchestrator::OrchestratorState>()
-                    .and_then(|s| s.snapshot())
-                    .map(|sess| sess.terminal_id == env.terminal_id)
-                    .unwrap_or(false);
                 let _decision = service.on_needs_attention(&env, is_orchestrator);
                 // Emit a frontend event so the tray window can
                 // refetch its entries list. Best-effort.
                 if let Err(err) = app.emit("tray://updated", &serde_json::json!({})) {
                     tracing::warn!(%err, "tray://updated emit failed");
                 }
+            }
+            // Update the host-side lifecycle snapshot and emit
+            // `lifecycle://updated` so the inner-rail Running/Done
+            // queue reconciles. Skipped for orchestrator terminals —
+            // they live in the outer-tab strip, not the workspace rail.
+            if let Some(registry) = app.try_state::<TerminalMeshRegistry>() {
+                crate::workspace_lifecycle::on_terminal_attention(
+                    &registry,
+                    &app,
+                    id,
+                    &payload.kind,
+                    is_orchestrator,
+                );
             }
         }
         if let Err(err) = app.emit(&topic, &env) {
@@ -880,8 +892,10 @@ pub fn terminal_mesh_cross_tab_read_scrollback(
 
 /// Look up the host-side lifecycle snapshot for a workspace tab. The
 /// inner-rail polls this on mount and after every `lifecycle://updated`
-/// event; returns `None` when the tab has no live session (e.g. during
-/// the brief window between workspace create and registry insert).
+/// event. Reads from the retained snapshot store, so it returns the
+/// last-known snapshot even after the underlying actor has exited
+/// naturally — only an explicit `terminal_shutdown` (or the absence of
+/// any prior registry insert for `tab_id`) yields `None`.
 #[tauri::command]
 pub fn workspace_lifecycle_snapshot(
     tab_id: String,
@@ -1012,7 +1026,7 @@ mod tests {
         // Natural actor exit (event channel close) must drop only the
         // live session — the retained snapshot stays so the Done queue
         // can still render this tab. This is the core invariant the
-        // host-side AC-7 store depends on.
+        // host-side retained store depends on.
         let r = TerminalMeshRegistry::new();
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
@@ -1077,7 +1091,8 @@ mod tests {
         let buf = StdArc::new(StdMutex::new(String::new()));
         r.record(id, tx, buf, Some("tab-resurrect".into()), TabKind::Workspace);
 
-        // Mark Done while still live (as task6's notification path will).
+        // Mark Done while the session is still live, mirroring what
+        // the notification-driven update path does.
         r.update_snapshot(id, |snap| {
             snap.status = TabStatus::Done;
             snap.done_reason = Some(DoneReason::CleanCompletion);
