@@ -38,6 +38,9 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 fs4 = "1"
 tauri-plugin-stronghold = "2"
 argon2 = "0.5"
+mcp-stdio = { path = "../crates/mcp-stdio" }
+tokio = { version = "1", features = ["process", "time", "sync", "io-util", "macros", "rt-multi-thread"] }
+nix = { version = "0.29", features = ["signal", "process"] }
 
 [dev-dependencies]
 tempfile = "3"

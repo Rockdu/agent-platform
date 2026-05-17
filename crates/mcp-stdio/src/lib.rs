@@ -328,7 +328,7 @@ pub fn decode_stream<R: BufRead>(
 // Sidecar identity (AC-1.6)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ClientId {
     HostUi { plugin_id: String },
     Claude { tab_id: Uuid, plugin_id: String },

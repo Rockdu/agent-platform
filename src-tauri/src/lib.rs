@@ -10,11 +10,13 @@ mod generated;
 mod logging;
 mod plugin_sqlite;
 mod secrets;
+mod sidecar_manager;
 
 use bootstrap::{BootstrapError, BootstrapPaths};
 use dispatcher::MountRegistry;
 use plugin_sqlite::{run_all_plugin_migrations_at_bootstrap, PluginMigrationState};
 use secrets::{AccessTokenCache, SecretsErrorDto, SetupMarker, SetupStatus};
+use sidecar_manager::{SidecarConfig, SidecarManager};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -173,6 +175,7 @@ pub fn run() {
         .manage(MountRegistry::new())
         .manage(PluginMigrationState::new())
         .manage(AccessTokenCache::new())
+        .manage(SidecarManager::new(SidecarConfig::production_defaults()))
         .setup(|app| {
             let result = bootstrap::ensure_dirs().and_then(|paths| {
                 // Now that the generated plugin registry is available, create
