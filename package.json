@@ -8,7 +8,7 @@
     "predev": "cargo run --quiet -p plugin-codegen && npm run build:sidecars",
     "build": "tsc -b && vite build",
     "prebuild": "cargo run --quiet -p plugin-codegen && npm run build:sidecars",
-    "build:sidecars": "cargo build --quiet -p terminal-mesh-sidecar",
+    "build:sidecars": "cargo build --quiet -p terminal-mesh-sidecar -p notes-plugin",
     "preview": "vite preview",
     "tauri": "tauri"
   },

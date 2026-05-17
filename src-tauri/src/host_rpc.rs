@@ -119,8 +119,15 @@ pub fn prepare_socket_path(app_data: &Path) -> Result<PathBuf, HostRpcError> {
 /// duration of the Tauri runtime; on app shutdown, dropping the task's
 /// JoinHandle is sufficient because the socket file is unlinked above
 /// at next start.
+///
+/// Uses `tauri::async_runtime::spawn` rather than bare `tokio::spawn`
+/// because this is invoked from the Tauri `setup` hook, which runs
+/// synchronously before any tokio-native task has entered the runtime
+/// — bare `tokio::spawn` panics there with "no reactor running".
+/// `tauri::async_runtime` is backed by tokio and is always available
+/// once Tauri's builder has been constructed.
 pub fn spawn_bridge(socket_path: PathBuf, state: HostRpcState) {
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         let listener = match UnixListener::bind(&socket_path) {
             Ok(l) => l,
             Err(e) => {

@@ -218,7 +218,7 @@ pub(crate) fn resolve_status(
 }
 
 #[tauri::command]
-pub fn orchestrator_launch_claude(
+pub async fn orchestrator_launch_claude(
     app: AppHandle,
     state: State<'_, OrchestratorState>,
     discovery: State<'_, DiscoveryCache>,
