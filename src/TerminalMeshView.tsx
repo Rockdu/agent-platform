@@ -18,6 +18,7 @@ import {
   revealWorkspaceInFinder,
   type IdeHandoffErrorDto,
 } from "./ide-handoff";
+import { IdePreferencePane } from "./IdePreferencePane";
 
 const INITIAL_SCROLLBACK_BYTES = 64 * 1024;
 
@@ -38,9 +39,13 @@ export interface TerminalMeshViewProps {
   /// bound workspace root rather than $HOME. Falls back to backend
   /// default when undefined.
   cwd?: string;
+  /// Display name of the bound workspace. Round 33 (task19
+  /// remediation): used as the header label for the per-tab
+  /// settings panel.
+  workspaceName?: string;
 }
 
-export function TerminalMeshView({ active, cwd }: TerminalMeshViewProps) {
+export function TerminalMeshView({ active, cwd, workspaceName }: TerminalMeshViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -51,6 +56,7 @@ export function TerminalMeshView({ active, cwd }: TerminalMeshViewProps) {
   const [ready, setReady] = useState(false);
   const [status, setStatus] = useState<TerminalRunStatus>({ kind: "running" });
   const [ideError, setIdeError] = useState<IdeHandoffErrorDto | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const onOpenIde = useCallback(async () => {
     if (!cwd) return;
@@ -254,6 +260,15 @@ export function TerminalMeshView({ active, cwd }: TerminalMeshViewProps) {
             >
               Finder 中显示
             </button>
+            <button
+              type="button"
+              className="terminal-mesh-view__settings-toggle"
+              aria-expanded={settingsOpen}
+              aria-label="工作区设置"
+              onClick={() => setSettingsOpen((v) => !v)}
+            >
+              ⚙ 设置
+            </button>
           </div>
         )}
       </header>
@@ -281,7 +296,77 @@ export function TerminalMeshView({ active, cwd }: TerminalMeshViewProps) {
       {!ready && !error && (
         <p className="placeholder__hint">正在启动终端…</p>
       )}
+      {settingsOpen && cwd && (
+        <WorkspaceSettingsPanel
+          workspacePath={cwd}
+          workspaceName={workspaceName}
+          onOpenIde={onOpenIde}
+          onRevealFinder={onRevealFinder}
+          onClose={() => setSettingsOpen(false)}
+          onIdeError={setIdeError}
+        />
+      )}
     </div>
+  );
+}
+
+function WorkspaceSettingsPanel(props: {
+  workspacePath: string;
+  workspaceName?: string;
+  onOpenIde: () => Promise<void> | void;
+  onRevealFinder: () => Promise<void> | void;
+  onClose: () => void;
+  onIdeError: (e: IdeHandoffErrorDto | null) => void;
+}) {
+  const {
+    workspacePath,
+    workspaceName,
+    onOpenIde,
+    onRevealFinder,
+    onClose,
+    onIdeError,
+  } = props;
+  const headerLabel =
+    workspaceName ??
+    workspacePath.split("/").filter(Boolean).pop() ??
+    workspacePath;
+  return (
+    <section
+      className="terminal-mesh-view__settings-panel"
+      role="dialog"
+      aria-label="工作区设置"
+    >
+      <header className="terminal-mesh-view__settings-header">
+        <h3>工作区设置 · {headerLabel}</h3>
+        <button
+          type="button"
+          className="terminal-mesh-view__settings-close"
+          onClick={onClose}
+          aria-label="关闭设置"
+        >
+          ×
+        </button>
+      </header>
+      <div className="terminal-mesh-view__settings-body">
+        <dl className="terminal-mesh-view__settings-meta">
+          <dt>路径</dt>
+          <dd>
+            <code>{workspacePath}</code>
+          </dd>
+        </dl>
+        <div className="terminal-mesh-view__settings-actions">
+          <button type="button" onClick={() => void onOpenIde()}>
+            Cursor 中打开
+          </button>
+          <button type="button" onClick={() => void onRevealFinder()}>
+            Finder 中显示
+          </button>
+        </div>
+        <hr className="terminal-mesh-view__settings-divider" />
+        <h4 className="terminal-mesh-view__settings-subhead">IDE 偏好</h4>
+        <IdePreferencePane onError={onIdeError} />
+      </div>
+    </section>
   );
 }
 

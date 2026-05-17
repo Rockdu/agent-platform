@@ -505,6 +505,100 @@
   font-size: 11px;
   border-bottom: 1px solid #1a1a1a;
 }
+.terminal-mesh-view__settings-toggle {
+  background: transparent;
+  border: 1px solid #555;
+  color: #ccc;
+  padding: 2px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+}
+.terminal-mesh-view__settings-toggle:hover {
+  background: #3a3a3a;
+  color: #fff;
+}
+/* Per-tab settings panel: overlays the xterm body while the
+   terminal stays mounted underneath, so closing the panel restores
+   the live session instantly. */
+.terminal-mesh-view__settings-panel {
+  position: absolute;
+  inset: 24px 0 0 0; /* leave the status strip visible above */
+  background: #1e1e1e;
+  border-top: 1px solid #1a1a1a;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: 10;
+}
+.terminal-mesh-view__settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid #2a2a2a;
+}
+.terminal-mesh-view__settings-header h3 {
+  margin: 0;
+  font-size: 13px;
+  color: #e0e0e0;
+}
+.terminal-mesh-view__settings-close {
+  background: transparent;
+  border: none;
+  color: #888;
+  font-size: 16px;
+  cursor: pointer;
+}
+.terminal-mesh-view__settings-close:hover {
+  color: #fff;
+}
+.terminal-mesh-view__settings-body {
+  padding: 12px 16px;
+  overflow-y: auto;
+  flex: 1;
+  color: #e0e0e0;
+}
+.terminal-mesh-view__settings-meta {
+  display: grid;
+  grid-template-columns: 60px 1fr;
+  gap: 4px 12px;
+  margin: 0 0 12px 0;
+  font-size: 12px;
+}
+.terminal-mesh-view__settings-meta dt {
+  color: #888;
+}
+.terminal-mesh-view__settings-meta dd {
+  margin: 0;
+}
+.terminal-mesh-view__settings-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.terminal-mesh-view__settings-actions button {
+  background: #3a3a3a;
+  border: 1px solid #555;
+  color: #e0e0e0;
+  padding: 4px 12px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.terminal-mesh-view__settings-actions button:hover {
+  background: #4a4a4a;
+}
+.terminal-mesh-view__settings-divider {
+  border: none;
+  border-top: 1px solid #2a2a2a;
+  margin: 12px 0;
+}
+.terminal-mesh-view__settings-subhead {
+  margin: 0 0 8px 0;
+  font-size: 12px;
+  color: #b8b8b8;
+}
 .terminal-mesh-view__xterm {
   flex: 1;
   width: 100%;
