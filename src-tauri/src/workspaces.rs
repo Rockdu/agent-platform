@@ -105,11 +105,79 @@ impl From<&WorkspaceError> for WorkspaceErrorDto {
     }
 }
 
+/// Disk-side mirror of `WorkspaceRecord`. Snake_case keys (no
+/// `rename_all`) so `workspaces.json` reads like a normal shell-tools
+/// JSON file. Separated from the wire `WorkspaceRecord` so the
+/// Tauri-IPC camelCase convention and the on-disk snake_case
+/// convention can evolve independently.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StoredWorkspaceRecord {
+    workspace_id: Uuid,
+    name: String,
+    path: PathBuf,
+    created_at: String,
+    last_used_at: String,
+    open_tab_id: Option<String>,
+}
+
+impl From<&WorkspaceRecord> for StoredWorkspaceRecord {
+    fn from(r: &WorkspaceRecord) -> Self {
+        Self {
+            workspace_id: r.workspace_id,
+            name: r.name.clone(),
+            path: r.path.clone(),
+            created_at: r.created_at.clone(),
+            last_used_at: r.last_used_at.clone(),
+            open_tab_id: r.open_tab_id.clone(),
+        }
+    }
+}
+
+impl From<StoredWorkspaceRecord> for WorkspaceRecord {
+    fn from(s: StoredWorkspaceRecord) -> Self {
+        Self {
+            workspace_id: s.workspace_id,
+            name: s.name,
+            path: s.path,
+            created_at: s.created_at,
+            last_used_at: s.last_used_at,
+            open_tab_id: s.open_tab_id,
+        }
+    }
+}
+
 /// On-disk shape persisted under `${APP_DATA}/workspaces.json`.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct StoredRegistry {
     #[serde(default)]
-    workspaces: Vec<WorkspaceRecord>,
+    workspaces: Vec<StoredWorkspaceRecord>,
+}
+
+/// Filesystem-level directory-identity helper. Two paths refer to
+/// the same workspace iff they're byte-equal OR (on Unix) they live
+/// on the same device and inode. The dev/ino fallback catches macOS
+/// APFS / NTFS / HFS+ case-insensitive aliases that `canonicalize`
+/// leaves byte-distinct, plus any residual symlink edge cases the
+/// canonical resolver missed. Non-Unix targets keep
+/// canonical-equality-only behavior.
+fn paths_refer_to_same_workspace(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    same_directory_identity(a, b)
+}
+
+#[cfg(unix)]
+fn same_directory_identity(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(ma) = std::fs::metadata(a) else { return false };
+    let Ok(mb) = std::fs::metadata(b) else { return false };
+    ma.dev() == mb.dev() && ma.ino() == mb.ino()
+}
+
+#[cfg(not(unix))]
+fn same_directory_identity(_a: &Path, _b: &Path) -> bool {
+    false
 }
 
 /// Tauri-managed registry. Backed by `${storage_root}/workspaces.json`.
@@ -147,12 +215,15 @@ impl WorkspaceRegistry {
     /// empty).
     pub fn load(storage_root: PathBuf, workspaces_root: Option<PathBuf>) -> Self {
         let path = storage_root.join(WORKSPACES_FILENAME);
-        let records = match std::fs::read(&path) {
+        let records: HashMap<Uuid, WorkspaceRecord> = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<StoredRegistry>(&bytes) {
                 Ok(stored) => stored
                     .workspaces
                     .into_iter()
-                    .map(|r| (r.workspace_id, r))
+                    .map(|s| {
+                        let r: WorkspaceRecord = s.into();
+                        (r.workspace_id, r)
+                    })
                     .collect(),
                 Err(e) => {
                     tracing::warn!(path = %path.display(), %e, "workspaces.json malformed; starting empty");
@@ -183,7 +254,11 @@ impl WorkspaceRegistry {
         let tmp = path.with_extension("json.tmp");
         let stored = StoredRegistry {
             workspaces: {
-                let mut v: Vec<WorkspaceRecord> = inner.records.values().cloned().collect();
+                let mut v: Vec<StoredWorkspaceRecord> = inner
+                    .records
+                    .values()
+                    .map(StoredWorkspaceRecord::from)
+                    .collect();
                 v.sort_by(|a, b| a.created_at.cmp(&b.created_at));
                 v
             },
@@ -268,7 +343,7 @@ impl WorkspaceRegistry {
             context: format!("canonicalize {}", target.display()),
             message: e.to_string(),
         })?;
-        if let Some(dup) = guard.find_canonical_duplicate(&canonical) {
+        if let Some(dup) = guard.find_duplicate(&canonical) {
             return Err(WorkspaceError::CanonicalDuplicate {
                 existing_workspace_id: dup.workspace_id,
                 existing_name: dup.name.clone(),
@@ -302,7 +377,7 @@ impl WorkspaceRegistry {
             message: e.to_string(),
         })?;
         let mut guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
-        if let Some(dup) = guard.find_canonical_duplicate(&canonical) {
+        if let Some(dup) = guard.find_duplicate(&canonical) {
             return Err(WorkspaceError::CanonicalDuplicate {
                 existing_workspace_id: dup.workspace_id,
                 existing_name: dup.name.clone(),
@@ -379,8 +454,15 @@ impl WorkspaceRegistry {
 }
 
 impl RegistryInner {
-    fn find_canonical_duplicate(&self, candidate: &Path) -> Option<&WorkspaceRecord> {
-        self.records.values().find(|r| r.path == candidate)
+    /// Locate an existing workspace whose canonical path refers to
+    /// the same physical directory as `candidate`. Uses
+    /// [`paths_refer_to_same_workspace`] so macOS APFS case-
+    /// insensitive aliases and any residual symlink edge cases are
+    /// rejected, not just byte-distinct canonical paths.
+    fn find_duplicate(&self, candidate: &Path) -> Option<&WorkspaceRecord> {
+        self.records
+            .values()
+            .find(|r| paths_refer_to_same_workspace(&r.path, candidate))
     }
 }
 
@@ -770,6 +852,116 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&dto).unwrap();
         assert_eq!(v.get("kind").and_then(|x| x.as_str()), Some("invalidName"));
         assert_eq!(v.get("reason").and_then(|x| x.as_str()), Some("bad"));
+    }
+
+    /// Codex round-28 blocker #1 regression: directory-identity check
+    /// rejects a symlink alias even though `canonicalize` already
+    /// collapses symlinks in most cases. This test pins the contract
+    /// against future refactors that might short-circuit identity
+    /// checks for byte-distinct candidates.
+    #[cfg(unix)]
+    #[test]
+    fn register_workspace_rejects_symlink_alias_of_existing_workspace() {
+        use std::os::unix::fs::symlink;
+        let (_storage, home, reg) = fresh_registry();
+        let real = home.path().join("real-workspace");
+        std::fs::create_dir_all(&real).unwrap();
+        let created = reg.register_workspace(&real).expect("register real");
+
+        let alias = home.path().join("alias-link");
+        symlink(&real, &alias).unwrap();
+        let err = reg.register_workspace(&alias).unwrap_err();
+        match err {
+            WorkspaceError::CanonicalDuplicate {
+                existing_workspace_id,
+                existing_name,
+            } => {
+                assert_eq!(existing_workspace_id, created.workspace_id);
+                assert_eq!(existing_name, created.name);
+            }
+            other => panic!("expected CanonicalDuplicate; got {other:?}"),
+        }
+    }
+
+    /// Codex round-28 blocker #1 regression: the case-insensitive
+    /// alias path. On macOS APFS / NTFS / HFS+, `canonicalize`
+    /// preserves the case the user typed, so byte-wise `PathBuf ==
+    /// PathBuf` misses true identity. The dev/inode fallback catches
+    /// it. On case-sensitive filesystems (Linux ext4) the alternate
+    /// path doesn't exist, so we skip the assertion path; the test
+    /// still passes structurally.
+    #[cfg(unix)]
+    #[test]
+    fn register_workspace_rejects_case_insensitive_alias_on_case_insensitive_filesystem() {
+        let (_storage, home, reg) = fresh_registry();
+        let mixed = home.path().join("MixedCase");
+        std::fs::create_dir_all(&mixed).unwrap();
+        let lower = home.path().join("mixedcase");
+
+        // Detect filesystem case-sensitivity at runtime: if statting
+        // the lowercased name succeeds AND points to the same inode,
+        // the filesystem is case-insensitive (macOS APFS default,
+        // NTFS, HFS+). Otherwise (Linux ext4) skip the assertion —
+        // the lowercased path is genuinely a different directory.
+        let case_insensitive = match (std::fs::metadata(&mixed), std::fs::metadata(&lower)) {
+            (Ok(a), Ok(b)) => {
+                use std::os::unix::fs::MetadataExt;
+                a.dev() == b.dev() && a.ino() == b.ino()
+            }
+            _ => false,
+        };
+
+        let created = reg.register_workspace(&mixed).expect("register mixed");
+
+        if case_insensitive {
+            let err = reg.register_workspace(&lower).unwrap_err();
+            match err {
+                WorkspaceError::CanonicalDuplicate {
+                    existing_workspace_id,
+                    existing_name,
+                } => {
+                    assert_eq!(existing_workspace_id, created.workspace_id);
+                    assert_eq!(existing_name, created.name);
+                }
+                other => panic!(
+                    "expected CanonicalDuplicate on case-insensitive FS; got {other:?}"
+                ),
+            }
+        } else {
+            eprintln!(
+                "case-sensitive filesystem detected; skipping case-insensitive alias assertion"
+            );
+        }
+    }
+
+    /// Codex round-28 blocker #2 regression: the persisted JSON shape
+    /// uses snake_case keys, decoupled from the camelCase wire shape
+    /// the Tauri IPC layer returns to the frontend.
+    #[test]
+    fn persisted_json_uses_snake_case_keys() {
+        let (storage, _home, reg) = fresh_registry();
+        let _ = reg.create_workspace("snake").expect("create");
+        let body = std::fs::read_to_string(storage.path().join("workspaces.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let workspaces = v
+            .get("workspaces")
+            .and_then(|x| x.as_array())
+            .expect("workspaces array");
+        let entry = workspaces.first().expect("at least one record");
+        // snake_case keys required on disk:
+        for k in ["workspace_id", "name", "path", "created_at", "last_used_at", "open_tab_id"] {
+            assert!(
+                entry.get(k).is_some(),
+                "on-disk key `{k}` missing from {entry:?}"
+            );
+        }
+        // camelCase wire-only keys must not appear on disk:
+        for k in ["workspaceId", "createdAt", "lastUsedAt", "openTabId"] {
+            assert!(
+                entry.get(k).is_none(),
+                "wire-only camelCase key `{k}` leaked to disk in {entry:?}"
+            );
+        }
     }
 
     #[test]
