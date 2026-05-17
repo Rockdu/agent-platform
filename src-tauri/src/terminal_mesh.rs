@@ -431,7 +431,7 @@ impl TerminalMeshRegistry {
     pub fn lifecycle_entry_for_tab(
         &self,
         tab_id: &str,
-    ) -> Option<(Uuid, WorkspaceLifecycleSnapshot)> {
+    ) -> Option<LifecycleUpdateEvent> {
         {
             let snap_idx = self
                 .snapshot_tab_index
@@ -440,23 +440,28 @@ impl TerminalMeshRegistry {
             if let Some(terminal_id) = snap_idx.get(tab_id).copied() {
                 drop(snap_idx);
                 let snapshot = self.snapshot_for_terminal(terminal_id)?;
-                return Some((terminal_id, snapshot));
+                return Some(LifecycleUpdateEvent {
+                    terminal_id: Some(terminal_id.to_string()),
+                    tab_id: Some(tab_id.to_string()),
+                    snapshot,
+                });
             }
         }
-        // Pending-launch placeholder fallback. The frontend hook
-        // keys its terminal-id cache on the returned id; for a
-        // workspace whose tab_id is the bare workspace UUID this
-        // parses cleanly, and the eventual `lifecycle://updated`
-        // event from the scheduler's placeholder emit uses the same
-        // derived id so the hook can deduplicate.
+        // Pending-launch placeholder fallback. The envelope carries
+        // `terminal_id = None` so the frontend hook only updates the
+        // snapshot map — the resolved-terminal-id map is left alone
+        // so the later real-id event still triggers the resolved
+        // path instead of being suppressed by an "already known" gate.
         let pending = self
             .pending_snapshots_by_tab
             .lock()
             .expect("pending_snapshots_by_tab poisoned");
         let snapshot = pending.get(tab_id).cloned()?;
-        drop(pending);
-        let synthetic_id = Uuid::parse_str(tab_id).unwrap_or(Uuid::nil());
-        Some((synthetic_id, snapshot))
+        Some(LifecycleUpdateEvent {
+            terminal_id: None,
+            tab_id: Some(tab_id.to_string()),
+            snapshot,
+        })
     }
 
     /// Apply `mutator` to the retained snapshot under the lock and
@@ -1110,12 +1115,7 @@ pub fn workspace_lifecycle_snapshot(
     tab_id: String,
     registry: State<'_, TerminalMeshRegistry>,
 ) -> Result<Option<LifecycleUpdateEvent>, TerminalMeshErrorDto> {
-    Ok(registry
-        .lifecycle_entry_for_tab(&tab_id)
-        .map(|(terminal_id, snapshot)| LifecycleUpdateEvent {
-            terminal_id: terminal_id.to_string(),
-            snapshot,
-        }))
+    Ok(registry.lifecycle_entry_for_tab(&tab_id))
 }
 
 #[cfg(test)]
@@ -1358,14 +1358,43 @@ mod tests {
         let entry = r
             .lifecycle_entry_for_tab("tab-entry")
             .expect("entry present");
-        let (terminal_id, snap) = entry;
-        assert_eq!(terminal_id, id, "terminal id must match the recorded id");
-        assert!(matches!(snap.tab_kind, TabKind::Workspace));
+        assert_eq!(
+            entry.terminal_id.as_deref(),
+            Some(id.to_string().as_str()),
+            "live entry must carry the real terminal id"
+        );
+        assert_eq!(entry.tab_id.as_deref(), Some("tab-entry"));
+        assert!(matches!(entry.snapshot.tab_kind, TabKind::Workspace));
 
         assert!(
             r.lifecycle_entry_for_tab("does-not-exist").is_none(),
             "unknown tab id must return None"
         );
+    }
+
+    /// Placeholder entries must surface a `None` `terminal_id` so the
+    /// frontend hook does not poison `terminalIdByTabId` with a
+    /// synthetic id. The later real-terminal event then transitions
+    /// the tab cleanly into the resolved state.
+    #[test]
+    fn lifecycle_entry_for_tab_returns_none_terminal_id_for_placeholder() {
+        let r = TerminalMeshRegistry::new();
+        let tab_id = Uuid::new_v4().to_string();
+        let mut placeholder =
+            WorkspaceLifecycleSnapshot::fresh_local_with_workspace_id(TabKind::Workspace, None);
+        placeholder.pending_launch = true;
+        r.set_pending_for_tab(tab_id.clone(), placeholder);
+
+        let entry = r
+            .lifecycle_entry_for_tab(&tab_id)
+            .expect("placeholder entry present");
+        assert!(
+            entry.terminal_id.is_none(),
+            "placeholder must NOT expose a synthetic terminal id; got {:?}",
+            entry.terminal_id
+        );
+        assert_eq!(entry.tab_id.as_deref(), Some(tab_id.as_str()));
+        assert!(entry.snapshot.pending_launch);
     }
 
     #[test]

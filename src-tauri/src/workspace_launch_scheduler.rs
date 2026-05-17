@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::claude_discovery::{ClaudeDiscoveryError, DiscoveryCache};
 use crate::terminal_mesh::TerminalMeshRegistry;
 use crate::workspace_lifecycle::{
-    emit_lifecycle_updated, TabKind, WorkspaceLifecycleSnapshot,
+    emit_lifecycle_updated_for_placeholder, TabKind, WorkspaceLifecycleSnapshot,
 };
 use crate::workspaces::{WorkspaceLocation, WorkspaceRegistry};
 
@@ -309,8 +309,13 @@ pub fn request_workspace_auto_launch(
         );
         placeholder.pending_launch = true;
         terminal_registry.set_pending_for_tab(tab_id.clone(), placeholder.clone());
-        let synthetic_terminal_id = Uuid::parse_str(&tab_id).unwrap_or(Uuid::nil());
-        emit_lifecycle_updated(&app, synthetic_terminal_id, &placeholder);
+        // Emit with `terminal_id = None` + `tab_id = Some(...)` so
+        // the frontend hook updates the snapshot map only and does
+        // NOT mark the tab as resolved in `terminalIdByTabId`. The
+        // later real-terminal event from `RealLaunchExecutor`'s
+        // post-spawn `on_pending_launch_changed(..., false)` then
+        // correctly populates both maps.
+        emit_lifecycle_updated_for_placeholder(&app, &tab_id, &placeholder);
     }
     Ok(())
 }

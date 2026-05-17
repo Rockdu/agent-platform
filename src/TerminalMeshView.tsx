@@ -129,6 +129,17 @@ export function TerminalMeshView({
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
+    // Workspace tabs in the auto-launch flow do NOT spawn their own
+    // PTY here — the host-side scheduler owns the spawn, and the
+    // live terminal_id arrives later via the lifecycle subscription
+    // as a fresh `existingTerminalId` value. Park BEFORE creating
+    // xterm so we don't construct a doomed instance during the
+    // waiting state; the effect re-runs when `existingTerminalId`
+    // flips from undefined to the real id (it's in the deps array
+    // below) and proceeds through the attach path on that re-run.
+    if (awaitingAutoLaunch && !existingTerminalId) {
+      return;
+    }
     // Reset the shared dispose flag at the start of every setup so
     // React StrictMode's setup → cleanup → setup replay doesn't see
     // the prior cleanup's `true` and immediately bail out of the
@@ -163,17 +174,10 @@ export function TerminalMeshView({
 
     (async () => {
       try {
-        // Workspace tabs in the auto-launch flow do NOT spawn their
-        // own PTY here — the host-side scheduler owns the spawn,
-        // and the live terminal_id arrives later via the lifecycle
-        // subscription as a fresh `existingTerminalId` value. Until
-        // then this branch parks until the next setup pass.
-        if (awaitingAutoLaunch && !existingTerminalId) {
-          return;
-        }
         // The orchestrator path bypasses spawn — the host already
         // created the PTY and recorded it in the terminal registry.
-        // We just subscribe.
+        // We just subscribe. Same path is taken by the auto-launch
+        // re-run once the scheduler resolves `existingTerminalId`.
         const terminalId: string =
           existingTerminalId ??
           (
@@ -279,7 +283,13 @@ export function TerminalMeshView({
       termRef.current = null;
       fitRef.current = null;
     };
-  }, []);
+    // Deps include the inputs that determine which terminal id the
+    // setup binds to. `existingTerminalId` flipping from undefined
+    // to a real id (the auto-launch waiting → attached transition)
+    // MUST trigger a re-run so the component subscribes to the new
+    // PTY; the previous run's cleanup is a no-op when it parked in
+    // the waiting state (no xterm or subscription was created).
+  }, [existingTerminalId, awaitingAutoLaunch, cwd, tabId, workspaceId]);
 
   // Inactive→active transitions: re-fit and push the new size back
   // to the actor. xterm doesn't measure correctly while hidden, so

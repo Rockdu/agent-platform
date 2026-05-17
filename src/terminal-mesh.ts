@@ -106,8 +106,20 @@ export interface WorkspaceLifecycleSnapshot {
 // Single envelope shape shared between the initial `workspace_
 // lifecycle_snapshot` fetch and the `lifecycle://updated` event
 // stream so the frontend hook can apply the same handler to both.
+//
+// `terminalId` is `null` while a workspace is sitting in the
+// launch-scheduler queue (pre-spawn placeholder). The hook treats
+// `null` as "snapshot data only; do NOT mark this tab as resolved
+// in `terminalIdByTabId`" — so the later real-terminal event still
+// triggers the resolved-id update instead of being suppressed by
+// the "already known" gate.
+//
+// `tabId` is always set for placeholder events (the only routing
+// key available) and helpful even for real events so the hook can
+// prune stale refs without a reverse lookup.
 export interface LifecycleUpdateEvent {
-  terminalId: string;
+  terminalId: string | null;
+  tabId: string | null;
   snapshot: WorkspaceLifecycleSnapshot;
 }
 

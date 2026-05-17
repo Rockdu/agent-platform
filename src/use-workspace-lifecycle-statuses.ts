@@ -74,6 +74,47 @@ export interface LifecycleStatusesMap {
   terminalIdByTabId: Readonly<Record<string, string | undefined>>;
 }
 
+/**
+ * Mutable state bundle for `applyLifecycleEntry`. The hook's effect
+ * holds equivalents (state objects + refs); the helper accepts the
+ * same shapes so it is unit-testable against the same logic.
+ */
+export interface LifecycleApplyState {
+  snapshotByTabId: Record<string, WorkspaceLifecycleSnapshot>;
+  terminalIdByTabId: Record<string, string | undefined>;
+  knownByTabId: Map<string, string>;
+  tabIdByTerminalId: Map<string, string>;
+}
+
+/**
+ * Apply a lifecycle envelope into the mutable state bundle.
+ *
+ * - The snapshot map always updates so the rail row reflects the
+ *   newest lifecycle data (Running / Done / pendingLaunch).
+ * - The terminal-id maps update ONLY when `terminalId` is a real
+ *   string. A `null` `terminalId` means the envelope is a
+ *   pending-launch placeholder; populating the resolved-id map
+ *   from a placeholder would poison the hook so the real-terminal
+ *   event arriving later is suppressed as "already known", leaving
+ *   the parent stuck passing the synthetic id down to the
+ *   `TerminalMeshView` and the pane never attaches.
+ *
+ * Exported as a pure helper so tsx-runnable harnesses can replay
+ * placeholder→real transitions without a React renderer.
+ */
+export function applyLifecycleEntry(
+  tabId: string,
+  terminalId: string | null,
+  snapshot: WorkspaceLifecycleSnapshot,
+  state: LifecycleApplyState,
+): void {
+  state.snapshotByTabId[tabId] = snapshot;
+  if (terminalId === null) return;
+  state.knownByTabId.set(tabId, terminalId);
+  state.tabIdByTerminalId.set(terminalId, tabId);
+  state.terminalIdByTabId[tabId] = terminalId;
+}
+
 const RETRY_DELAYS_MS = [200, 400, 800, 1600] as const;
 
 export function useWorkspaceLifecycleStatuses(
@@ -133,16 +174,23 @@ export function useWorkspaceLifecycleStatuses(
       });
     };
 
+    // Apply an envelope into both state setters AND the ref maps,
+    // sharing the resolution rules with `applyLifecycleEntry` so the
+    // tsx harness verifies exactly the hook's runtime behavior. The
+    // helper's state-bag is synthesized from the refs + setter
+    // proxies; for the snapshot setter, we still go through React's
+    // `setSnapshotByTabId` so the parent re-renders.
     const applyEntry = (
       tabId: string,
-      terminalId: string,
+      terminalId: string | null,
       snapshot: WorkspaceLifecycleSnapshot,
     ) => {
       if (cancelled) return;
       if (!activeTabIdsRef.current.has(tabId)) return;
+      setSnapshotByTabId((prev) => ({ ...prev, [tabId]: snapshot }));
+      if (terminalId === null) return;
       knownTerminalIdByTabIdRef.current.set(tabId, terminalId);
       tabIdByTerminalIdRef.current.set(terminalId, tabId);
-      setSnapshotByTabId((prev) => ({ ...prev, [tabId]: snapshot }));
       setTerminalIdByTabId((prev) => ({ ...prev, [tabId]: terminalId }));
     };
 
@@ -154,7 +202,11 @@ export function useWorkspaceLifecycleStatuses(
         if (!activeTabIdsRef.current.has(tabId)) return;
         if (entry) {
           applyEntry(tabId, entry.terminalId, entry.snapshot);
-          return;
+          // Placeholders keep `knownTerminalIdByTabId` unset, so the
+          // retry loop should still run until a real terminal id
+          // resolves the tab. Only return early when a real id
+          // already exists in the resolved map.
+          if (knownTerminalIdByTabIdRef.current.has(tabId)) return;
         }
         if (knownTerminalIdByTabIdRef.current.has(tabId)) return;
         if (attempt >= RETRY_DELAYS_MS.length) return;
@@ -193,15 +245,32 @@ export function useWorkspaceLifecycleStatuses(
     // not lost.
     void subscribeWorkspaceLifecycleUpdates((event: LifecycleUpdateEvent) => {
       if (cancelled) return;
-      const tabId = tabIdByTerminalIdRef.current.get(event.terminalId);
-      if (tabId !== undefined) {
-        if (!activeTabIdsRef.current.has(tabId)) return;
-        setSnapshotByTabId((prev) => ({ ...prev, [tabId]: event.snapshot }));
+      // Placeholder route: event carries a tab id and no terminal
+      // id. Apply the snapshot without populating the resolved-id
+      // maps so a later real-terminal event still triggers the
+      // resolved-id update path.
+      if (event.terminalId === null) {
+        if (event.tabId === null) return;
+        if (!activeTabIdsRef.current.has(event.tabId)) return;
+        applyEntry(event.tabId, null, event.snapshot);
         return;
       }
-      // An event for a terminal id we do not yet recognize: the
-      // registry has likely populated since our last fetch, so retry
-      // every still-unresolved tab.
+      const knownTabId = tabIdByTerminalIdRef.current.get(event.terminalId);
+      if (knownTabId !== undefined) {
+        if (!activeTabIdsRef.current.has(knownTabId)) return;
+        setSnapshotByTabId((prev) => ({ ...prev, [knownTabId]: event.snapshot }));
+        return;
+      }
+      // The event carries a real terminal id but we have not yet
+      // resolved it. If the envelope also names its tab, take the
+      // direct route and resolve the tab immediately — this is the
+      // placeholder→real transition. Otherwise fall back to a
+      // refetch of every unresolved tab (the registry has likely
+      // populated since our last fetch).
+      if (event.tabId !== null && activeTabIdsRef.current.has(event.tabId)) {
+        applyEntry(event.tabId, event.terminalId, event.snapshot);
+        return;
+      }
       refetchUnresolved();
     }).then((fn) => {
       if (cancelled) {

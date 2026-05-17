@@ -113,17 +113,25 @@ impl WorkspaceLifecycleSnapshot {
     }
 }
 
-/// Envelope shape the frontend sees on `LIFECYCLE_UPDATED_TOPIC`. The
-/// terminal-id is carried alongside the snapshot so the frontend can
-/// demultiplex without a separate per-terminal subscription.
+/// Envelope shape the frontend sees on `LIFECYCLE_UPDATED_TOPIC`.
+///
+/// `terminal_id` is `Some(uuid)` only when a real PTY has been
+/// recorded for the tab. While a workspace is sitting in the launch
+/// queue (pre-spawn placeholder), `terminal_id` is `None` and
+/// `tab_id` carries the route. The frontend hook treats `None`
+/// `terminal_id` as "snapshot data only — do NOT mark this tab as
+/// resolved in `terminalIdByTabId`", so the real-id event that
+/// arrives later still triggers the resolved-id update path
+/// instead of being suppressed by an "already known" gate.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LifecycleUpdateEvent {
-    pub terminal_id: String,
+    pub terminal_id: Option<String>,
+    pub tab_id: Option<String>,
     pub snapshot: WorkspaceLifecycleSnapshot,
 }
 
-/// Emit `LIFECYCLE_UPDATED_TOPIC` with the supplied snapshot. The
+/// Emit `LIFECYCLE_UPDATED_TOPIC` for a real terminal id. The
 /// notification-driven update path calls this AFTER applying the
 /// mutation under `TerminalMeshRegistry::update_snapshot`.
 pub fn emit_lifecycle_updated(
@@ -132,7 +140,8 @@ pub fn emit_lifecycle_updated(
     snapshot: &WorkspaceLifecycleSnapshot,
 ) {
     let envelope = LifecycleUpdateEvent {
-        terminal_id: terminal_id.to_string(),
+        terminal_id: Some(terminal_id.to_string()),
+        tab_id: None,
         snapshot: snapshot.clone(),
     };
     if let Err(e) = app.emit(LIFECYCLE_UPDATED_TOPIC, envelope) {
@@ -140,6 +149,29 @@ pub fn emit_lifecycle_updated(
             %terminal_id,
             error = %e,
             "failed to emit lifecycle://updated"
+        );
+    }
+}
+
+/// Emit `LIFECYCLE_UPDATED_TOPIC` for a pending-launch placeholder
+/// (no real PTY exists yet). The envelope carries `tab_id` for
+/// routing and `terminal_id = None` so the frontend hook only
+/// updates the snapshot map, not the resolved-terminal-id map.
+pub fn emit_lifecycle_updated_for_placeholder(
+    app: &AppHandle,
+    tab_id: &str,
+    snapshot: &WorkspaceLifecycleSnapshot,
+) {
+    let envelope = LifecycleUpdateEvent {
+        terminal_id: None,
+        tab_id: Some(tab_id.to_string()),
+        snapshot: snapshot.clone(),
+    };
+    if let Err(e) = app.emit(LIFECYCLE_UPDATED_TOPIC, envelope) {
+        tracing::warn!(
+            tab_id = %tab_id,
+            error = %e,
+            "failed to emit lifecycle://updated for placeholder"
         );
     }
 }
@@ -349,13 +381,35 @@ mod tests {
     #[test]
     fn lifecycle_update_event_serializes_with_camelcase_terminal_id() {
         let event = LifecycleUpdateEvent {
-            terminal_id: "abc-123".into(),
+            terminal_id: Some("abc-123".into()),
+            tab_id: None,
             snapshot: WorkspaceLifecycleSnapshot::fresh_local(TabKind::Workspace),
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"terminalId\":\"abc-123\""), "got {json}");
+        assert!(json.contains("\"tabId\":null"), "got {json}");
         assert!(json.contains("\"snapshot\":"), "got {json}");
         assert!(json.contains("\"tabKind\":\"Workspace\""), "got {json}");
+    }
+
+    /// Placeholder envelopes ride `terminal_id = null + tab_id =
+    /// Some(...)` on the wire. The frontend hook keys its
+    /// "resolved tab" decision on `terminal_id !== null`, so the
+    /// shape must serialize literally; any accidental `Some` would
+    /// poison `terminalIdByTabId` with a synthetic id.
+    #[test]
+    fn lifecycle_update_event_serializes_placeholder_with_null_terminal_id() {
+        let event = LifecycleUpdateEvent {
+            terminal_id: None,
+            tab_id: Some("workspace-uuid".into()),
+            snapshot: WorkspaceLifecycleSnapshot::fresh_local(TabKind::Workspace),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"terminalId\":null"), "got {json}");
+        assert!(
+            json.contains("\"tabId\":\"workspace-uuid\""),
+            "got {json}"
+        );
     }
 
     #[test]
