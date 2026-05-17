@@ -372,7 +372,13 @@ mod tests {
             let id = Uuid::new_v4();
             let (tx, _rx) = mpsc::channel::<terminal_mesh_core::ActorCommand>(1);
             let buf = Arc::new(StdMutex::new(body));
-            terminal_registry.record(id, tx, buf, Some(tab_id));
+            terminal_registry.record(
+                id,
+                tx,
+                buf,
+                Some(tab_id),
+                crate::workspace_lifecycle::TabKind::Workspace,
+            );
         }
 
         // Mint the privileged orchestrator capability.
@@ -553,7 +559,13 @@ mod tests {
         let buf = Arc::new(StdMutex::new("WORKSPACE_TAB_OUTPUT".into()));
         state
             .terminal_registry
-            .record(extra_terminal_id, tx, buf, Some(extra_tab_id.clone()));
+            .record(
+                extra_terminal_id,
+                tx,
+                buf,
+                Some(extra_tab_id.clone()),
+                crate::workspace_lifecycle::TabKind::Workspace,
+            );
 
         // Orchestrator reads the new workspace tab end-to-end.
         let params = json!({
@@ -581,7 +593,13 @@ mod tests {
         let buf = Arc::new(StdMutex::new("UNINDEXED".into()));
         state
             .terminal_registry
-            .record(no_tab_terminal_id, tx, buf, None);
+            .record(
+                no_tab_terminal_id,
+                tx,
+                buf,
+                None,
+                crate::workspace_lifecycle::TabKind::Workspace,
+            );
 
         // The orchestrator tries to address it by the OLD (terminal_id)
         // value as a "tab_id". Since the tab_index is empty for it,

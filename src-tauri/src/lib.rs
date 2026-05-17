@@ -19,6 +19,7 @@ mod plugin_sqlite;
 mod secrets;
 mod sidecar_manager;
 mod terminal_mesh;
+mod workspace_lifecycle;
 mod workspaces;
 
 use bootstrap::{BootstrapError, BootstrapPaths};
@@ -450,6 +451,7 @@ pub fn run() {
             terminal_mesh::terminal_shutdown,
             terminal_mesh::terminal_scrollback,
             terminal_mesh::terminal_mesh_cross_tab_read_scrollback,
+            terminal_mesh::workspace_lifecycle_snapshot,
             workspaces::list_workspaces,
             workspaces::create_workspace,
             workspaces::register_workspace,

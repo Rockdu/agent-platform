@@ -307,7 +307,13 @@ pub(crate) fn spawn_orchestrator_claude(
         rows: 30,
     };
 
-    match spawn_into_registry(spec, app, registry, Some(tab_id.clone())) {
+    match spawn_into_registry(
+        spec,
+        app,
+        registry,
+        Some(tab_id.clone()),
+        crate::workspace_lifecycle::TabKind::Orchestrator,
+    ) {
         Ok(terminal_id) => {
             // task21 / AC-3.3: mint the orchestrator's privileged
             // `terminal-mesh` mount with `cross_tab_read_flag = true`.
@@ -678,7 +684,13 @@ mod tests {
         // a no-op channel + scrollback for the contains() check.
         let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
         let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        registry.record(live_id, command_tx, scrollback, None);
+        registry.record(
+            live_id,
+            command_tx,
+            scrollback,
+            None,
+            crate::workspace_lifecycle::TabKind::Orchestrator,
+        );
 
         let discovery = DiscoveryCache::empty();
         let status = resolve_status(&state, &discovery, &registry);

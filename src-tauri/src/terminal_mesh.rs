@@ -21,6 +21,8 @@ use terminal_mesh_core::{
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::workspace_lifecycle::{TabKind, WorkspaceLifecycleSnapshot};
+
 /// Maximum scrollback retained in-memory per terminal so the frontend
 /// can ask `terminal_scrollback` to restore content on tab remount.
 /// Bounded to keep the registry from drifting unbounded over the
@@ -134,6 +136,11 @@ struct TerminalSession {
     /// `OrchestratorSession::tab_id` for the orchestrator). Used by
     /// the host RPC bridge to resolve `target_tab_id → terminal_id`.
     tab_id: Option<String>,
+    /// Host-side lifecycle snapshot used by the inner-rail Running/Done
+    /// queue, `terminal_mesh.list_tabs`, and the orchestrator-isolation
+    /// auth filter. Mutated under `Arc<Mutex<...>>` by the notification
+    /// path; the read path clones it out for serialization.
+    snapshot: Arc<StdMutex<WorkspaceLifecycleSnapshot>>,
 }
 
 /// Tauri-managed registry of live terminal sessions.
@@ -171,20 +178,69 @@ impl TerminalMeshRegistry {
         command_tx: mpsc::Sender<ActorCommand>,
         scrollback: Arc<StdMutex<String>>,
         tab_id: Option<String>,
+        tab_kind: TabKind,
     ) {
         let mut guard = self.inner.lock().expect("TerminalMeshRegistry poisoned");
         if let Some(t) = tab_id.as_deref() {
             let mut idx = self.tab_index.lock().expect("TerminalMeshRegistry tab_index poisoned");
             idx.insert(t.to_string(), id);
         }
+        let snapshot = Arc::new(StdMutex::new(
+            WorkspaceLifecycleSnapshot::fresh_local(tab_kind),
+        ));
         guard.insert(
             id,
             TerminalSession {
                 command_tx,
                 scrollback,
                 tab_id,
+                snapshot,
             },
         );
+    }
+
+    /// Clone-return the lifecycle snapshot for `terminal_id`. The
+    /// inner-rail polls this on mount and after every
+    /// `lifecycle://updated` event.
+    pub fn snapshot_for_terminal(
+        &self,
+        terminal_id: Uuid,
+    ) -> Option<WorkspaceLifecycleSnapshot> {
+        let guard = self.inner.lock().expect("TerminalMeshRegistry poisoned");
+        guard.get(&terminal_id).map(|s| {
+            s.snapshot
+                .lock()
+                .expect("snapshot mutex poisoned")
+                .clone()
+        })
+    }
+
+    /// Tab-id-keyed snapshot lookup. Returns `None` during the brief
+    /// window between workspace creation and registry insertion (the
+    /// frontend gracefully degrades to a Running placeholder).
+    pub fn snapshot_for_tab(&self, tab_id: &str) -> Option<WorkspaceLifecycleSnapshot> {
+        let terminal_id = self.lookup_terminal_by_tab(tab_id)?;
+        self.snapshot_for_terminal(terminal_id)
+    }
+
+    /// Apply `mutator` to the snapshot under the lock and return the
+    /// updated value. The notification path is the only writer today;
+    /// it calls `emit_lifecycle_updated` with the returned snapshot.
+    /// Returns `None` if `terminal_id` is not registered.
+    #[allow(dead_code)]
+    pub fn update_snapshot<F>(
+        &self,
+        terminal_id: Uuid,
+        mutator: F,
+    ) -> Option<WorkspaceLifecycleSnapshot>
+    where
+        F: FnOnce(&mut WorkspaceLifecycleSnapshot),
+    {
+        let guard = self.inner.lock().expect("TerminalMeshRegistry poisoned");
+        let session = guard.get(&terminal_id)?;
+        let mut snap = session.snapshot.lock().expect("snapshot mutex poisoned");
+        mutator(&mut snap);
+        Some(snap.clone())
     }
 
     pub fn lookup_command_tx(&self, id: Uuid) -> Option<mpsc::Sender<ActorCommand>> {
@@ -315,7 +371,7 @@ pub async fn terminal_spawn(
         rows,
     };
 
-    let terminal_id = spawn_into_registry(spec, &app, &registry, req.tab_id)
+    let terminal_id = spawn_into_registry(spec, &app, &registry, req.tab_id, TabKind::Workspace)
         .map_err(|e| TerminalMeshErrorDto::from(&e))?;
     Ok(TerminalSpawnResponse {
         terminal_id: terminal_id.to_string(),
@@ -337,6 +393,7 @@ pub(crate) fn spawn_into_registry(
     app: &AppHandle,
     registry: &TerminalMeshRegistry,
     tab_id: Option<String>,
+    tab_kind: TabKind,
 ) -> Result<Uuid, TerminalMeshError> {
     let handle = TerminalActor::spawn_local(spec).map_err(TerminalMeshError::from)?;
     let TerminalHandle {
@@ -346,7 +403,7 @@ pub(crate) fn spawn_into_registry(
         status_rx,
     } = handle;
     let scrollback = Arc::new(StdMutex::new(String::new()));
-    registry.record(id, command_tx, scrollback.clone(), tab_id);
+    registry.record(id, command_tx, scrollback.clone(), tab_id, tab_kind);
 
     let app_for_events = app.clone();
     let scrollback_for_events = scrollback.clone();
@@ -736,6 +793,18 @@ pub fn terminal_mesh_cross_tab_read_scrollback(
     .map_err(|e| TerminalMeshErrorDto::from(&e))
 }
 
+/// Look up the host-side lifecycle snapshot for a workspace tab. The
+/// inner-rail polls this on mount and after every `lifecycle://updated`
+/// event; returns `None` when the tab has no live session (e.g. during
+/// the brief window between workspace create and registry insert).
+#[tauri::command]
+pub fn workspace_lifecycle_snapshot(
+    tab_id: String,
+    registry: State<'_, TerminalMeshRegistry>,
+) -> Result<Option<WorkspaceLifecycleSnapshot>, TerminalMeshErrorDto> {
+    Ok(registry.snapshot_for_tab(&tab_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,7 +816,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(String::new()));
-        r.record(id, tx.clone(), buf.clone(), None);
+        r.record(id, tx.clone(), buf.clone(), None, TabKind::Workspace);
         assert!(r.lookup_command_tx(id).is_some());
         assert!(r.lookup_scrollback(id).is_some());
         assert_eq!(r.active_count(), 1);
@@ -757,13 +826,110 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_initialized_on_record_with_workspace_kind() {
+        let r = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let buf = StdArc::new(StdMutex::new(String::new()));
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        r.record(id, tx, buf, None, TabKind::Workspace);
+        let snap = r.snapshot_for_terminal(id).expect("snapshot present");
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert!(matches!(snap.tab_kind, TabKind::Workspace));
+        assert!(matches!(
+            snap.transport_kind,
+            crate::workspace_lifecycle::TransportKind::Local
+        ));
+        assert!(matches!(
+            snap.status,
+            crate::workspace_lifecycle::TabStatus::Running
+        ));
+        assert!(snap.done_reason.is_none());
+        assert!(snap.workspace_id.is_none());
+        assert!(snap.last_activity_at_unix_ms >= before);
+        assert!(snap.last_activity_at_unix_ms <= after);
+    }
+
+    #[test]
+    fn snapshot_initialized_with_orchestrator_kind_when_specified() {
+        let r = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let buf = StdArc::new(StdMutex::new(String::new()));
+        r.record(id, tx, buf, None, TabKind::Orchestrator);
+        let snap = r.snapshot_for_terminal(id).expect("snapshot present");
+        assert!(matches!(snap.tab_kind, TabKind::Orchestrator));
+    }
+
+    #[test]
+    fn snapshot_lookup_by_tab_id_returns_recorded_state() {
+        let r = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let buf = StdArc::new(StdMutex::new(String::new()));
+        r.record(
+            id,
+            tx,
+            buf,
+            Some("tab-snapshot".into()),
+            TabKind::Workspace,
+        );
+        assert!(r.snapshot_for_tab("tab-snapshot").is_some());
+        assert!(r.snapshot_for_tab("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn update_snapshot_mutates_in_place_and_returns_new_state() {
+        use crate::workspace_lifecycle::{DoneReason, TabStatus};
+        let r = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let buf = StdArc::new(StdMutex::new(String::new()));
+        r.record(id, tx, buf, None, TabKind::Workspace);
+
+        let after_update = r
+            .update_snapshot(id, |snap| {
+                snap.status = TabStatus::Done;
+                snap.done_reason = Some(DoneReason::CleanCompletion);
+                snap.last_activity_at_unix_ms = 1_700_000_000_000;
+            })
+            .expect("mutator runs");
+        assert!(matches!(after_update.status, TabStatus::Done));
+        assert!(matches!(
+            after_update.done_reason,
+            Some(DoneReason::CleanCompletion)
+        ));
+        assert_eq!(after_update.last_activity_at_unix_ms, 1_700_000_000_000);
+
+        let reread = r.snapshot_for_terminal(id).expect("present");
+        assert!(matches!(reread.status, TabStatus::Done));
+        assert!(matches!(
+            reread.done_reason,
+            Some(DoneReason::CleanCompletion)
+        ));
+    }
+
+    #[test]
+    fn update_snapshot_returns_none_for_unknown_terminal() {
+        let r = TerminalMeshRegistry::new();
+        let result = r.update_snapshot(Uuid::new_v4(), |_| panic!("should not run"));
+        assert!(result.is_none());
+    }
+
+    #[test]
     fn terminal_registry_contains_returns_false_after_forget() {
         let r = TerminalMeshRegistry::new();
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(String::new()));
         assert!(!r.contains(id), "unknown id must report not-contained");
-        r.record(id, tx, buf, None);
+        r.record(id, tx, buf, None, TabKind::Workspace);
         assert!(r.contains(id), "after record, contains true");
         r.forget(id);
         assert!(!r.contains(id), "after forget, contains false");
@@ -866,7 +1032,7 @@ mod tests {
                 ..
             } = handle;
             let scrollback = StdArc::new(StdMutex::new(String::new()));
-            registry.record(id, command_tx.clone(), scrollback, None);
+            registry.record(id, command_tx.clone(), scrollback, None, TabKind::Workspace);
             keepalive_receivers.push(events_rx);
             keepalive_statuses.push(status_rx);
             command_txs.push((id, command_tx));
@@ -906,7 +1072,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(body.to_string()));
-        registry.record(id, tx, buf, None);
+        registry.record(id, tx, buf, None, TabKind::Workspace);
         (registry, id)
     }
 
@@ -920,7 +1086,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(body.to_string()));
-        registry.record(id, tx, buf, Some(tab_id.to_string()));
+        registry.record(id, tx, buf, Some(tab_id.to_string()), TabKind::Workspace);
         (registry, id)
     }
 

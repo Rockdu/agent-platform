@@ -311,17 +311,17 @@ async fn processor_task(
                     }
                     Some(ActorCommand::Shutdown) => {
                         shutdown_requested = true;
-                        // Step 1 (graceful): SIGHUP on Unix via the
-                        // pre-extracted shutdown handle. A well-behaved
-                        // child unwinds and exits; the wait thread then
-                        // resolves `exit_rx`.
+                        // Cooperative shutdown first — SIGHUP on Unix
+                        // via the pre-extracted handle. A well-behaved
+                        // child unwinds and exits, and the wait thread
+                        // then resolves `exit_rx` on its own.
                         if let Err(e) = shutdown_handle.shutdown(ShutdownMode::Graceful) {
                             tracing::warn!(%terminal_id, %e, "graceful shutdown failed");
                         }
-                        // Step 2 (escalation): if exit_rx hasn't
-                        // resolved within the grace window, the next
-                        // select arm sends a hard kill via the same
-                        // handle.
+                        // Arm the escalation deadline; if `exit_rx`
+                        // does not resolve within the grace window,
+                        // the dedicated select arm below sends a hard
+                        // kill via the same handle.
                         if escalation_deadline.is_none() && !exit_observed {
                             escalation_deadline = Some(
                                 tokio::time::Instant::now() + ESCALATE_TO_SIGKILL_AFTER,
@@ -506,6 +506,10 @@ async fn emit_attention(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::transport::{
+        Transport, TransportError, TransportSession, TransportSpawnRequest,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     fn shell_spec(script: &str) -> TerminalSpec {
@@ -911,5 +915,55 @@ mod tests {
         for j in joins {
             assert!(j.await.unwrap(), "concurrent actor missed its Completion");
         }
+    }
+
+    /// A test-only transport whose `spawn` always returns a known error.
+    /// Proves the actor surfaces the injected transport error without
+    /// silently falling back to `LocalTransport`.
+    struct FailingTransport {
+        spawn_calls: Arc<AtomicUsize>,
+    }
+
+    impl Transport for FailingTransport {
+        fn spawn(
+            &self,
+            _request: TransportSpawnRequest,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
+            self.spawn_calls.fetch_add(1, Ordering::SeqCst);
+            Err(TransportError::SpawnFailed {
+                program: "/test/injected".into(),
+                message: "injected-failure".into(),
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actor_propagates_injected_transport_spawn_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let transport: Arc<dyn Transport> = Arc::new(FailingTransport {
+            spawn_calls: calls.clone(),
+        });
+
+        let result = TerminalActor::spawn(transport, shell_spec("echo should-not-run"));
+
+        match result {
+            Err(ActorError::Pty(msg)) => {
+                assert!(
+                    msg.contains("injected-failure"),
+                    "expected injected error text to survive into ActorError, got {msg:?}"
+                );
+                assert!(
+                    msg.contains("/test/injected"),
+                    "expected injected program path to survive into ActorError, got {msg:?}"
+                );
+            }
+            Err(other) => panic!("expected ActorError::Pty(...), got {other:?}"),
+            Ok(_) => panic!("expected Err, got Ok(TerminalHandle) — local fallback occurred"),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "injected transport spawn must be called exactly once (no local fallback)"
+        );
     }
 }
