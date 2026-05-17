@@ -231,12 +231,34 @@
   background: #1e1e1e;
   position: relative;
 }
-.terminal-mesh-view,
-.terminal-mesh-view__xterm {
-  height: 100%;
-  width: 100%;
+/* Every open tab's TerminalMeshView stays mounted as an absolutely
+   positioned panel so its PTY survives tab switches. Inactive panels
+   are hidden via `display: none` so xterm doesn't try to render
+   anything while not visible — `--active` toggles visibility. */
+.terminal-mesh-view {
+  position: absolute;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+}
+.terminal-mesh-view--active {
+  display: flex;
+}
+.terminal-mesh-view__status-strip {
+  display: flex;
+  align-items: center;
+  padding: 4px 8px;
+  background: #252525;
+  color: #b8b8b8;
+  font-size: 12px;
+  border-bottom: 1px solid #1a1a1a;
+}
+.terminal-mesh-view__status-label {
+  font-variant-numeric: tabular-nums;
 }
 .terminal-mesh-view__xterm {
+  flex: 1;
+  width: 100%;
   padding: 4px;
   box-sizing: border-box;
 }

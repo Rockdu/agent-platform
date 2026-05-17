@@ -795,10 +795,13 @@ function BootstrapDebugCard({ state }: { state: BootstrapState }) {
 }
 
 function MultiTerminalContainer() {
-  // Each tab owns its own React key so unmounting frees the xterm.js
-  // instance + triggers `terminal_shutdown` via TerminalMeshView's
-  // useEffect cleanup. Workspace binding (task17) will replace this
-  // local key array with persisted workspace tab IDs.
+  // ALL open tabs stay mounted so their PTYs survive switching
+  // (AC-4.1 ≥4 PTYs HARD at the UI layer). Closing a tab removes it
+  // from the array → React unmounts ONE TerminalMeshView →
+  // useEffect cleanup fires terminal_shutdown exactly once. Switching
+  // tabs only changes `active`, which the panel uses for visibility.
+  // Workspace binding (task17) will replace the local key array with
+  // persisted workspace tab IDs.
   const [tabs, setTabs] = useState<Array<{ id: string; label: string }>>([
     { id: `term-${Date.now()}-0`, label: "终端 1" },
   ]);
@@ -826,7 +829,10 @@ function MultiTerminalContainer() {
     [active],
   );
 
-  const activeTab = tabs.find((t) => t.id === active) ?? tabs[0] ?? null;
+  // Derive a final "currently active" id that defaults to the last
+  // remaining tab when the active tab was just closed.
+  const activeId =
+    tabs.find((t) => t.id === active)?.id ?? tabs[tabs.length - 1]?.id ?? null;
 
   return (
     <section className="terminal-mesh-container">
@@ -836,9 +842,9 @@ function MultiTerminalContainer() {
             key={t.id}
             type="button"
             role="tab"
-            aria-selected={active === t.id}
+            aria-selected={activeId === t.id}
             className={`terminal-mesh-container__tab ${
-              active === t.id ? "terminal-mesh-container__tab--active" : ""
+              activeId === t.id ? "terminal-mesh-container__tab--active" : ""
             }`}
             onClick={() => setActive(t.id)}
           >
@@ -865,13 +871,14 @@ function MultiTerminalContainer() {
         </button>
       </nav>
       <div className="terminal-mesh-container__body">
-        {activeTab ? (
-          <TerminalMeshView key={activeTab.id} />
-        ) : (
+        {tabs.length === 0 && (
           <section className="placeholder">
             <p>所有终端已关闭。点击 “+ 新终端” 创建。</p>
           </section>
         )}
+        {tabs.map((t) => (
+          <TerminalMeshView key={t.id} active={activeId === t.id} />
+        ))}
       </div>
     </section>
   );

@@ -15,17 +15,36 @@ import {
 
 const INITIAL_SCROLLBACK_BYTES = 64 * 1024;
 
-export function TerminalMeshView() {
+export type TerminalRunStatus =
+  | { kind: "running" }
+  | { kind: "exited"; code: number | null }
+  | { kind: "cancelled" };
+
+export interface TerminalMeshViewProps {
+  /// Whether this terminal's panel is the currently visible tab. The
+  /// panel stays mounted regardless so the PTY survives tab switches
+  /// (AC-4.1 ≥4 PTYs HARD at the UI layer). Visibility is toggled
+  /// via CSS; on inactive→active transitions we re-run fit+resize so
+  /// xterm.js measures the now-visible container correctly.
+  active: boolean;
+}
+
+export function TerminalMeshView({ active }: TerminalMeshViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const terminalIdRef = useRef<string | null>(null);
+  const disposedRef = useRef(false);
+  const wasActiveRef = useRef(false);
   const [error, setError] = useState<TerminalMeshErrorDto | null>(null);
   const [ready, setReady] = useState(false);
+  const [status, setStatus] = useState<TerminalRunStatus>({ kind: "running" });
 
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
+    // Closure-local cancellation flag. Mirrored to disposedRef so the
+    // async event handler can also bail when the component is gone.
     let cancelled = false;
     let unlisten: (() => void) | null = null;
 
@@ -38,7 +57,12 @@ export function TerminalMeshView() {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(container);
-    fit.fit();
+    try {
+      fit.fit();
+    } catch {
+      // Hidden container at first paint can throw; safe to ignore —
+      // the activation-effect below will retry once visible.
+    }
     termRef.current = term;
     fitRef.current = fit;
 
@@ -48,6 +72,9 @@ export function TerminalMeshView() {
           cols: term.cols,
           rows: term.rows,
         });
+        // Recheck after each await: if the component unmounted while
+        // the await was in flight, shut the just-spawned terminal
+        // down immediately and bail.
         if (cancelled) {
           await shutdownTerminal(terminalId).catch(() => {});
           return;
@@ -59,16 +86,31 @@ export function TerminalMeshView() {
             terminalId,
             INITIAL_SCROLLBACK_BYTES,
           );
+          if (cancelled || disposedRef.current) return;
           if (scrollback) term.write(scrollback);
         } catch {
           // Best-effort restore; ignore failures.
         }
 
-        unlisten = await subscribeTerminalEvents(terminalId, (env) =>
-          handleEvent(env, term),
+        const resolvedUnlisten = await subscribeTerminalEvents(
+          terminalId,
+          (env) => {
+            // Guard against disposed terminals (close/switch raced
+            // the in-flight listen()).
+            if (disposedRef.current) return;
+            handleEvent(env, term, setStatus);
+          },
         );
+        if (cancelled || disposedRef.current) {
+          // Cleanup already ran; immediately drop the just-installed
+          // listener instead of leaking it.
+          resolvedUnlisten();
+          return;
+        }
+        unlisten = resolvedUnlisten;
         setReady(true);
       } catch (err) {
+        if (cancelled || disposedRef.current) return;
         if (isTerminalMeshErrorDto(err)) setError(err);
         else
           setError({
@@ -83,7 +125,11 @@ export function TerminalMeshView() {
       const f = fitRef.current;
       const id = terminalIdRef.current;
       if (!f || !id) return;
-      f.fit();
+      try {
+        f.fit();
+      } catch {
+        return;
+      }
       void resizeTerminal(id, term.cols, term.rows).catch(() => {});
     };
     window.addEventListener("resize", onResize);
@@ -95,6 +141,7 @@ export function TerminalMeshView() {
 
     return () => {
       cancelled = true;
+      disposedRef.current = true;
       window.removeEventListener("resize", onResize);
       inputDisposable.dispose();
       if (unlisten) unlisten();
@@ -106,8 +153,41 @@ export function TerminalMeshView() {
     };
   }, []);
 
+  // Inactive→active transitions: re-fit and push the new size back
+  // to the actor. xterm doesn't measure correctly while hidden, so
+  // we deferred the initial fit; this effect makes sure the first
+  // visible paint sees the right cols/rows.
+  useEffect(() => {
+    if (!active) {
+      wasActiveRef.current = false;
+      return;
+    }
+    if (wasActiveRef.current) return;
+    wasActiveRef.current = true;
+    const f = fitRef.current;
+    const term = termRef.current;
+    const id = terminalIdRef.current;
+    if (!f || !term) return;
+    try {
+      f.fit();
+    } catch {
+      return;
+    }
+    if (id) {
+      void resizeTerminal(id, term.cols, term.rows).catch(() => {});
+    }
+  }, [active]);
+
   return (
-    <div className="terminal-mesh-view">
+    <div
+      className={`terminal-mesh-view ${active ? "terminal-mesh-view--active" : "terminal-mesh-view--hidden"}`}
+      data-terminal-active={active ? "true" : "false"}
+    >
+      <header className="terminal-mesh-view__status-strip" role="status">
+        <span className="terminal-mesh-view__status-label">
+          {renderStatusLabel(status)}
+        </span>
+      </header>
       {error && (
         <aside
           className="bootstrap-card bootstrap-card--error"
@@ -127,15 +207,37 @@ export function TerminalMeshView() {
   );
 }
 
-function handleEvent(envelope: TerminalEventEnvelope, term: Terminal): void {
+export function renderStatusLabel(status: TerminalRunStatus): string {
+  switch (status.kind) {
+    case "running":
+      return "运行中";
+    case "exited":
+      return status.code === null
+        ? "已退出"
+        : `已退出 (exit ${status.code})`;
+    case "cancelled":
+      return "已取消";
+  }
+}
+
+function handleEvent(
+  envelope: TerminalEventEnvelope,
+  term: Terminal,
+  setStatus: (s: TerminalRunStatus) => void,
+): void {
   switch (envelope.event.kind) {
     case "output":
       term.write(Uint8Array.from(envelope.event.bytes));
       break;
-    case "exit":
-      term.write("\r\n\x1b[2m[终端已退出]\x1b[0m\r\n");
+    case "exit": {
+      const code = envelope.event.code;
+      setStatus({ kind: "exited", code });
+      const codeLabel = code === null ? "exit ?" : `exit ${code}`;
+      term.write(`\r\n\x1b[2m[终端已退出 · ${codeLabel}]\x1b[0m\r\n`);
       break;
+    }
     case "cancelled":
+      setStatus({ kind: "cancelled" });
       term.write("\r\n\x1b[2m[终端已关闭]\x1b[0m\r\n");
       break;
     case "resize":
