@@ -73,6 +73,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-stronghold",
  "tempfile",
+ "terminal-mesh-core",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

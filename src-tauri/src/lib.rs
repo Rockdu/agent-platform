@@ -13,6 +13,7 @@ mod mcp_config;
 mod plugin_sqlite;
 mod secrets;
 mod sidecar_manager;
+mod terminal_mesh;
 
 use bootstrap::{BootstrapError, BootstrapPaths};
 use claude_discovery::DiscoveryCache;
@@ -21,6 +22,7 @@ use mcp_config::McpConfigRegistry;
 use plugin_sqlite::{run_all_plugin_migrations_at_bootstrap, PluginMigrationState};
 use secrets::{AccessTokenCache, SecretsErrorDto, SetupMarker, SetupStatus};
 use sidecar_manager::{SidecarConfig, SidecarManager};
+use terminal_mesh::TerminalMeshRegistry;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -182,6 +184,7 @@ pub fn run() {
         .manage(AccessTokenCache::new())
         .manage(DiscoveryCache::empty())
         .manage(McpConfigRegistry::new())
+        .manage(TerminalMeshRegistry::new())
         .manage({
             let mgr = std::sync::Arc::new(SidecarManager::new(SidecarConfig::production_defaults()));
             SidecarManager::install_self_arc(&mgr);
@@ -280,6 +283,11 @@ pub fn run() {
             claude_discovery::claude_set_path_override,
             mcp_config::generate_mcp_config,
             mcp_config::delete_mcp_config,
+            terminal_mesh::terminal_spawn,
+            terminal_mesh::terminal_write_stdin,
+            terminal_mesh::terminal_resize,
+            terminal_mesh::terminal_shutdown,
+            terminal_mesh::terminal_scrollback,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -27,6 +27,8 @@ import {
   type ClaudeDiscoveryStatus,
   type ClaudePathRecord,
 } from "./claude-discovery";
+import { TerminalMeshView } from "./TerminalMeshView";
+import "@xterm/xterm/css/xterm.css";
 import "./App.css";
 
 // Mirrors src-tauri/src/bootstrap.rs::BootstrapPaths
@@ -520,6 +522,9 @@ function PluginBody({
   diagnostics: SidecarBinaryDiagnostic[];
 }) {
   if (!registryEntry) {
+    if (pluginId === "static-terminal") {
+      return <MultiTerminalContainer />;
+    }
     // Static placeholder (MVP plugin not yet packaged as a manifest).
     const label = STATIC_PLACEHOLDERS.find((p) => p.id === pluginId)?.label ?? pluginId;
     return (
@@ -786,5 +791,88 @@ function BootstrapDebugCard({ state }: { state: BootstrapState }) {
       </dl>
       <p className="bootstrap-card__hint">调试卡，后续由插件健康面板替换。</p>
     </aside>
+  );
+}
+
+function MultiTerminalContainer() {
+  // Each tab owns its own React key so unmounting frees the xterm.js
+  // instance + triggers `terminal_shutdown` via TerminalMeshView's
+  // useEffect cleanup. Workspace binding (task17) will replace this
+  // local key array with persisted workspace tab IDs.
+  const [tabs, setTabs] = useState<Array<{ id: string; label: string }>>([
+    { id: `term-${Date.now()}-0`, label: "终端 1" },
+  ]);
+  const [active, setActive] = useState<string>(tabs[0]?.id ?? "");
+
+  const addTab = useCallback(() => {
+    const next = {
+      id: `term-${Date.now()}-${tabs.length}`,
+      label: `终端 ${tabs.length + 1}`,
+    };
+    setTabs((prev) => [...prev, next]);
+    setActive(next.id);
+  }, [tabs.length]);
+
+  const closeTab = useCallback(
+    (id: string) => {
+      setTabs((prev) => {
+        const remaining = prev.filter((t) => t.id !== id);
+        if (active === id && remaining.length > 0) {
+          setActive(remaining[remaining.length - 1].id);
+        }
+        return remaining;
+      });
+    },
+    [active],
+  );
+
+  const activeTab = tabs.find((t) => t.id === active) ?? tabs[0] ?? null;
+
+  return (
+    <section className="terminal-mesh-container">
+      <nav className="terminal-mesh-container__strip" role="tablist">
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            role="tab"
+            aria-selected={active === t.id}
+            className={`terminal-mesh-container__tab ${
+              active === t.id ? "terminal-mesh-container__tab--active" : ""
+            }`}
+            onClick={() => setActive(t.id)}
+          >
+            <span>{t.label}</span>
+            <span
+              role="button"
+              aria-label={`关闭 ${t.label}`}
+              className="terminal-mesh-container__close"
+              onClick={(e) => {
+                e.stopPropagation();
+                closeTab(t.id);
+              }}
+            >
+              ×
+            </span>
+          </button>
+        ))}
+        <button
+          type="button"
+          className="terminal-mesh-container__add"
+          onClick={addTab}
+        >
+          + 新终端
+        </button>
+      </nav>
+      <div className="terminal-mesh-container__body">
+        {activeTab ? (
+          <TerminalMeshView key={activeTab.id} />
+        ) : (
+          <section className="placeholder">
+            <p>所有终端已关闭。点击 “+ 新终端” 创建。</p>
+          </section>
+        )}
+      </div>
+    </section>
   );
 }

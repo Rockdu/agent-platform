@@ -814,6 +814,67 @@ mod tests {
         );
     }
 
+    /// Task16 stress proof for AC-4.1's ≥4 PTYs HARD requirement
+    /// under synthetic fast-output load: 8 actors each emit ~200
+    /// lines of output and reach Completion concurrently. Verifies
+    /// the actor architecture sustains realistic shell output across
+    /// more than the spec minimum simultaneously without dropping
+    /// events or hanging.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn eight_concurrent_actors_under_fast_output_load() {
+        let started = std::time::Instant::now();
+        let script = r#"i=1; while [ $i -le 200 ]; do printf 'line %d\n' $i; i=$((i+1)); done; exit 0"#;
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let h = TerminalActor::spawn(shell_spec(script)).expect("spawn");
+            let TerminalHandle {
+                mut events_rx,
+                command_tx,
+                ..
+            } = h;
+            joins.push(tokio::spawn(async move {
+                let _keep = command_tx;
+                let evs = collect_until(
+                    &mut events_rx,
+                    |e| matches!(
+                        e.event,
+                        TerminalEvent::NeedsAttention {
+                            payload: NeedsAttentionPayload {
+                                kind: AttentionKind::Completion { .. },
+                                ..
+                            },
+                        }
+                    ),
+                    5000,
+                )
+                .await;
+                let has_output = evs.iter().any(|e| matches!(e.event, TerminalEvent::Output { .. }));
+                let has_exit = evs.iter().any(|e| matches!(e.event, TerminalEvent::Exit { .. }));
+                let has_completion = evs.iter().any(|e| matches!(
+                    e.event,
+                    TerminalEvent::NeedsAttention {
+                        payload: NeedsAttentionPayload {
+                            kind: AttentionKind::Completion { exit_code: 0 },
+                            ..
+                        },
+                    }
+                ));
+                (has_output, has_exit, has_completion)
+            }));
+        }
+        for j in joins {
+            let (output, exit, completion) = j.await.unwrap();
+            assert!(output, "stress actor missed Output");
+            assert!(exit, "stress actor missed Exit");
+            assert!(completion, "stress actor missed Completion");
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "8-concurrent-PTY stress test must finish under 5s; took {elapsed:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn four_concurrent_actors_all_emit_completion() {
         let mut handles = Vec::new();

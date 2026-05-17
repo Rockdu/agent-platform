@@ -177,3 +177,66 @@
   font-size: 12px;
   word-break: break-all;
 }
+
+/* Terminal Mesh multi-tab container (task16). */
+.terminal-mesh-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+.terminal-mesh-container__strip {
+  display: flex;
+  gap: 4px;
+  padding: 6px 8px 0;
+  background: #2a2a2a;
+  border-bottom: 1px solid #1a1a1a;
+}
+.terminal-mesh-container__tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: #3a3a3a;
+  color: #ccc;
+  border: none;
+  border-radius: 4px 4px 0 0;
+  cursor: pointer;
+  font-size: 12px;
+}
+.terminal-mesh-container__tab--active {
+  background: #1e1e1e;
+  color: #fff;
+}
+.terminal-mesh-container__close {
+  display: inline-block;
+  padding: 0 4px;
+  color: #888;
+  cursor: pointer;
+}
+.terminal-mesh-container__close:hover {
+  color: #fff;
+}
+.terminal-mesh-container__add {
+  margin-left: auto;
+  padding: 4px 10px;
+  background: transparent;
+  color: #ccc;
+  border: 1px dashed #555;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.terminal-mesh-container__body {
+  flex: 1;
+  background: #1e1e1e;
+  position: relative;
+}
+.terminal-mesh-view,
+.terminal-mesh-view__xterm {
+  height: 100%;
+  width: 100%;
+}
+.terminal-mesh-view__xterm {
+  padding: 4px;
+  box-sizing: border-box;
+}
