@@ -41,12 +41,12 @@ export const DEFAULT_LIFECYCLE_SNAPSHOT: WorkspaceLifecycleSnapshot = {
  *
  * Exported separately so the prune logic is unit-testable without a
  * React renderer. Without this prune, closing and reopening the same
- * workspace (which reuses the `tab-${workspaceId}` tab id) leaves
- * the old terminal id in `knownByTabId`; the retry loop's "have I
- * resolved this tab yet?" check then short-circuits using the stale
- * id, and subsequent `lifecycle://updated` events for the new
- * terminal go to the unknown-id refetch branch which also skips the
- * tab as already-known.
+ * workspace (which reuses the bare-UUID workspaceId as tab id)
+ * leaves the old terminal id in `knownByTabId`; the retry loop's
+ * "have I resolved this tab yet?" check then short-circuits using
+ * the stale id, and subsequent `lifecycle://updated` events for the
+ * new terminal go to the unknown-id refetch branch which also skips
+ * the tab as already-known.
  */
 export function pruneStaleRefs(
   activeTabIds: ReadonlyArray<string>,
@@ -177,9 +177,10 @@ export function useWorkspaceLifecycleStatuses(
     seedDefaults();
     // Drop ref entries for tabs that were removed since the previous
     // effect cycle. Without this, a closed-then-reopened workspace
-    // (same `tab-${workspaceId}` tab id) keeps the old terminal id
-    // around and the retry/refetch paths short-circuit on the stale
-    // entry, leaving the reopened row stuck on the default snapshot.
+    // (same bare-UUID workspaceId reused as tab id) keeps the old
+    // terminal id around and the retry/refetch paths short-circuit
+    // on the stale entry, leaving the reopened row stuck on the
+    // default snapshot.
     pruneStaleRefs(
       targetTabIds,
       knownTerminalIdByTabIdRef.current,

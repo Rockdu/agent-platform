@@ -2,8 +2,8 @@
 // `useWorkspaceLifecycleStatuses` calls on every effect cycle to drop
 // terminal-id refs for tab ids that are no longer active. Without
 // this helper, a closed-then-reopened workspace (which reuses the
-// same `tab-${workspaceId}` tab id) keeps the old terminal id in the
-// known-by-tab map; the retry loop's "already known" check then
+// bare-UUID workspaceId as its tab id) keeps the old terminal id in
+// the known-by-tab map; the retry loop's "already known" check then
 // short-circuits using the stale id, and the row stays stuck on the
 // fallback Running snapshot.
 //

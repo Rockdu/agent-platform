@@ -3,6 +3,7 @@ import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import {
   createWorkspace,
   isWorkspaceErrorDto,
+  localPath,
   registerWorkspace,
   type WorkspaceErrorDto,
   type WorkspaceRecord,
@@ -379,6 +380,18 @@ function CreatePane(props: {
   );
 }
 
+function renderRemoteLocation(w: WorkspaceRecord): string {
+  if (w.location.kind !== "remote") return "";
+  const { ssh, container } = w.location;
+  const user = ssh.user ? `${ssh.user}@` : "";
+  const port = ssh.port ? `:${ssh.port}` : "";
+  const path = ssh.canonicalRemotePath ?? "";
+  const base = `ssh://${user}${ssh.host}${port}${path}`;
+  return container
+    ? `${base} (container ${container.containerId})`
+    : base;
+}
+
 function RecentPane(props: {
   workspaces: WorkspaceRecord[];
   openWorkspaceIds: Set<string>;
@@ -418,7 +431,9 @@ function RecentPane(props: {
                   </span>
                 )}
               </div>
-              <code className="workspace-switcher-modal__row-path">{w.path}</code>
+              <code className="workspace-switcher-modal__row-path">
+                {localPath(w) ?? renderRemoteLocation(w)}
+              </code>
               <div className="workspace-switcher-modal__row-meta">
                 <span>最近使用: {w.lastUsedAt}</span>
                 <span>创建: {w.createdAt}</span>
@@ -431,30 +446,39 @@ function RecentPane(props: {
               </div>
             </button>
             <div className="workspace-switcher-modal__row-actions">
-              <button
-                type="button"
-                className="workspace-switcher-modal__row-action"
-                onClick={(e) => {
-                  // Codex AC-4.6: row-level action buttons must NOT
-                  // also trigger the surrounding row open.
-                  e.stopPropagation();
-                  void onCursor(w.path);
-                }}
-                disabled={busy}
-              >
-                Cursor 中打开
-              </button>
-              <button
-                type="button"
-                className="workspace-switcher-modal__row-action"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  void onFinder(w.path);
-                }}
-                disabled={busy}
-              >
-                Finder 中显示
-              </button>
+              {(() => {
+                const p = localPath(w);
+                return (
+                  <>
+                    <button
+                      type="button"
+                      className="workspace-switcher-modal__row-action"
+                      onClick={(e) => {
+                        // Row-level action buttons must not also
+                        // trigger the surrounding row's open handler.
+                        e.stopPropagation();
+                        if (p) void onCursor(p);
+                      }}
+                      disabled={busy || p === null}
+                      title={p === null ? "远程工作区暂不支持 Cursor" : undefined}
+                    >
+                      Cursor 中打开
+                    </button>
+                    <button
+                      type="button"
+                      className="workspace-switcher-modal__row-action"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (p) void onFinder(p);
+                      }}
+                      disabled={busy || p === null}
+                      title={p === null ? "远程工作区暂不支持 Finder" : undefined}
+                    >
+                      Finder 中显示
+                    </button>
+                  </>
+                );
+              })()}
             </div>
           </div>
         </li>

@@ -4,6 +4,7 @@
 
 import {
   isWorkspaceErrorDto,
+  localPath,
   type WorkspaceErrorDto,
   type WorkspaceRecord,
 } from "../src/workspaces";
@@ -12,7 +13,10 @@ export function _probe_record_shape(r: WorkspaceRecord): string {
   return [
     r.workspaceId,
     r.name,
-    r.path,
+    localPath(r) ?? "<remote>",
+    r.location.kind,
+    String(r.profile.autoLaunchClaude),
+    r.profile.claudeArgv.join(","),
     r.createdAt,
     r.lastUsedAt,
     r.openTabId ?? "<closed>",
@@ -47,11 +51,12 @@ export function _probe_is_workspace_error_dto_narrows(): void {
 }
 
 // Object-literal probes — tsc places the error on the offending field.
-export function _probe_invalid_record_missing_path(): void {
-  // @ts-expect-error `path` is required on WorkspaceRecord
+export function _probe_invalid_record_missing_location(): void {
+  // @ts-expect-error `location` is required on WorkspaceRecord
   const r: WorkspaceRecord = {
     workspaceId: "u",
     name: "n",
+    profile: { autoLaunchClaude: true, claudeArgv: [] },
     createdAt: "2026-01-01T00:00:00Z",
     lastUsedAt: "2026-01-01T00:00:00Z",
     openTabId: null,
@@ -60,19 +65,48 @@ export function _probe_invalid_record_missing_path(): void {
   void r;
 }
 
-// task18 round-31 probe: conversationRoundsCount is required on the
-// wire shape (computed at command return time, never absent).
+// conversationRoundsCount is required on the wire shape (computed at
+// command return time, never absent).
 export function _probe_invalid_record_missing_conversation_count(): void {
   // @ts-expect-error `conversationRoundsCount` is required on WorkspaceRecord
   const r: WorkspaceRecord = {
     workspaceId: "u",
     name: "n",
-    path: "/tmp/x",
+    location: { kind: "local", path: "/tmp/x" },
+    profile: { autoLaunchClaude: true, claudeArgv: [] },
     createdAt: "2026-01-01T00:00:00Z",
     lastUsedAt: "2026-01-01T00:00:00Z",
     openTabId: null,
   };
   void r;
+}
+
+// Probe the Remote location shape: SSH variant, with and without
+// container.
+export function _probe_remote_location_round_trip(): void {
+  const remote: WorkspaceRecord = {
+    workspaceId: "u",
+    name: "n",
+    location: {
+      kind: "remote",
+      ssh: {
+        user: "alice",
+        host: "host.example",
+        port: 2222,
+        canonicalRemotePath: "/home/alice/work",
+      },
+      container: {
+        containerId: "ctr-7",
+        cwdInContainer: "/app",
+      },
+    },
+    profile: { autoLaunchClaude: false, claudeArgv: ["--print", "hi"] },
+    createdAt: "2026-01-01T00:00:00Z",
+    lastUsedAt: "2026-01-01T00:00:00Z",
+    openTabId: null,
+    conversationRoundsCount: 0,
+  };
+  void localPath(remote);
 }
 
 export function _probe_invalid_error_dto_kind(): void {

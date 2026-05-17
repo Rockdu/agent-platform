@@ -46,6 +46,7 @@ import {
   closeWorkspace,
   isWorkspaceErrorDto,
   listWorkspaces,
+  localPath,
   openWorkspace,
   type WorkspaceErrorDto,
   type WorkspaceRecord,
@@ -1330,7 +1331,7 @@ function MultiTerminalContainer() {
               tabId,
               workspaceId: refreshed.workspaceId,
               workspaceName: refreshed.name,
-              workspacePath: refreshed.path,
+              workspacePath: localPath(refreshed) ?? "",
             },
           ];
         });

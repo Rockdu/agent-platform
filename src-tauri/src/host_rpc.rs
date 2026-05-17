@@ -815,15 +815,18 @@ mod tests {
         // Seed the workspace registry with a known name + record a
         // tab whose workspace_id matches; assert the bridge response
         // carries the friendly name in workspaceName.
-        use crate::workspaces::WorkspaceRecord;
+        use crate::workspaces::{WorkspaceLocation, WorkspaceProfile, WorkspaceRecord};
         let orch_tab = make_uuid_tab_id();
-        let (mut state, _ws_tab_a, _ws_tab_b) = bridge_state_for_list_tabs(&orch_tab);
+        let (state, _ws_tab_a, _ws_tab_b) = bridge_state_for_list_tabs(&orch_tab);
 
         let real_ws_id = Uuid::new_v4();
         state.workspaces.insert_record_for_tests(WorkspaceRecord {
             workspace_id: real_ws_id,
             name: "Alice's Project".into(),
-            path: std::path::PathBuf::from("/tmp/alice"),
+            location: WorkspaceLocation::Local {
+                path: std::path::PathBuf::from("/tmp/alice"),
+            },
+            profile: WorkspaceProfile::default_local(),
             created_at: "2025-01-01T00:00:00Z".into(),
             last_used_at: "2025-01-01T00:00:00Z".into(),
             open_tab_id: None,

@@ -3,10 +3,36 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+export interface SshLocation {
+  user: string | null;
+  host: string;
+  port: number | null;
+  canonicalRemotePath: string | null;
+}
+
+export interface ContainerLocation {
+  containerId: string;
+  cwdInContainer: string | null;
+}
+
+export type WorkspaceLocation =
+  | { kind: "local"; path: string }
+  | {
+      kind: "remote";
+      ssh: SshLocation;
+      container: ContainerLocation | null;
+    };
+
+export interface WorkspaceProfile {
+  autoLaunchClaude: boolean;
+  claudeArgv: string[];
+}
+
 export interface WorkspaceRecord {
   workspaceId: string;
   name: string;
-  path: string;
+  location: WorkspaceLocation;
+  profile: WorkspaceProfile;
   createdAt: string;
   lastUsedAt: string;
   openTabId: string | null;
@@ -14,8 +40,17 @@ export interface WorkspaceRecord {
   /// scanning `<path>/.claude/` for `*.jsonl` files at command
   /// return time. NOT persisted in `workspaces.json` — purely
   /// computed for display. Always present on the wire (defaults
-  /// to 0 when `.claude/` is missing).
+  /// to 0 when `.claude/` is missing or the workspace is Remote).
   conversationRoundsCount: number;
+}
+
+/// Returns the local filesystem path for `Local` workspaces, or
+/// `null` for `Remote` workspaces. Frontend callers that previously
+/// read `workspace.path` migrate to this helper.
+export function localPath(workspace: WorkspaceRecord): string | null {
+  return workspace.location.kind === "local"
+    ? workspace.location.path
+    : null;
 }
 
 export type WorkspaceErrorDto =

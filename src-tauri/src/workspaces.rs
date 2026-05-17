@@ -20,12 +20,72 @@ use uuid::Uuid;
 const WORKSPACES_FILENAME: &str = "workspaces.json";
 const NAME_MAX_CHARS: usize = 64;
 
+/// Where a workspace lives. `Local` workspaces own a filesystem path
+/// the host can canonicalize and inode-check; `Remote` workspaces
+/// live behind an SSH endpoint (optionally inside a Docker container
+/// on the remote host) and are shell-only in v1.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum WorkspaceLocation {
+    Local { path: PathBuf },
+    Remote {
+        ssh: SshLocation,
+        #[serde(default)]
+        container: Option<ContainerLocation>,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SshLocation {
+    /// Defaults to the local user's username when `None`.
+    pub user: Option<String>,
+    pub host: String,
+    /// Canonicalizes to 22 when `None`.
+    pub port: Option<u16>,
+    /// Remote cwd used as the wrapper's `$AM_REMOTE_CWD`.
+    pub canonical_remote_path: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerLocation {
+    pub container_id: String,
+    pub cwd_in_container: Option<String>,
+}
+
+/// Per-workspace claude launch policy. The defaults match the
+/// product spec: auto-launch is opt-in but defaults ON, with
+/// `--dangerously-skip-permissions` as the argv. The launch
+/// scheduler reads these fields to decide whether and how to spawn
+/// claude on Local workspace open.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceProfile {
+    pub auto_launch_claude: bool,
+    pub claude_argv: Vec<String>,
+}
+
+impl WorkspaceProfile {
+    pub fn default_local() -> Self {
+        Self {
+            auto_launch_claude: true,
+            claude_argv: vec!["--dangerously-skip-permissions".to_string()],
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceRecord {
     pub workspace_id: Uuid,
     pub name: String,
-    pub path: PathBuf,
+    /// Where the workspace lives. Replaces the old flat `path` field
+    /// so SSH / Docker-over-SSH workspaces can be persisted alongside
+    /// Local ones.
+    pub location: WorkspaceLocation,
+    /// Launch policy (auto-launch claude + argv).
+    pub profile: WorkspaceProfile,
     pub created_at: String,
     pub last_used_at: String,
     pub open_tab_id: Option<String>,
@@ -34,9 +94,23 @@ pub struct WorkspaceRecord {
     /// return time. Computed, not persisted — `StoredWorkspaceRecord`
     /// excludes this field deliberately so the registry never
     /// becomes an authoritative cache. Defaults to 0 when `.claude/`
-    /// is missing or unreadable.
+    /// is missing or unreadable. For Remote workspaces this stays 0
+    /// (the host cannot scan a remote `.claude/` without a remote
+    /// agent, which is a v2 surface).
     #[serde(default)]
     pub conversation_rounds_count: u32,
+}
+
+impl WorkspaceRecord {
+    /// Filesystem path for Local workspaces, `None` for Remote.
+    /// Callers that previously read the flat `path` field migrate to
+    /// this helper.
+    pub fn local_path(&self) -> Option<&Path> {
+        match &self.location {
+            WorkspaceLocation::Local { path } => Some(path.as_path()),
+            WorkspaceLocation::Remote { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,11 +192,21 @@ impl From<&WorkspaceError> for WorkspaceErrorDto {
 /// JSON file. Separated from the wire `WorkspaceRecord` so the
 /// Tauri-IPC camelCase convention and the on-disk snake_case
 /// convention can evolve independently.
+///
+/// `location` and `profile` are written for every new record. The
+/// legacy `path` field is kept `Option<PathBuf>` for backward-
+/// compatible reads of legacy `workspaces.json` files (where `path`
+/// was the only location indicator). Writes leave `path = None`.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct StoredWorkspaceRecord {
     workspace_id: Uuid,
     name: String,
-    path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    location: Option<WorkspaceLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<WorkspaceProfile>,
     created_at: String,
     last_used_at: String,
     open_tab_id: Option<String>,
@@ -136,7 +220,9 @@ impl From<&WorkspaceRecord> for StoredWorkspaceRecord {
         Self {
             workspace_id: r.workspace_id,
             name: r.name.clone(),
-            path: r.path.clone(),
+            path: None,
+            location: Some(r.location.clone()),
+            profile: Some(r.profile.clone()),
             created_at: r.created_at.clone(),
             last_used_at: r.last_used_at.clone(),
             open_tab_id: r.open_tab_id.clone(),
@@ -144,21 +230,43 @@ impl From<&WorkspaceRecord> for StoredWorkspaceRecord {
     }
 }
 
-impl From<StoredWorkspaceRecord> for WorkspaceRecord {
-    fn from(s: StoredWorkspaceRecord) -> Self {
-        Self {
+/// Errors raised while migrating a single on-disk record into the
+/// live registry. Surfaced as warnings + record-drops at load time;
+/// the registry tolerates a corrupted entry by skipping it.
+#[derive(Debug, thiserror::Error)]
+enum StoredRecordMigrationError {
+    #[error("stored record `{workspace_id}` has neither `location` nor legacy `path`")]
+    MissingLocation { workspace_id: Uuid },
+}
+
+impl TryFrom<StoredWorkspaceRecord> for WorkspaceRecord {
+    type Error = StoredRecordMigrationError;
+
+    fn try_from(s: StoredWorkspaceRecord) -> Result<Self, Self::Error> {
+        let location = match (s.location, s.path) {
+            (Some(loc), _) => loc,
+            (None, Some(p)) => WorkspaceLocation::Local { path: p },
+            (None, None) => {
+                return Err(StoredRecordMigrationError::MissingLocation {
+                    workspace_id: s.workspace_id,
+                });
+            }
+        };
+        let profile = s.profile.unwrap_or_else(WorkspaceProfile::default_local);
+        Ok(Self {
             workspace_id: s.workspace_id,
             name: s.name,
-            path: s.path,
+            location,
+            profile,
             created_at: s.created_at,
             last_used_at: s.last_used_at,
             open_tab_id: s.open_tab_id,
             // Caller is expected to populate via
-            // `count_claude_conversation_rounds(&record.path)`
+            // `count_claude_conversation_rounds(record.local_path())`
             // before returning to the frontend; default 0 here so
             // an unpopulated record is still serializable.
             conversation_rounds_count: 0,
-        }
+        })
     }
 }
 
@@ -240,20 +348,34 @@ impl WorkspaceRegistry {
                 Ok(stored) => stored
                     .workspaces
                     .into_iter()
-                    .map(|s| {
-                        let mut r: WorkspaceRecord = s.into();
-                        // `open_tab_id` is RUNTIME state: a tab id
-                        // only has meaning within the lifetime of a
-                        // single frontend session. The disk slot is
-                        // preserved purely for diagnostics (what was
-                        // open at last shutdown); on load we clear
-                        // it so a fresh session starts with zero
-                        // workspace locks. This unblocks the
-                        // open-after-restart path that would
-                        // otherwise return `AlreadyOpen` for a stale
-                        // tab id from the previous launch.
-                        r.open_tab_id = None;
-                        (r.workspace_id, r)
+                    .filter_map(|s| {
+                        let workspace_id = s.workspace_id;
+                        match WorkspaceRecord::try_from(s) {
+                            Ok(mut r) => {
+                                // `open_tab_id` is RUNTIME state: a
+                                // tab id only has meaning within the
+                                // lifetime of a single frontend
+                                // session. The disk slot is preserved
+                                // purely for diagnostics (what was
+                                // open at last shutdown); on load we
+                                // clear it so a fresh session starts
+                                // with zero workspace locks. This
+                                // unblocks the open-after-restart
+                                // path that would otherwise return
+                                // `AlreadyOpen` for a stale tab id
+                                // from the previous launch.
+                                r.open_tab_id = None;
+                                Some((r.workspace_id, r))
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    %workspace_id,
+                                    %e,
+                                    "stored workspace record skipped during migration"
+                                );
+                                None
+                            }
+                        }
                     })
                     .collect(),
                 Err(e) => {
@@ -342,7 +464,10 @@ impl WorkspaceRegistry {
         // Sort descending by `last_used_at` (string-comparable RFC3339).
         out.sort_by(|a, b| b.last_used_at.cmp(&a.last_used_at));
         for r in out.iter_mut() {
-            r.conversation_rounds_count = count_claude_conversation_rounds(&r.path);
+            r.conversation_rounds_count = match r.local_path() {
+                Some(p) => count_claude_conversation_rounds(p),
+                None => 0,
+            };
         }
         out
     }
@@ -372,7 +497,10 @@ impl WorkspaceRegistry {
     /// every Tauri-command return path to keep the wire shape
     /// up-to-date without persisting the count.
     fn with_conversation_count(&self, mut record: WorkspaceRecord) -> WorkspaceRecord {
-        record.conversation_rounds_count = count_claude_conversation_rounds(&record.path);
+        record.conversation_rounds_count = match record.local_path() {
+            Some(p) => count_claude_conversation_rounds(p),
+            None => 0,
+        };
         record
     }
 
@@ -417,7 +545,8 @@ impl WorkspaceRegistry {
         let record = WorkspaceRecord {
             workspace_id: Uuid::new_v4(),
             name: name.to_string(),
-            path: canonical,
+            location: WorkspaceLocation::Local { path: canonical },
+            profile: WorkspaceProfile::default_local(),
             created_at: now.clone(),
             last_used_at: now,
             open_tab_id: None,
@@ -456,7 +585,8 @@ impl WorkspaceRegistry {
         let record = WorkspaceRecord {
             workspace_id: Uuid::new_v4(),
             name,
-            path: canonical,
+            location: WorkspaceLocation::Local { path: canonical },
+            profile: WorkspaceProfile::default_local(),
             created_at: now.clone(),
             last_used_at: now,
             open_tab_id: None,
@@ -527,10 +657,18 @@ impl RegistryInner {
     /// [`paths_refer_to_same_workspace`] so macOS APFS case-
     /// insensitive aliases and any residual symlink edge cases are
     /// rejected, not just byte-distinct canonical paths.
+    ///
+    /// Scoped to `WorkspaceLocation::Local` records only — Remote
+    /// workspaces don't share the local inode/dev namespace, so a
+    /// nominal-path collision between a Local and a Remote record is
+    /// not a real duplicate.
     fn find_duplicate(&self, candidate: &Path) -> Option<&WorkspaceRecord> {
-        self.records
-            .values()
-            .find(|r| paths_refer_to_same_workspace(&r.path, candidate))
+        self.records.values().find(|r| match &r.location {
+            WorkspaceLocation::Local { path } => {
+                paths_refer_to_same_workspace(path, candidate)
+            }
+            WorkspaceLocation::Remote { .. } => false,
+        })
     }
 }
 
@@ -751,7 +889,10 @@ mod tests {
         let record = WorkspaceRecord {
             workspace_id: id,
             name: name.into(),
-            path: std::path::PathBuf::from("/tmp/test-workspace"),
+            location: WorkspaceLocation::Local {
+                path: std::path::PathBuf::from("/tmp/test-workspace"),
+            },
+            profile: WorkspaceProfile::default_local(),
             created_at: "2025-01-01T00:00:00Z".into(),
             last_used_at: "2025-01-01T00:00:00Z".into(),
             open_tab_id: None,
@@ -849,10 +990,11 @@ mod tests {
         let target = home.path().join("AgentPlatform").join("workspaces").join("demo");
         assert!(target.is_dir());
         let canonical = std::fs::canonicalize(&target).unwrap();
-        assert_eq!(rec.path, canonical);
+        assert_eq!(rec.local_path(), Some(canonical.as_path()));
         assert_eq!(rec.name, "demo");
         assert_eq!(rec.open_tab_id, None);
         assert!(!target.join(".git").exists(), "no auto-git-init per spec");
+        assert_eq!(rec.profile, WorkspaceProfile::default_local());
     }
 
     #[test]
@@ -874,7 +1016,10 @@ mod tests {
         let canary = dir.join("README.md");
         std::fs::write(&canary, b"untouched").unwrap();
         let rec = reg.register_workspace(&dir).expect("register");
-        assert_eq!(rec.path, std::fs::canonicalize(&dir).unwrap());
+        assert_eq!(
+            rec.local_path(),
+            Some(std::fs::canonicalize(&dir).unwrap().as_path())
+        );
         // Verify the file is byte-identical (no copy/modification).
         let body = std::fs::read(&canary).unwrap();
         assert_eq!(body, b"untouched");
@@ -901,7 +1046,11 @@ mod tests {
         let (_storage, _home, reg) = fresh_registry();
         let created = reg.create_workspace("alpha").expect("create");
         // Try to register the same canonical path again.
-        let err = reg.register_workspace(&created.path).unwrap_err();
+        let created_path = created
+            .local_path()
+            .expect("local workspace has path")
+            .to_path_buf();
+        let err = reg.register_workspace(&created_path).unwrap_err();
         match err {
             WorkspaceError::CanonicalDuplicate {
                 existing_workspace_id,
@@ -1138,13 +1287,26 @@ mod tests {
             .and_then(|x| x.as_array())
             .expect("workspaces array");
         let entry = workspaces.first().expect("at least one record");
-        // snake_case keys required on disk:
-        for k in ["workspace_id", "name", "path", "created_at", "last_used_at", "open_tab_id"] {
+        // snake_case keys required on disk for the current shape:
+        for k in [
+            "workspace_id",
+            "name",
+            "location",
+            "profile",
+            "created_at",
+            "last_used_at",
+            "open_tab_id",
+        ] {
             assert!(
                 entry.get(k).is_some(),
                 "on-disk key `{k}` missing from {entry:?}"
             );
         }
+        // Legacy flat `path` field must not be written by current code:
+        assert!(
+            entry.get("path").is_none(),
+            "legacy flat `path` key leaked to disk in {entry:?}"
+        );
         // camelCase wire-only keys must not appear on disk:
         for k in ["workspaceId", "createdAt", "lastUsedAt", "openTabId"] {
             assert!(
@@ -1160,6 +1322,30 @@ mod tests {
                 "computed-only key `{k}` leaked to disk in {entry:?}"
             );
         }
+        // Location is tagged + nested correctly:
+        let loc = entry.get("location").expect("location present");
+        assert_eq!(
+            loc.get("kind").and_then(|x| x.as_str()),
+            Some("local"),
+            "default create yields Local location; got {loc:?}"
+        );
+        assert!(
+            loc.get("path").is_some(),
+            "Local location must carry `path`; got {loc:?}"
+        );
+        // Profile uses camelCase field names per #[serde(rename_all)]:
+        let prof = entry.get("profile").expect("profile present");
+        assert_eq!(
+            prof.get("autoLaunchClaude").and_then(|x| x.as_bool()),
+            Some(true),
+            "default profile auto-launch=true; got {prof:?}"
+        );
+        let argv = prof
+            .get("claudeArgv")
+            .and_then(|x| x.as_array())
+            .expect("claudeArgv array");
+        assert_eq!(argv.len(), 1);
+        assert_eq!(argv[0].as_str(), Some("--dangerously-skip-permissions"));
     }
 
     /// Codex round-30 task18 contract: helper returns 0 for a fresh
@@ -1195,7 +1381,10 @@ mod tests {
         let (_storage, _home, reg) = fresh_registry();
         let created = reg.create_workspace("counted").expect("create");
         // Seed two .jsonl files under the auto-created workspace.
-        let claude = created.path.join(".claude/projects/counted");
+        let claude = created
+            .local_path()
+            .expect("local workspace has path")
+            .join(".claude/projects/counted");
         std::fs::create_dir_all(&claude).unwrap();
         std::fs::write(claude.join("a.jsonl"), b"{}").unwrap();
         std::fs::write(claude.join("b.jsonl"), b"{}").unwrap();
@@ -1219,5 +1408,180 @@ mod tests {
         let listed = reg.list();
         assert_eq!(listed[0].workspace_id, b.workspace_id);
         assert_eq!(listed[1].workspace_id, a.workspace_id);
+    }
+
+    #[test]
+    fn workspace_profile_default_local_matches_spec() {
+        let p = WorkspaceProfile::default_local();
+        assert!(p.auto_launch_claude);
+        assert_eq!(p.claude_argv, vec!["--dangerously-skip-permissions"]);
+    }
+
+    /// Legacy on-disk records (only the flat `path` field) must
+    /// deserialize as `Local + default profile`. Verified by handing a
+    /// raw JSON blob to the registry loader and round-tripping through
+    /// `list()`.
+    #[test]
+    fn legacy_stored_record_without_location_migrates_to_local_with_default_profile() {
+        let storage = tempfile::TempDir::new().unwrap();
+        let workspaces_root = tempfile::TempDir::new().unwrap();
+        let id = Uuid::new_v4();
+        let blob = serde_json::json!({
+            "workspaces": [{
+                "workspace_id": id.to_string(),
+                "name": "legacy-ws",
+                "path": "/tmp/some-legacy-path",
+                "created_at": "2025-01-01T00:00:00Z",
+                "last_used_at": "2025-01-01T00:00:00Z",
+                "open_tab_id": null
+            }]
+        });
+        std::fs::write(
+            storage.path().join("workspaces.json"),
+            serde_json::to_vec_pretty(&blob).unwrap(),
+        )
+        .unwrap();
+
+        let reg = WorkspaceRegistry::load(
+            storage.path().to_path_buf(),
+            Some(workspaces_root.path().to_path_buf()),
+        );
+        let listed = reg.list();
+        assert_eq!(listed.len(), 1);
+        let rec = &listed[0];
+        assert_eq!(rec.workspace_id, id);
+        assert_eq!(rec.name, "legacy-ws");
+        assert_eq!(
+            rec.local_path(),
+            Some(std::path::Path::new("/tmp/some-legacy-path"))
+        );
+        assert_eq!(rec.profile, WorkspaceProfile::default_local());
+    }
+
+    /// A record carrying `location` + `profile` on disk should round-
+    /// trip through Stored serialize → deserialize without loss.
+    #[test]
+    fn stored_record_with_location_round_trips() {
+        let original = WorkspaceRecord {
+            workspace_id: Uuid::new_v4(),
+            name: "remote-demo".into(),
+            location: WorkspaceLocation::Remote {
+                ssh: SshLocation {
+                    user: Some("alice".into()),
+                    host: "host.example".into(),
+                    port: Some(2222),
+                    canonical_remote_path: Some("/home/alice/work".into()),
+                },
+                container: Some(ContainerLocation {
+                    container_id: "ctr-7".into(),
+                    cwd_in_container: Some("/app".into()),
+                }),
+            },
+            profile: WorkspaceProfile {
+                auto_launch_claude: false,
+                claude_argv: vec!["--print".into(), "hello".into()],
+            },
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_used_at: "2026-01-02T00:00:00Z".into(),
+            open_tab_id: None,
+            conversation_rounds_count: 0,
+        };
+        let stored: StoredWorkspaceRecord = (&original).into();
+        let json = serde_json::to_string(&stored).unwrap();
+        let parsed: StoredWorkspaceRecord = serde_json::from_str(&json).unwrap();
+        let restored: WorkspaceRecord = parsed.try_into().expect("migrate ok");
+        assert_eq!(restored.workspace_id, original.workspace_id);
+        assert_eq!(restored.name, original.name);
+        assert_eq!(restored.location, original.location);
+        assert_eq!(restored.profile, original.profile);
+        assert_eq!(restored.local_path(), None, "Remote has no local_path");
+    }
+
+    /// When both `location` and legacy `path` are present in a stored
+    /// blob, `location` wins. (Forward-only migration: new writes
+    /// drop `path`, so this only matters if a hand-edited file ends
+    /// up with both.)
+    #[test]
+    fn stored_record_location_takes_precedence_over_legacy_path() {
+        let id = Uuid::new_v4();
+        let blob = serde_json::json!({
+            "workspace_id": id.to_string(),
+            "name": "both",
+            "path": "/tmp/legacy",
+            "location": {"kind": "local", "path": "/tmp/new"},
+            "created_at": "2025-01-01T00:00:00Z",
+            "last_used_at": "2025-01-01T00:00:00Z",
+            "open_tab_id": null
+        });
+        let stored: StoredWorkspaceRecord = serde_json::from_value(blob).unwrap();
+        let rec: WorkspaceRecord = stored.try_into().expect("migrate ok");
+        assert_eq!(rec.local_path(), Some(std::path::Path::new("/tmp/new")));
+    }
+
+    /// A corrupted record with neither `location` nor legacy `path`
+    /// must fail migration; the loader logs + drops it rather than
+    /// inserting a malformed record.
+    #[test]
+    fn stored_record_without_location_or_path_fails_migration() {
+        let id = Uuid::new_v4();
+        let blob = serde_json::json!({
+            "workspace_id": id.to_string(),
+            "name": "corrupt",
+            "created_at": "2025-01-01T00:00:00Z",
+            "last_used_at": "2025-01-01T00:00:00Z",
+            "open_tab_id": null
+        });
+        let stored: StoredWorkspaceRecord = serde_json::from_value(blob).unwrap();
+        let err = WorkspaceRecord::try_from(stored).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoredRecordMigrationError::MissingLocation { workspace_id } if workspace_id == id
+            ),
+            "expected MissingLocation; got {err:?}"
+        );
+    }
+
+    /// Canonical-duplicate detection must skip `Remote` records so a
+    /// Remote SSH workspace whose nominal path happens to match a
+    /// Local path does not falsely block creation.
+    #[test]
+    fn canonical_duplicate_detection_skips_remote_records() {
+        let (_storage, home, reg) = fresh_registry();
+        // Seed a Remote record whose remote path string equals a real
+        // local path we'll then register.
+        let local_dir = home.path().join("shared-name");
+        std::fs::create_dir_all(&local_dir).unwrap();
+        let remote_id = Uuid::new_v4();
+        let remote_record = WorkspaceRecord {
+            workspace_id: remote_id,
+            name: "remote-shared-name".into(),
+            location: WorkspaceLocation::Remote {
+                ssh: SshLocation {
+                    user: None,
+                    host: "host.example".into(),
+                    port: None,
+                    canonical_remote_path: Some(
+                        local_dir.to_string_lossy().into_owned(),
+                    ),
+                },
+                container: None,
+            },
+            profile: WorkspaceProfile::default_local(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_used_at: "2026-01-01T00:00:00Z".into(),
+            open_tab_id: None,
+            conversation_rounds_count: 0,
+        };
+        reg.insert_record_for_tests(remote_record);
+
+        // Registering a Local workspace at the same nominal path must
+        // succeed (the Remote record is not a duplicate of a Local).
+        let local_rec = reg.register_workspace(&local_dir).expect("register local");
+        assert_ne!(local_rec.workspace_id, remote_id);
+        assert!(matches!(
+            local_rec.location,
+            WorkspaceLocation::Local { .. }
+        ));
     }
 }
