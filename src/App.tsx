@@ -29,7 +29,11 @@ import {
   type ClaudePathRecord,
 } from "./claude-discovery";
 import { TerminalMeshView } from "./TerminalMeshView";
-import { useWorkspaceLifecycleStatus } from "./use-workspace-lifecycle-status";
+import type { DoneReason, WorkspaceLifecycleSnapshot } from "./terminal-mesh";
+import {
+  DEFAULT_LIFECYCLE_SNAPSHOT,
+  useWorkspaceLifecycleStatuses,
+} from "./use-workspace-lifecycle-statuses";
 import {
   getOrchestratorStatus,
   isOrchestratorErrorDto,
@@ -994,7 +998,6 @@ interface OpenTab {
 type HostModal = "workspace-switcher" | null;
 
 type TransportKindHint = "Local" | "Ssh" | "SshDocker" | undefined;
-type TabStatusHint = "Running" | "Done" | undefined;
 
 function transportKindIcon(kind: TransportKindHint): string {
   switch (kind) {
@@ -1020,23 +1023,57 @@ function transportKindLabel(kind: TransportKindHint): string {
   }
 }
 
-function statusBadgeLabel(status: TabStatusHint): string {
-  return status === "Done" ? "Done" : "Running";
+interface DoneBadgeInfo {
+  label: string;
+  modifier: string; // CSS BEM modifier suffix without the leading "--"
+  tooltip?: string;
+}
+
+function doneReasonBadgeInfo(reason: DoneReason | null): DoneBadgeInfo {
+  if (reason === null) {
+    return { label: "Done", modifier: "done" };
+  }
+  switch (reason.kind) {
+    case "CleanCompletion":
+      return { label: "已完成", modifier: "clean-completion" };
+    case "NonZeroExit":
+      return { label: `退出 ${reason.code}`, modifier: "non-zero-exit" };
+    case "Disconnected":
+      return { label: "已断开", modifier: "disconnected" };
+    case "TaskComplete":
+      return {
+        label: "任务完成",
+        modifier: "task-complete",
+        tooltip: reason.summary,
+      };
+  }
 }
 
 interface WorkspaceRailRowProps {
   tab: OpenTab;
+  snapshot: WorkspaceLifecycleSnapshot;
   isActive: boolean;
   onSelect: (tabId: string) => void;
   onClose: (tabId: string) => void;
+  // When the row is in the Done section, the parent passes a resume
+  // handler that brings the tab back into focus; the first
+  // user-initiated keystroke (handled by Round-6's user_initiated
+  // stdin path) is what actually transitions the snapshot back to
+  // Running, so this click on its own does not mutate lifecycle.
+  doneAffordance?: () => void;
 }
 
 function WorkspaceRailRow(props: WorkspaceRailRowProps) {
-  const { tab, isActive, onSelect, onClose } = props;
-  const lifecycle = useWorkspaceLifecycleStatus(tab.tabId);
-  const icon = transportKindIcon(lifecycle.transportKind);
-  const transportLabel = transportKindLabel(lifecycle.transportKind);
-  const status = statusBadgeLabel(lifecycle.status);
+  const { tab, snapshot, isActive, onSelect, onClose, doneAffordance } = props;
+  const icon = transportKindIcon(snapshot.transportKind);
+  const transportLabel = transportKindLabel(snapshot.transportKind);
+  const isDone = snapshot.status === "Done";
+  const badge: DoneBadgeInfo = isDone
+    ? doneReasonBadgeInfo(snapshot.doneReason)
+    : { label: "Running", modifier: "running" };
+  const rowTitle = badge.tooltip
+    ? `${tab.workspacePath} — ${badge.tooltip}`
+    : tab.workspacePath;
   return (
     <div
       className={`terminal-mesh-container__rail-row ${
@@ -1056,16 +1093,28 @@ function WorkspaceRailRow(props: WorkspaceRailRowProps) {
         aria-selected={isActive}
         className="rail-row__label"
         onClick={() => onSelect(tab.tabId)}
-        title={tab.workspacePath}
+        title={rowTitle}
       >
         {tab.workspaceName}
       </button>
       <span
-        className={`rail-row__status-badge rail-row__status-badge--${status.toLowerCase()}`}
-        aria-label={`状态：${status}`}
+        className={`rail-row__status-badge rail-row__status-badge--${badge.modifier}`}
+        aria-label={`状态：${badge.label}`}
+        title={badge.tooltip}
       >
-        {status}
+        {badge.label}
       </span>
+      {doneAffordance && (
+        <button
+          type="button"
+          className="rail-row__resume"
+          onClick={doneAffordance}
+          aria-label={`聚焦 ${tab.workspaceName} 输入下一条指令`}
+          title="下一条指令"
+        >
+          下一条指令
+        </button>
+      )}
       <button
         type="button"
         className="terminal-mesh-container__close"
@@ -1075,6 +1124,81 @@ function WorkspaceRailRow(props: WorkspaceRailRowProps) {
         ×
       </button>
     </div>
+  );
+}
+
+interface RailSectionsProps {
+  tabs: OpenTab[];
+  activeId: string | null;
+  onSelect: (tabId: string) => void;
+  onClose: (tabId: string) => void;
+}
+
+function RailSections(props: RailSectionsProps) {
+  const { tabs, activeId, onSelect, onClose } = props;
+  const tabIds = tabs.map((t) => t.tabId);
+  const { snapshotByTabId } = useWorkspaceLifecycleStatuses(tabIds);
+
+  // Partition by snapshot status; filter to Workspace-kind tabs only
+  // so the orchestrator slot never leaks into the workspace rail —
+  // the orchestrator lives outside this container, but this defensive
+  // filter also covers any future routing that mounts an orchestrator-
+  // kind tab by accident.
+  const running: OpenTab[] = [];
+  const done: OpenTab[] = [];
+  for (const tab of tabs) {
+    const snap = snapshotByTabId[tab.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
+    if (snap.tabKind !== "Workspace") continue;
+    if (snap.status === "Done") {
+      done.push(tab);
+    } else {
+      running.push(tab);
+    }
+  }
+  // FIFO ordering: ascending by signal arrival timestamp. Tabs whose
+  // snapshot has not yet been fetched fall back to lastActivity = 0,
+  // sorting them to the top of Running — they will jump into position
+  // once the bootstrap fetch resolves.
+  const byActivity = (a: OpenTab, b: OpenTab): number => {
+    const sa = snapshotByTabId[a.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
+    const sb = snapshotByTabId[b.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
+    return sa.lastActivityAtUnixMs - sb.lastActivityAtUnixMs;
+  };
+  running.sort(byActivity);
+  done.sort(byActivity);
+
+  const renderRow = (tab: OpenTab, opts: { affordance: boolean }) => {
+    const snap = snapshotByTabId[tab.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
+    return (
+      <WorkspaceRailRow
+        key={tab.tabId}
+        tab={tab}
+        snapshot={snap}
+        isActive={activeId === tab.tabId}
+        onSelect={onSelect}
+        onClose={onClose}
+        doneAffordance={opts.affordance ? () => onSelect(tab.tabId) : undefined}
+      />
+    );
+  };
+
+  return (
+    <>
+      <section className="rail-section rail-section--running">
+        <header className="rail-section__header">
+          <span className="rail-section__label">运行区</span>
+          <span className="rail-section__count">{running.length}</span>
+        </header>
+        {running.map((t) => renderRow(t, { affordance: false }))}
+      </section>
+      <section className="rail-section rail-section--done">
+        <header className="rail-section__header">
+          <span className="rail-section__label">完成区</span>
+          <span className="rail-section__count">{done.length}</span>
+        </header>
+        {done.map((t) => renderRow(t, { affordance: true }))}
+      </section>
+    </>
   );
 }
 
@@ -1185,15 +1309,12 @@ function MultiTerminalContainer() {
         role="tablist"
         aria-orientation="vertical"
       >
-        {tabs.map((t) => (
-          <WorkspaceRailRow
-            key={t.tabId}
-            tab={t}
-            isActive={activeId === t.tabId}
-            onSelect={setActive}
-            onClose={(id) => void closeTab(id)}
-          />
-        ))}
+        <RailSections
+          tabs={tabs}
+          activeId={activeId}
+          onSelect={setActive}
+          onClose={(id) => void closeTab(id)}
+        />
         <button
           type="button"
           className="terminal-mesh-container__add"

@@ -300,6 +300,64 @@
   background: #616161;
   color: #fff;
 }
+.rail-row__status-badge--clean-completion {
+  background: #616161;
+  color: #fff;
+}
+.rail-row__status-badge--non-zero-exit {
+  background: #b71c1c;
+  color: #fff;
+}
+.rail-row__status-badge--disconnected {
+  background: #ef6c00;
+  color: #fff;
+}
+.rail-row__status-badge--task-complete {
+  background: #1565c0;
+  color: #fff;
+}
+.rail-row__resume {
+  flex: 0 0 auto;
+  background: transparent;
+  color: #aaa;
+  border: 1px solid #555;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 10px;
+  cursor: pointer;
+}
+.rail-row__resume:hover {
+  color: #fff;
+  border-color: #888;
+}
+.rail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.rail-section__header {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px 2px;
+  color: #888;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.rail-section__label {
+  flex: 1 1 auto;
+}
+.rail-section__count {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  background: #444;
+  color: #ccc;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 1.4;
+}
 .terminal-mesh-container__close {
   background: transparent;
   border: none;
