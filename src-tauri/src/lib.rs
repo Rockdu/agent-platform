@@ -4,16 +4,20 @@
 //! the mobile entry point both call `run()`.
 
 mod bootstrap;
+mod claude_discovery;
 mod dev_diagnostics;
 mod dispatcher;
 mod generated;
 mod logging;
+mod mcp_config;
 mod plugin_sqlite;
 mod secrets;
 mod sidecar_manager;
 
 use bootstrap::{BootstrapError, BootstrapPaths};
+use claude_discovery::DiscoveryCache;
 use dispatcher::MountRegistry;
+use mcp_config::McpConfigRegistry;
 use plugin_sqlite::{run_all_plugin_migrations_at_bootstrap, PluginMigrationState};
 use secrets::{AccessTokenCache, SecretsErrorDto, SetupMarker, SetupStatus};
 use sidecar_manager::{SidecarConfig, SidecarManager};
@@ -175,6 +179,8 @@ pub fn run() {
         .manage(MountRegistry::new())
         .manage(PluginMigrationState::new())
         .manage(AccessTokenCache::new())
+        .manage(DiscoveryCache::empty())
+        .manage(McpConfigRegistry::new())
         .manage({
             let mgr = std::sync::Arc::new(SidecarManager::new(SidecarConfig::production_defaults()));
             SidecarManager::install_self_arc(&mgr);
@@ -215,6 +221,36 @@ pub fn run() {
                             Ok(()) => tracing::info!(stronghold_root = %sg_root.display(), "stronghold-state dir ready"),
                             Err(err) => tracing::error!(%err, "stronghold-state dir create failed"),
                         }
+                        // Round 20 (task13): clean any stale per-tab MCP
+                        // config files left behind by the previous app
+                        // run BEFORE any new tab generates a config. The
+                        // conservative GC policy (delete all *.json
+                        // inside `${APP_DATA}/claude-mcp-configs/`) is
+                        // acceptable per spec when no `host-runtime.json`
+                        // PID metadata is available; task38 will replace
+                        // this with PID-correlated GC.
+                        mcp_config::startup_gc(app_data);
+
+                        // Round 20 (task13): run `claude` PATH discovery
+                        // once at bootstrap and cache the result so the
+                        // orchestrator placeholder can render the
+                        // onboarding card without polling. Failure does
+                        // NOT abort bootstrap; the cache stores the
+                        // typed error so the frontend can recover.
+                        if let Some(home) = directories::BaseDirs::new()
+                            .map(|b| b.home_dir().to_path_buf())
+                        {
+                            let cache = app.state::<DiscoveryCache>();
+                            let outcome = claude_discovery::validate_or_rediscover(&home, app_data);
+                            cache.store(match &outcome {
+                                Ok(r) => Ok(r.clone()),
+                                Err(e) => Err(claude_discovery::clone_error(e)),
+                            });
+                            match &outcome {
+                                Ok(rec) => tracing::info!(path = %rec.path.display(), "claude discovery ready"),
+                                Err(err) => tracing::warn!(%err, "claude discovery not found"),
+                            }
+                        }
                     }
                 }
                 Err(err) => tracing::error!(%err, "bootstrap failed"),
@@ -238,6 +274,11 @@ pub fn run() {
             sidecar_manager::retry_sidecar,
             sidecar_manager::shutdown_sidecar,
             sidecar_manager::spawn_sidecar_from_manifest,
+            claude_discovery::claude_discovery_status,
+            claude_discovery::claude_redo_discovery,
+            claude_discovery::claude_set_path_override,
+            mcp_config::generate_mcp_config,
+            mcp_config::delete_mcp_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

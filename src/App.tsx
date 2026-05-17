@@ -1,4 +1,4 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useState, type ComponentType, type LazyExoticComponent } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState, type ComponentType, type FormEvent, type LazyExoticComponent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { PLUGIN_TABS, type PluginTabEntry } from "./generated/plugin-tabs";
 import type {
@@ -17,6 +17,15 @@ import {
   spawnSidecarFromManifest,
   useSidecarStatus,
 } from "./use-sidecar-status";
+import {
+  getClaudeDiscoveryStatus,
+  isClaudeDiscoveryErrorDto,
+  redoClaudeDiscovery,
+  setClaudePathOverride,
+  type ClaudeDiscoveryErrorDto,
+  type ClaudeDiscoveryStatus,
+  type ClaudePathRecord,
+} from "./claude-discovery";
 import "./App.css";
 
 // Mirrors src-tauri/src/bootstrap.rs::BootstrapPaths
@@ -316,13 +325,194 @@ function TabButton(props: {
 }
 
 function OrchestratorPlaceholder() {
+  const [status, setStatus] = useState<ClaudeDiscoveryStatus | null>(null);
+  const [error, setError] = useState<ClaudeDiscoveryErrorDto | null>(null);
+  const [overrideInput, setOverrideInput] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(async () => {
+    try {
+      const s = await getClaudeDiscoveryStatus();
+      setStatus(s);
+      setError(null);
+    } catch (err) {
+      if (isClaudeDiscoveryErrorDto(err)) setError(err);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const onRedo = useCallback(async () => {
+    setBusy(true);
+    try {
+      await redoClaudeDiscovery();
+      await refresh();
+    } catch (err) {
+      if (isClaudeDiscoveryErrorDto(err)) setError(err);
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  const onSubmitOverride = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      const trimmed = overrideInput.trim();
+      if (!trimmed) return;
+      setBusy(true);
+      try {
+        await setClaudePathOverride(trimmed);
+        await refresh();
+        setOverrideInput("");
+      } catch (err) {
+        if (isClaudeDiscoveryErrorDto(err)) setError(err);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [overrideInput, refresh],
+  );
+
+  if (!status) {
+    return (
+      <section className="placeholder placeholder--loading">
+        <h2>Orchestrator</h2>
+        <p>正在检查 Claude Code 安装位置…</p>
+      </section>
+    );
+  }
+
+  if (status.kind === "ready") {
+    return (
+      <section className="placeholder">
+        <h2>Orchestrator</h2>
+        <p>
+          特权单实例 tab。后续会自动启动 <code>claude</code> 并预配所有平台 MCP 服务器。
+        </p>
+        <p className="placeholder__hint">当前仅渲染占位；PTY + claude 接入留待后续实现。</p>
+        <ClaudeReadyFooter record={status.record} onRedo={onRedo} busy={busy} />
+      </section>
+    );
+  }
+
+  // NotFound or NotRun → render the AC-3.2 onboarding card.
+  const probed = status.kind === "not_found" ? status.probed : [];
   return (
-    <section className="placeholder">
-      <h2>Orchestrator</h2>
+    <ClaudeOnboardingCard
+      probed={probed}
+      error={error}
+      overrideInput={overrideInput}
+      setOverrideInput={setOverrideInput}
+      onSubmitOverride={onSubmitOverride}
+      onRedo={onRedo}
+      busy={busy}
+    />
+  );
+}
+
+function ClaudeReadyFooter({
+  record,
+  onRedo,
+  busy,
+}: {
+  record: ClaudePathRecord;
+  onRedo: () => void;
+  busy: boolean;
+}) {
+  return (
+    <aside className="bootstrap-card bootstrap-card--ok" data-claude-discovery="ready">
+      <h3>Claude Code 已就绪</h3>
+      <dl>
+        <dt>路径</dt>
+        <dd>
+          <code>{record.path}</code>
+        </dd>
+        <dt>版本</dt>
+        <dd>{record.version ?? "未知"}</dd>
+        <dt>发现时间</dt>
+        <dd>{record.discoveredAt}</dd>
+      </dl>
+      <button type="button" onClick={onRedo} disabled={busy}>
+        重新查找
+      </button>
+    </aside>
+  );
+}
+
+function ClaudeOnboardingCard({
+  probed,
+  error,
+  overrideInput,
+  setOverrideInput,
+  onSubmitOverride,
+  onRedo,
+  busy,
+}: {
+  probed: string[];
+  error: ClaudeDiscoveryErrorDto | null;
+  overrideInput: string;
+  setOverrideInput: (s: string) => void;
+  onSubmitOverride: (e: FormEvent<HTMLFormElement>) => void;
+  onRedo: () => void;
+  busy: boolean;
+}) {
+  return (
+    <section
+      className="placeholder placeholder--error"
+      role="alert"
+      data-claude-discovery="not-found"
+    >
+      <h2>未找到 Claude Code</h2>
       <p>
-        特权单实例 tab。后续会自动启动 <code>claude</code> 并预配所有平台 MCP 服务器。
+        应用无法在常见位置找到 <code>claude</code> 命令。由于 macOS
+        图形界面应用不会继承终端里的 PATH，需要手动确认 Claude Code 的安装位置。
       </p>
-      <p className="placeholder__hint">当前仅渲染占位；PTY + claude 接入留待后续实现。</p>
+      <p>已检查路径：</p>
+      <ul>
+        {probed.map((p) => (
+          <li key={p}>
+            <code>{p}</code>
+          </li>
+        ))}
+      </ul>
+      <p>你可以选择 claude 可执行文件，或安装 Claude Code 后重试。</p>
+      <form onSubmit={onSubmitOverride} className="claude-discovery__override">
+        <label>
+          选择 claude 路径
+          <input
+            type="text"
+            placeholder="/usr/local/bin/claude"
+            value={overrideInput}
+            onChange={(e) => setOverrideInput(e.target.value)}
+            spellCheck={false}
+          />
+        </label>
+        <button type="submit" disabled={busy || overrideInput.trim() === ""}>
+          提交
+        </button>
+      </form>
+      <button type="button" onClick={onRedo} disabled={busy}>
+        重新查找
+      </button>
+      {error && (
+        <p className="bootstrap-card__hint" data-claude-discovery-error={error.kind}>
+          错误：<code>{error.kind}</code>
+        </p>
+      )}
+      <p className="bootstrap-card__hint">
+        安装提示：<code>brew install claude</code>。
+        详见{" "}
+        <a
+          href="https://docs.anthropic.com/en/docs/claude-code"
+          target="_blank"
+          rel="noreferrer"
+        >
+          Anthropic Claude Code 安装文档
+        </a>
+        。
+      </p>
     </section>
   );
 }
