@@ -1,0 +1,31 @@
+[package]
+name = "terminal-mesh-core"
+version = "0.0.1"
+description = "Terminal Mesh portable-pty Tokio actor, 1MB ring buffer, UTF-8/ANSI-safe scanner, OSC agent marker parser, prompt-waiting detector, NeedsAttention dedup arbiter (per docs/specs/terminal-events.md)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "terminal_mesh_core"
+path = "src/lib.rs"
+
+[lints.clippy]
+# Terminal Mesh actor + downstream sidecar must use the host event bus
+# (TerminalEvent envelopes) — never raw stdout/stderr inside the crate.
+print_stdout = "deny"
+print_stderr = "deny"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+regex = "1"
+base64 = "0.22"
+portable-pty = "0.9"
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time", "test-util"] }
