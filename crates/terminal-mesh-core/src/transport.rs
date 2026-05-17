@@ -26,8 +26,19 @@ use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub enum WorkspaceLocation {
-    Local { path: Option<PathBuf> },
-    // Remote variants are added when remote-workspace support lands.
+    Local {
+        path: Option<PathBuf>,
+    },
+    /// SSH-backed workspace (optionally inside a Docker container on
+    /// the remote host). Matches the spec §6.1 identity tuple and
+    /// mirrors the registry-side `WorkspaceLocation::Remote` shape.
+    Remote {
+        user: Option<String>,
+        host: String,
+        port: Option<u16>,
+        canonical_remote_path: String,
+        container: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -45,7 +56,10 @@ pub struct PtySize {
 #[derive(Debug, Clone)]
 pub enum PathBufOrRemote {
     Local(PathBuf),
-    // Remote variants are added when remote-workspace support lands.
+    /// Canonical remote path (passed as `AM_REMOTE_CWD` to the SSH
+    /// wrapper script). Local transports ignore this variant; only
+    /// `SshTransport` / `DockerOverSshTransport` consume it.
+    Remote(String),
 }
 
 #[derive(Debug)]
@@ -227,16 +241,21 @@ impl Transport for LocalTransport {
         request: TransportSpawnRequest,
     ) -> Result<Box<dyn TransportSession>, TransportError> {
         let TransportSpawnRequest {
-            // The workspace location is informational at this layer:
-            // selecting a transport implementation is the caller's
-            // responsibility; LocalTransport accepts the request as long
-            // as the command + cwd can be honored locally.
-            workspace: _,
+            workspace,
             command,
             initial_size,
             env,
             cwd,
         } = request;
+        // Defensive: callers SHOULD route Remote workspaces to
+        // `SshTransport` / `DockerOverSshTransport`. If a Remote
+        // request reaches LocalTransport it is a routing bug, not a
+        // recoverable runtime condition.
+        if matches!(workspace, WorkspaceLocation::Remote { .. }) {
+            return Err(TransportError::Protocol {
+                message: "LocalTransport cannot spawn a Remote workspace".into(),
+            });
+        }
 
         let pty_system = native_pty_system();
         let pair = pty_system

@@ -24,6 +24,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
 base64 = "0.22"
 portable-pty = "0.9"
+sha2 = "0.10"
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
 tracing = "0.1"
 
@@ -31,8 +32,10 @@ tracing = "0.1"
 # Used for SIGKILL escalation when portable-pty's ChildKiller (SIGHUP)
 # alone fails to terminate a child that traps/ignores HUP. Pinned to
 # the same major version src-tauri already uses for sidecar signal
-# handling so the workspace shares one nix.
-nix = { version = "0.29", features = ["signal", "process"] }
+# handling so the workspace shares one nix. The `user` feature gates
+# `Uid::current` used by `transport_ssh::init_control_master_dir`.
+nix = { version = "0.29", features = ["signal", "process", "user"] }
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time", "test-util"] }
