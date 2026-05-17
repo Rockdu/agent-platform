@@ -82,6 +82,26 @@ pub struct TerminalHandle {
     pub status_rx: mpsc::Receiver<BufferTruncated>,
 }
 
+/// Outcome of `TransportSession::wait` after collapsing the
+/// transport's typed exit status into the discrete signals the
+/// actor's processor task cares about. The wait thread maps:
+///
+/// - `CleanCompletion` / `NonZeroExit(N)` / `Signaled(N)` → `Completed(N)`
+///   (CleanCompletion is `Completed(0)`).
+/// - `Disconnect(_)` from the transport → `Disconnected`.
+/// - `wait()` returning `Err(_)` → `Disconnected`.
+///
+/// The processor then translates `Disconnected` into both a
+/// `TerminalEvent::Exit { code: None }` AND a
+/// `NeedsAttention(AttentionKind::Disconnect)` event, so the host's
+/// lifecycle layer can map a lost remote channel to
+/// `DoneReason::Disconnected`.
+#[derive(Debug, Clone, Copy)]
+enum WaitResult {
+    Completed(i32),
+    Disconnected,
+}
+
 pub struct TerminalActor;
 
 impl TerminalActor {
@@ -155,7 +175,7 @@ impl TerminalActor {
         let (command_tx, command_rx) = mpsc::channel::<ActorCommand>(COMMAND_CHANNEL_CAPACITY);
         let (bytes_tx, bytes_rx) = mpsc::channel::<Vec<u8>>(RAW_BYTES_CHANNEL_CAPACITY);
         let (reader_done_tx, reader_done_rx) = oneshot::channel::<()>();
-        let (exit_tx, exit_rx) = oneshot::channel::<Option<i32>>();
+        let (exit_tx, exit_rx) = oneshot::channel::<WaitResult>();
 
         // Reader thread (sync). Reads from the transport's output stream
         // until EOF or error; forwards every chunk over `bytes_tx`.
@@ -187,13 +207,13 @@ impl TerminalActor {
         std::thread::Builder::new()
             .name(format!("terminal-mesh-wait-{terminal_id}"))
             .spawn(move || {
-                let code = match session.wait() {
-                    Ok(TransportExitStatus::CleanCompletion) => Some(0),
+                let outcome = match session.wait() {
+                    Ok(TransportExitStatus::CleanCompletion) => WaitResult::Completed(0),
                     Ok(TransportExitStatus::NonZeroExit(n))
-                    | Ok(TransportExitStatus::Signaled(n)) => Some(n),
-                    Ok(TransportExitStatus::Disconnect(_)) | Err(_) => None,
+                    | Ok(TransportExitStatus::Signaled(n)) => WaitResult::Completed(n),
+                    Ok(TransportExitStatus::Disconnect(_)) | Err(_) => WaitResult::Disconnected,
                 };
-                let _ = exit_tx.send(code);
+                let _ = exit_tx.send(outcome);
             })
             .map_err(|e| ActorError::Io(e.to_string()))?;
 
@@ -237,7 +257,7 @@ async fn processor_task(
     events_tx: mpsc::Sender<TerminalEventEnvelope>,
     status_tx: mpsc::Sender<BufferTruncated>,
     mut reader_done_rx: oneshot::Receiver<()>,
-    mut exit_rx: oneshot::Receiver<Option<i32>>,
+    mut exit_rx: oneshot::Receiver<WaitResult>,
 ) {
     // Wrap writer in Option so we can drop it after the child exits to
     // release the master fd refcount and help the kernel propagate EOF
@@ -249,7 +269,7 @@ async fn processor_task(
     let mut tick = tokio::time::interval(PROMPT_TICK_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut shutdown_requested = false;
-    let mut child_exit_code: Option<Option<i32>> = None;
+    let mut child_outcome: Option<WaitResult> = None;
     let mut commands_closed = false;
     let mut bytes_closed = false;
     let mut reader_drained = false;
@@ -275,8 +295,12 @@ async fn processor_task(
 
         tokio::select! {
             // ---- child exited ----
-            code = &mut exit_rx, if !exit_observed => {
-                child_exit_code = Some(code.unwrap_or(None));
+            outcome = &mut exit_rx, if !exit_observed => {
+                // The wait thread may have been dropped before sending
+                // (process aborted, channel closed). Treat that as a
+                // Disconnected outcome so the post-exit drain still
+                // emits the Disconnect attention path.
+                child_outcome = Some(outcome.unwrap_or(WaitResult::Disconnected));
                 exit_observed = true;
                 // Drop the writer so the master fd refcount goes down,
                 // helping the kernel propagate EOF to the reader.
@@ -440,17 +464,29 @@ async fn processor_task(
         }
     }
 
-    let code = child_exit_code.flatten();
-    let envelope = TerminalEventEnvelope::now(terminal_id, TerminalEvent::Exit { code });
+    // Map the wait outcome into the public event sequence. Note
+    // that `child_outcome == None` here means the drain deadline
+    // expired without a wait signal — emit `Exit { code: None }`
+    // with no attention event (the host's notification service has
+    // no signal to act on either way).
+    let (exit_code, attention_kind) = match child_outcome {
+        Some(WaitResult::Completed(c)) => {
+            let kind = if c == 0 {
+                AttentionKind::Completion { exit_code: 0 }
+            } else {
+                AttentionKind::NonZeroExit { exit_code: c }
+            };
+            (Some(c), Some(kind))
+        }
+        Some(WaitResult::Disconnected) => (None, Some(AttentionKind::Disconnect)),
+        None => (None, None),
+    };
+    let envelope =
+        TerminalEventEnvelope::now(terminal_id, TerminalEvent::Exit { code: exit_code });
     let _ = events_tx.send(envelope).await;
-    // task22 Round 41: emit Completion / NonZeroExit unconditionally
-    // — the host `NotificationService` owns notification dedup.
-    if let Some(c) = code {
-        let kind = if c == 0 {
-            AttentionKind::Completion { exit_code: 0 }
-        } else {
-            AttentionKind::NonZeroExit { exit_code: c }
-        };
+    // Host `NotificationService` owns notification dedup; emit
+    // attention unconditionally when the wait outcome implies one.
+    if let Some(kind) = attention_kind {
         emit_attention(terminal_id, &events_tx, kind).await;
     }
     if shutdown_requested {
@@ -510,7 +546,8 @@ async fn emit_attention(
 mod tests {
     use super::*;
     use crate::transport::{
-        Transport, TransportError, TransportSession, TransportSpawnRequest,
+        Transport, TransportError, TransportOutputStream, TransportResizeHandle, TransportSession,
+        TransportShutdownHandle, TransportSpawnRequest, TransportStdinSink,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1015,6 +1052,151 @@ mod tests {
             task_complete.as_deref(),
             Some("shipped"),
             "child OSC 1339 must produce AttentionKind::TaskComplete with decoded summary; got {evs:?}"
+        );
+    }
+
+    /// A test-only transport whose session's `wait()` returns
+    /// `Disconnect(...)`. Proves the actor's wait-thread → processor
+    /// → event-sender pipeline carries the typed Disconnect outcome
+    /// and emits `NeedsAttention(AttentionKind::Disconnect)` after
+    /// the final `TerminalEvent::Exit { code: None }`.
+    struct DisconnectingTransport;
+
+    struct DisconnectingSession {
+        output: Option<Box<dyn TransportOutputStream>>,
+        sink: Option<Box<dyn TransportStdinSink>>,
+        shutdown_handle: Option<Box<dyn TransportShutdownHandle>>,
+        resize_handle: Option<Box<dyn TransportResizeHandle>>,
+        waited: bool,
+    }
+
+    struct NoopShutdownHandle;
+    impl TransportShutdownHandle for NoopShutdownHandle {
+        fn shutdown(&self, _mode: ShutdownMode) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    struct NoopResizeHandle;
+    impl TransportResizeHandle for NoopResizeHandle {
+        fn resize(&self, _size: crate::transport::PtySize) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    struct EmptyReader;
+    impl TransportOutputStream for EmptyReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            // Block-then-EOF: sleep briefly so the actor's reader
+            // thread isn't a hot loop, then return EOF so the
+            // reader_done channel resolves.
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(0)
+        }
+    }
+
+    struct NoopSink;
+    impl TransportStdinSink for NoopSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Transport for DisconnectingTransport {
+        fn spawn(
+            &self,
+            _request: TransportSpawnRequest,
+        ) -> Result<Box<dyn TransportSession>, TransportError> {
+            Ok(Box::new(DisconnectingSession {
+                output: Some(Box::new(EmptyReader)),
+                sink: Some(Box::new(NoopSink)),
+                shutdown_handle: Some(Box::new(NoopShutdownHandle)),
+                resize_handle: Some(Box::new(NoopResizeHandle)),
+                waited: false,
+            }))
+        }
+    }
+
+    impl TransportSession for DisconnectingSession {
+        fn output_stream(&mut self) -> Result<Box<dyn TransportOutputStream>, TransportError> {
+            self.output.take().ok_or(TransportError::Protocol {
+                message: "output already taken".into(),
+            })
+        }
+        fn stdin_sink(&mut self) -> Result<Box<dyn TransportStdinSink>, TransportError> {
+            self.sink.take().ok_or(TransportError::Protocol {
+                message: "sink already taken".into(),
+            })
+        }
+        fn take_shutdown_handle(&mut self) -> Option<Box<dyn TransportShutdownHandle>> {
+            self.shutdown_handle.take()
+        }
+        fn take_resize_handle(&mut self) -> Option<Box<dyn TransportResizeHandle>> {
+            self.resize_handle.take()
+        }
+        fn resize(&mut self, _size: crate::transport::PtySize) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn shutdown(&mut self, _mode: ShutdownMode) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn wait(&mut self) -> Result<TransportExitStatus, TransportError> {
+            self.waited = true;
+            Ok(TransportExitStatus::Disconnect(
+                crate::transport::DisconnectReason::Io("simulated link reset".into()),
+            ))
+        }
+        fn disconnect_reason(&self) -> Option<crate::transport::DisconnectReason> {
+            None
+        }
+        fn cleanup(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actor_emits_disconnect_attention_when_transport_disconnects() {
+        let transport: Arc<dyn Transport> = Arc::new(DisconnectingTransport);
+        let h = TerminalActor::spawn(transport, shell_spec("ignored"))
+            .expect("disconnecting transport spawns successfully");
+        let mut events_rx = h.events_rx;
+        let _command_tx = h.command_tx;
+        let evs = collect_until(
+            &mut events_rx,
+            |e| matches!(
+                &e.event,
+                TerminalEvent::NeedsAttention {
+                    payload: NeedsAttentionPayload {
+                        kind: AttentionKind::Disconnect,
+                        ..
+                    },
+                }
+            ),
+            5000,
+        )
+        .await;
+        let exit_with_none = evs
+            .iter()
+            .find(|e| matches!(&e.event, TerminalEvent::Exit { code: None }));
+        assert!(
+            exit_with_none.is_some(),
+            "Disconnect outcome must emit Exit {{ code: None }}; got {evs:?}"
+        );
+        let attention = evs.iter().find_map(|e| match &e.event {
+            TerminalEvent::NeedsAttention {
+                payload: NeedsAttentionPayload {
+                    kind: AttentionKind::Disconnect,
+                    ..
+                },
+            } => Some(()),
+            _ => None,
+        });
+        assert!(
+            attention.is_some(),
+            "Disconnect outcome must emit NeedsAttention(Disconnect); got {evs:?}"
         );
     }
 }

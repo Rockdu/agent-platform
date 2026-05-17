@@ -4901,6 +4901,7 @@ name = "terminal-mesh-core"
 version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
+ "filetime",
  "nix 0.29.0",
  "portable-pty",
  "regex",

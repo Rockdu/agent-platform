@@ -102,9 +102,10 @@ impl SshLocation {
 // ---------------------------------------------------------------------------
 
 /// Build the system-ssh argv per spec §4.1. The `wrapper_script` is
-/// the body that runs on the remote side; we wrap it via `sh -lc
-/// <quoted>` so the sentinel wrapper executes in a real login-shell
-/// environment.
+/// the body that runs on the remote side; we wrap it via
+/// `compose_remote_command` into ONE quoted `sh -lc '...'` string
+/// so OpenSSH's "join all post-host argv with spaces and send to the
+/// remote shell" rule still produces correct remote semantics.
 pub fn build_ssh_argv(
     control_path: &Path,
     location: &SshLocation,
@@ -128,10 +129,24 @@ pub fn build_ssh_argv(
         "-p".into(),
         port.to_string(),
         location.user_host(),
-        "sh".into(),
-        "-lc".into(),
-        wrapper_script.to_string(),
+        compose_remote_command(wrapper_script),
     ]
+}
+
+/// Wrap a multi-line wrapper script in a single shell-safe
+/// `sh -lc '...'` invocation. Real OpenSSH joins all argv after the
+/// destination with spaces and sends the resulting string to the
+/// remote login shell, which then re-parses it. If we passed
+/// `["sh", "-lc", <multi-line wrapper>]` as three separate argv
+/// elements, the remote shell would parse the joined string and the
+/// wrapper's spaces / newlines would split across tokens.
+///
+/// The escape uses the POSIX `'\''` idiom: close the single-quoted
+/// string, append an escaped single quote, then re-open the string.
+/// Apostrophes in the wrapper body therefore survive the round-trip
+/// through the remote shell's command-line parser.
+pub fn compose_remote_command(wrapper_script: &str) -> String {
+    format!("sh -lc {}", shell_single_quote(wrapper_script))
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +205,7 @@ pub fn build_sentinel_wrapper_script(canonical_remote_path: Option<&str>) -> Str
     script
 }
 
-fn shell_single_quote(s: &str) -> String {
+pub(crate) fn shell_single_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for ch in s.chars() {
@@ -479,12 +494,79 @@ pub struct SshTransport {
 }
 
 impl SshTransport {
+    /// Construct an `SshTransport` against a pre-validated control
+    /// directory. **For tests only**: production callers should use
+    /// `from_app_data` so the ControlMaster directory is created,
+    /// validated (0700 + Uid::current ownership), and freed of any
+    /// stale sockets in one place.
     pub fn new(ssh_program: PathBuf, control_dir: PathBuf) -> Self {
         Self {
             ssh_program,
             control_dir,
         }
     }
+
+    /// Production constructor: creates `${app_data}/ssh-cm/` with
+    /// mode 0700, verifies it is owned by the current user, runs
+    /// stale-master cleanup once, and stores the validated dir.
+    /// Returns `TransportError::SshControlPathInvalid` when the dir
+    /// cannot be safely used (unsafe permissions, foreign owner,
+    /// permission-denied on cleanup, etc.).
+    pub fn from_app_data(
+        ssh_program: PathBuf,
+        app_data: &Path,
+    ) -> Result<Self, TransportError> {
+        let control_dir = init_control_master_dir(app_data)?;
+        // Best-effort: cleanup failures do NOT fail construction
+        // (a non-removable stale socket should not block remote
+        // workspace creation), but they are logged.
+        if let Err(e) = cleanup_stale_master_sockets(&control_dir) {
+            tracing::warn!(
+                control_dir = %control_dir.display(),
+                error = %e,
+                "SshTransport::from_app_data: stale-master cleanup failed (continuing)"
+            );
+        }
+        Ok(Self {
+            ssh_program,
+            control_dir,
+        })
+    }
+}
+
+/// Verify the existing socket file at `path` is owned by the current
+/// user. Returns `Ok(())` when the path is missing (common case;
+/// ssh will create the socket itself) or when the owner matches.
+/// Returns `SshControlPathInvalid` on a foreign-owned existing file.
+#[cfg(unix)]
+fn ensure_control_socket_owner_safe(path: &Path) -> Result<(), TransportError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(TransportError::SshControlPathInvalid {
+                path: path.to_path_buf(),
+                message: format!("metadata: {e}"),
+            });
+        }
+    };
+    let me = nix::unistd::Uid::current().as_raw();
+    if meta.uid() != me {
+        return Err(TransportError::SshControlPathInvalid {
+            path: path.to_path_buf(),
+            message: format!(
+                "existing ControlPath socket owned by uid={} (current uid={me})",
+                meta.uid()
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_control_socket_owner_safe(_path: &Path) -> Result<(), TransportError> {
+    Ok(())
 }
 
 impl Transport for SshTransport {
@@ -506,6 +588,11 @@ impl Transport for SshTransport {
             })?;
 
         let control_path = ssh_control_path_for(&self.control_dir, &location);
+        // Refuse to hand a foreign-owned existing socket file to
+        // OpenSSH — that would let another user MITM the SSH session
+        // through their ControlMaster. The common case (socket
+        // missing) is a no-op.
+        ensure_control_socket_owner_safe(&control_path)?;
         let wrapper = build_sentinel_wrapper_script(Some(&location.canonical_remote_path));
         let argv = build_ssh_argv(&control_path, &location, &wrapper);
 
@@ -766,21 +853,35 @@ pub struct SshTransportSession {
 
 struct SshOutputAdapter {
     shared: Arc<SharedSshState>,
+    /// Per-reader pending tail: bytes drained from the shared buffer
+    /// that did not fit in the caller's `buf`. Subsequent `read`
+    /// calls serve from here BEFORE re-draining the shared buffer,
+    /// so a small consumer buffer never loses bytes when the SSH
+    /// reader thread accumulated a larger chunk between reads.
+    pending: VecDeque<u8>,
 }
 
 impl TransportOutputStream for SshOutputAdapter {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // Drain whatever the reader thread has accumulated. Returns
-        // 0 when the upstream EOF'd; otherwise returns a non-zero
-        // chunk. The caller is expected to be a long-lived loop
-        // similar to LocalReaderAdapter.
         loop {
-            let chunk = self.shared.drain_output();
-            if !chunk.is_empty() {
-                let n = chunk.len().min(buf.len());
-                buf[..n].copy_from_slice(&chunk[..n]);
+            // Serve from the pending tail first if it has bytes.
+            if !self.pending.is_empty() {
+                let n = self.pending.len().min(buf.len());
+                for (i, byte) in self.pending.drain(..n).enumerate() {
+                    buf[i] = byte;
+                }
                 return Ok(n);
             }
+            // Pending is empty: drain the shared buffer into pending,
+            // then serve. The drain returns whatever the SSH reader
+            // thread has accumulated since the last call.
+            let chunk = self.shared.drain_output();
+            if !chunk.is_empty() {
+                self.pending.extend(chunk);
+                continue;
+            }
+            // No buffered bytes anywhere; signal EOF only if upstream
+            // is done, else park briefly to wait for the reader.
             if self.shared.reader_done.load(Ordering::SeqCst) {
                 return Ok(0);
             }
@@ -857,6 +958,7 @@ impl TransportSession for SshTransportSession {
     fn output_stream(&mut self) -> Result<Box<dyn TransportOutputStream>, TransportError> {
         Ok(Box::new(SshOutputAdapter {
             shared: Arc::clone(&self.shared),
+            pending: VecDeque::new(),
         }))
     }
 
@@ -1000,9 +1102,39 @@ mod tests {
         assert!(argv.contains(&"-p".to_string()));
         assert!(argv.contains(&"2222".to_string()));
         assert!(argv.contains(&"alice@example.com".to_string()));
-        assert!(argv.contains(&"sh".to_string()));
-        assert!(argv.contains(&"-lc".to_string()));
-        assert!(argv.contains(&"echo hi".to_string()));
+        // The remote command MUST be ONE argv element so OpenSSH's
+        // join-with-spaces rule produces correct remote semantics.
+        let last = argv.last().expect("argv non-empty");
+        assert_eq!(last, "sh -lc 'echo hi'");
+    }
+
+    #[test]
+    fn compose_remote_command_wraps_wrapper_in_sh_lc_quoted() {
+        let cmd = compose_remote_command("printf 'hi'\necho done");
+        assert_eq!(cmd, "sh -lc 'printf '\\''hi'\\''\necho done'");
+    }
+
+    #[test]
+    fn compose_remote_command_round_trips_through_sh_parser() {
+        // Mirror how the remote shell will see the composed string:
+        // join the would-be argv elements with spaces (OpenSSH's
+        // behavior) and re-parse via /bin/sh -c. The wrapper script
+        // body must reach the remote-side shell unchanged.
+        let wrapper = "printf 'hello'\nexit 7";
+        let composed = compose_remote_command(wrapper);
+        // Mirror OpenSSH: a single argv element is delivered to the
+        // remote shell as-is. /bin/sh -c will re-parse it.
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&composed)
+            .output()
+            .expect("sh -c");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "hello",
+            "wrapper printf must survive sh-quoting round-trip"
+        );
+        assert_eq!(output.status.code(), Some(7));
     }
 
     #[test]
@@ -1253,14 +1385,96 @@ mod tests {
     fn cleanup_stale_master_sockets_removes_old_sock_files() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = init_control_master_dir(tmp.path()).unwrap();
-        let sock = dir.join("stale.sock");
-        std::fs::write(&sock, b"not really a socket").unwrap();
-        // Set mtime to 2 hours ago via filetime crate? We don't have
-        // that as a dep; instead, just verify the function doesn't
-        // touch recent files.
+        let recent = dir.join("recent.sock");
+        let stale = dir.join("stale.sock");
+        std::fs::write(&recent, b"not really a socket").unwrap();
+        std::fs::write(&stale, b"not really a socket").unwrap();
+        // Back-date the stale socket's mtime to 2 hours ago.
+        let old = filetime::FileTime::from_unix_time(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                - 7200,
+            0,
+        );
+        filetime::set_file_mtime(&stale, old).unwrap();
         let removed = cleanup_stale_master_sockets(&dir).unwrap();
-        assert_eq!(removed, 0, "recent socket must not be removed");
-        assert!(sock.exists());
+        assert_eq!(removed, 1, "exactly one stale socket should be removed");
+        assert!(recent.exists(), "recent socket must survive");
+        assert!(!stale.exists(), "stale socket must be removed");
+    }
+
+    #[test]
+    fn from_app_data_creates_and_validates_control_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stub_ssh = tmp.path().join("stub-ssh");
+        std::fs::write(&stub_ssh, b"#!/bin/sh\nexit 0\n").unwrap();
+        let t = SshTransport::from_app_data(stub_ssh, tmp.path())
+            .expect("from_app_data must succeed on fresh dir");
+        assert!(t.control_dir.is_dir());
+        assert!(t.control_dir.ends_with("ssh-cm"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&t.control_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "must enforce 0700");
+        }
+    }
+
+    #[test]
+    fn from_app_data_runs_stale_cleanup_at_construction() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Pre-seed the ssh-cm dir with an old socket.
+        let control_dir = tmp.path().join("ssh-cm");
+        std::fs::create_dir_all(&control_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&control_dir).unwrap().permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&control_dir, perms).unwrap();
+        }
+        let stale = control_dir.join("stale.sock");
+        std::fs::write(&stale, b"x").unwrap();
+        let old = filetime::FileTime::from_unix_time(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                - 7200,
+            0,
+        );
+        filetime::set_file_mtime(&stale, old).unwrap();
+
+        let stub_ssh = tmp.path().join("stub-ssh");
+        std::fs::write(&stub_ssh, b"#!/bin/sh\nexit 0\n").unwrap();
+        let _t = SshTransport::from_app_data(stub_ssh, tmp.path()).expect("from_app_data");
+        assert!(
+            !stale.exists(),
+            "from_app_data must remove stale sockets at construction"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_control_socket_owner_safe_passes_when_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist.sock");
+        ensure_control_socket_owner_safe(&missing).expect("missing file is safe");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_control_socket_owner_safe_passes_when_owned_by_us() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let owned = tmp.path().join("ours.sock");
+        std::fs::write(&owned, b"x").unwrap();
+        ensure_control_socket_owner_safe(&owned).expect("our own file is safe");
     }
 
     #[test]

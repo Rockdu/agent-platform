@@ -258,6 +258,64 @@ fn ssh_transport_local_transport_rejects_remote_workspace() {
 }
 
 #[test]
+fn ssh_transport_preserves_bursty_output_across_short_reads() {
+    let tmp = TempDir::new().unwrap();
+    // Stub emits the shell-started sentinel, then a deterministic
+    // 32 KiB payload, then the exit-status sentinel. The consumer
+    // reads in 4 KiB chunks; every byte must arrive in order.
+    let stub_body = r#"printf '\033]1338;am-shell-started\a'
+i=0
+while [ $i -lt 1024 ]; do
+  printf 'ABCDEFGHIJKLMNOPQRSTUVWXYZ012345'
+  i=$((i+1))
+done
+printf '\033]1338;am-exit-status;0\a'
+exit 0
+"#;
+    let t = transport(&tmp, stub_body);
+    let mut session = t.spawn(remote_request("/srv")).expect("spawn ok");
+    let mut reader = session.output_stream().expect("output_stream");
+    let mut accum: Vec<u8> = Vec::with_capacity(32 * 1024);
+    let mut buf = [0u8; 4096];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => accum.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        if accum.len() >= 32 * 1024 {
+            break;
+        }
+    }
+    // Strip the OSC 1338 sentinels and ssh's own banner before
+    // comparing. The pattern body is 32 KiB of repeated 32-byte
+    // chunks; assert that the count of expected payload bytes is
+    // preserved (no drops).
+    let payload = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+    let needle = payload.as_bytes();
+    let mut count = 0usize;
+    let mut window = &accum[..];
+    while let Some(idx) = window
+        .windows(needle.len())
+        .position(|w| w == needle)
+    {
+        count += 1;
+        window = &window[idx + needle.len()..];
+    }
+    assert_eq!(
+        count, 1024,
+        "expected 1024 repetitions of the 32-byte payload; got {count} (out of {} bytes)",
+        accum.len(),
+    );
+    let _ = session.wait();
+    session.cleanup().expect("cleanup");
+}
+
+#[test]
 fn ssh_transport_shutdown_terminates_long_running_session() {
     let tmp = TempDir::new().unwrap();
     let t = transport(
