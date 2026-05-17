@@ -221,7 +221,18 @@ impl WorkspaceRegistry {
                     .workspaces
                     .into_iter()
                     .map(|s| {
-                        let r: WorkspaceRecord = s.into();
+                        let mut r: WorkspaceRecord = s.into();
+                        // `open_tab_id` is RUNTIME state: a tab id
+                        // only has meaning within the lifetime of a
+                        // single frontend session. The disk slot is
+                        // preserved purely for diagnostics (what was
+                        // open at last shutdown); on load we clear
+                        // it so a fresh session starts with zero
+                        // workspace locks. This unblocks the
+                        // open-after-restart path that would
+                        // otherwise return `AlreadyOpen` for a stale
+                        // tab id from the previous launch.
+                        r.open_tab_id = None;
                         (r.workspace_id, r)
                     })
                     .collect(),
@@ -937,6 +948,46 @@ mod tests {
     /// Codex round-28 blocker #2 regression: the persisted JSON shape
     /// uses snake_case keys, decoupled from the camelCase wire shape
     /// the Tauri IPC layer returns to the frontend.
+    /// Codex round-29 blocker regression: persisted `open_tab_id`
+    /// must not survive a restart. After load, the in-memory record
+    /// must show no lock so the user can reopen the workspace with
+    /// a fresh tab id without hitting `AlreadyOpen`.
+    #[test]
+    fn open_persist_reload_reopen_with_fresh_tab_id_succeeds() {
+        let (storage, home, reg) = fresh_registry();
+        let workspaces_root = home.path().join("AgentPlatform").join("workspaces");
+        let created = reg.create_workspace("restart-demo").expect("create");
+        let opened = reg
+            .open_workspace(created.workspace_id, "tab-old")
+            .expect("open original");
+        assert_eq!(opened.open_tab_id.as_deref(), Some("tab-old"));
+        // Drop the registry instance; the disk file still records
+        // `open_tab_id = "tab-old"` for diagnostic purposes.
+        drop(reg);
+
+        // Reload from the same storage root, mimicking app restart.
+        let reg2 = WorkspaceRegistry::load(
+            storage.path().to_path_buf(),
+            Some(workspaces_root),
+        );
+        let listed = reg2.list();
+        let found = listed
+            .iter()
+            .find(|r| r.workspace_id == created.workspace_id)
+            .expect("reloaded record present");
+        assert_eq!(
+            found.open_tab_id, None,
+            "load must clear runtime-only open_tab_id; got {:?}",
+            found.open_tab_id
+        );
+
+        // Reopening with a DIFFERENT tab id must now succeed.
+        let reopened = reg2
+            .open_workspace(created.workspace_id, "tab-new")
+            .expect("reopen post-restart with fresh tab id");
+        assert_eq!(reopened.open_tab_id.as_deref(), Some("tab-new"));
+    }
+
     #[test]
     fn persisted_json_uses_snake_case_keys() {
         let (storage, _home, reg) = fresh_registry();
