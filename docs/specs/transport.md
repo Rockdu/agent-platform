@@ -200,7 +200,9 @@ Users must pre-arrange one of:
 - an unencrypted key accepted by their OpenSSH config
 - host-specific OpenSSH config in `~/.ssh/config`
 
-When authentication fails under `BatchMode=yes`, classify it as `TransportError::SshAuth` and surface `AttentionKind::Disconnect`.
+When authentication fails under `BatchMode=yes`, `Transport::spawn` MUST return `Err(TransportError::SshAuth { user, host, port })` synchronously. No `TransportSession` handle is produced, no `AttentionKind` event is emitted, no `WorkspaceLifecycleSnapshot` Done entry is enqueued, and no `WorkspaceRecord` is persisted. The caller (WorkspaceLaunchScheduler / workspace-create path) surfaces the typed error to the UI as a create-time failure, not as a lifecycle disconnect.
+
+Rationale: `AttentionKind::Disconnect` is reserved for sessions that successfully started a remote shell and later lost their transport. A workspace that never reached `am-shell-started` has no session to "disconnect" and must not pollute the Done queue with phantom entries the user did not initiate.
 
 ### 4.4 `StrictHostKeyChecking=accept-new`
 
@@ -239,22 +241,25 @@ Remote wrapper snippet:
 
 ```sh
 #!/bin/sh
-printf '\033]1338;am-shell-started\a'
-
-status=0
+# Reserved exit codes (must NOT collide with shell-relayed exit codes):
+#   77 = RemotePathInvalid (cd to $AM_REMOTE_CWD failed BEFORE shell start)
+# All other non-zero codes are interpreted as the user shell's own exit status.
 
 if [ -n "$AM_REMOTE_CWD" ]; then
-  cd "$AM_REMOTE_CWD" || exit_status=$?
+  if ! cd "$AM_REMOTE_CWD" 2>/dev/null; then
+    # Do NOT emit am-shell-started: we never reached the interactive shell.
+    # Host maps exit code 77 -> TransportError::RemotePathInvalid.
+    exit 77
+  fi
 fi
 
-if [ -n "$exit_status" ]; then
-  status="$exit_status"
+printf '\033]1338;am-shell-started\a'
+
+if [ -n "$SHELL" ] && [ -x "$SHELL" ]; then
+  "$SHELL" -l
+  status=$?
 else
-  if [ -n "$SHELL" ] && [ -x "$SHELL" ]; then
-    "$SHELL" -l
-  else
-    /bin/sh -l
-  fi
+  /bin/sh -l
   status=$?
 fi
 
@@ -262,7 +267,7 @@ printf '\033]1338;am-exit-status;%s\a' "$status"
 exit "$status"
 ```
 
-The actual implementation may inline this script through `sh -lc` or upload it to a temporary remote file, but the emitted OSC protocol is fixed.
+The actual implementation may inline this script through `sh -lc` or upload it to a temporary remote file, but the emitted OSC protocol AND the reserved exit-code semantics (77 = RemotePathInvalid) are fixed. Exit code 77 is chosen because it is outside the conventional shell-builtin exit range (0-2) and the signal-derived range (128+N) and is not assigned by POSIX or common shells, minimizing the risk that a user shell coincidentally returns it. If a host observes ssh exit code 77 AND no `am-shell-started` sentinel was seen, it MUST classify the failure as `TransportError::RemotePathInvalid`.
 
 Parser behavior:
 
@@ -273,45 +278,72 @@ Parser behavior:
 
 ### 4.6 SSH state-machine mapping
 
-| shell_started seen? | exit_status sentinel seen? | ssh exit | Resulting AttentionKind / typed error |
-|---|---:|---:|---|
-| yes | `0` | `0` | `AttentionKind::Completion` / `TransportExitStatus::CleanCompletion` |
-| yes | non-zero `N` | any | `AttentionKind::NonZeroExit` / `TransportExitStatus::NonZeroExit(N)` |
-| yes | no | non-zero or signal | `AttentionKind::Disconnect` / `TransportError::RemoteCommandFailed` or `DisconnectReason::Io` |
-| no | no | auth failure pattern | `AttentionKind::Disconnect` / `TransportError::SshAuth` |
-| no | no | connect timeout, DNS, refused, no route | `AttentionKind::Disconnect` / `TransportError::SshConnect` |
-| no | no | host key changed pattern | `AttentionKind::Disconnect` / `TransportError::SshHostKeyChanged` |
+Two distinct phases govern classification:
 
-Auth, connect, and host-key classification can initially use OpenSSH stderr pattern matching plus process exit status. The classification must be centralized in `crates/terminal-mesh-transport-ssh/src/ssh.rs` so it can be hardened later.
+**Phase A — Pre-shell (`Transport::spawn` time).** Failures that occur before the wrapper emits `am-shell-started` MUST surface as typed `TransportError` returned synchronously from `Transport::spawn` (`Err(...)`). No `TransportSession` is constructed, no `AttentionKind` event is emitted, no Done entry is enqueued, and no `WorkspaceRecord` is persisted. The caller (workspace-create or WorkspaceLaunchScheduler) presents these as create-time errors.
+
+**Phase B — Post-shell (during an established session).** Failures or completions that occur after `am-shell-started` was seen MUST surface through the normal `TransportSession::wait` / `disconnect_reason` path and may emit `AttentionKind` events that DO produce Done-queue entries.
+
+| Row | shell_started seen? | exit_status sentinel seen? | ssh exit / failure | Phase | Surface | Resulting classification | AttentionKind | Done entry? |
+|---|---|---:|---|---|---|---|---|---|
+| 1 | yes | `0` | `0` | B | `wait` returns Ok | `TransportExitStatus::CleanCompletion` | `Completion` | yes |
+| 2 | yes | non-zero `N` | any | B | `wait` returns Ok | `TransportExitStatus::NonZeroExit(N)` | `NonZeroExit` | yes |
+| 3 | yes | no | non-zero or signal | B | `wait` returns Err / `disconnect_reason = Io` | session-side disconnect | `Disconnect` | yes |
+| 4 | no | no | OpenSSH stderr matches auth failure pattern (`Permission denied`, `publickey`) | A | `spawn` returns `Err` | `TransportError::SshAuth { user, host, port }` | (none — no session created) | **no** |
+| 5 | no | no | exit before any TCP handshake (refused, DNS, no route, timeout) | A | `spawn` returns `Err` | `TransportError::SshConnect { host, port, message }` | (none) | **no** |
+| 6 | no | no | OpenSSH stderr matches host-key-changed pattern (`REMOTE HOST IDENTIFICATION HAS CHANGED`) | A | `spawn` returns `Err` | `TransportError::SshHostKeyChanged { host, port, message }` | (none) | **no** |
+| 7 | no | no | ssh exit code `77` | A | `spawn` returns `Err` | `TransportError::RemotePathInvalid { path, host, port, message }` | (none) | **no** |
+| 8 | no | no | ssh exits cleanly OR with another non-zero code without matching any pattern above | A | `spawn` returns `Err` | `TransportError::SshShellDidNotStart { host, port, ssh_exit }` | (none) | **no** |
+
+Notes:
+
+- Rows 4-8 are all Phase A: pre-shell, typed errors only, NO Done entry, NO `AttentionKind` event. A failed-to-start SSH workspace must never appear in the user's Running or Done sidebar — only as a create-time error toast / dialog.
+- Row 3 is the only Phase B "disconnect" — the user already had a live remote shell that the network lost.
+- The Phase A classifier MUST inspect stderr patterns BEFORE falling through to the catch-all `SshShellDidNotStart` so that host-key changes and auth failures are reported precisely.
+- The exit-code-77 → `RemotePathInvalid` mapping (row 7) is contingent on the wrapper snippet in §4.5 being used. If a custom wrapper is substituted, the classifier MUST still fall through to `SshShellDidNotStart` when shell_started was not seen.
+- The classification logic must be centralized in `crates/terminal-mesh-transport-ssh/src/ssh.rs` so it can be hardened later (regex patterns, OpenSSH version differences).
 
 ### 4.7 Error taxonomy
 
-`TransportError` should live in `crates/terminal-mesh-core/src/transport.rs` if shared broadly, or in `terminal-mesh-transport-ssh` with conversion into core status if kept transport-specific.
+`TransportError` lives in `crates/terminal-mesh-core/src/transport.rs` (shared across LocalTransport, SshTransport, and DockerOverSshTransport). Variants prefixed `Ssh*` and `Docker*` are scaffolded in the core crate but only produced by the SSH/Docker transport crates.
+
+All variants in the SSH/Docker pre-shell group (rows 4-8 of §4.6) are Phase A: they are returned synchronously from `Transport::spawn` as `Err(...)`. They MUST NOT be wrapped in a `TransportSession` and MUST NOT trigger any `AttentionKind` event. Workspaces that fail with these errors never enter the Running or Done sidebars.
 
 Required variants:
 
 ```rust
 pub enum TransportError {
+    // ---- LocalTransport / generic transport errors ----
     SpawnFailed { program: String, message: String },
     Io { message: String },
     ResizeFailed { message: String },
     ShutdownFailed { message: String },
     WaitFailed { message: String },
 
+    // ---- SshTransport pre-shell errors (Phase A: returned from spawn, NO AttentionKind, NO Done entry) ----
     SshBinaryNotFound,
     SshAuth { user: String, host: String, port: u16 },
     SshConnect { host: String, port: u16, message: String },
-    SshHostKeyChanged { host: String, port: u16 },
-    SshShellDidNotStart { host: String, port: u16, ssh_exit: Option<i32> },
+    SshHostKeyChanged { host: String, port: u16, message: String },
+    SshShellDidNotStart { host: String, port: u16, ssh_exit: Option<i32>, stderr_tail: String },
     SshControlPathInvalid { path: PathBuf, message: String },
+    RemotePathInvalid { path: String, host: String, port: u16, message: String },
 
+    // ---- DockerOverSshTransport errors ----
     DockerContainerMissing { container: String },
     DockerExecFailed { container: String, message: String },
     DockerCleanupFailed { container: String, message: String },
 
+    // ---- Catch-all ----
     Protocol { message: String },
 }
 ```
+
+`RemotePathInvalid` is produced when the wrapper of §4.5 exits with code `77` (cd to `$AM_REMOTE_CWD` failed before reaching the interactive shell). The `path` field carries the offending `$AM_REMOTE_CWD` value; `message` carries a brief human-readable description (typically derived from `cd`'s stderr, e.g. `"No such file or directory"` or `"Permission denied"`).
+
+`SshHostKeyChanged` includes `message` so the UI can surface the OpenSSH-emitted hint (`"REMOTE HOST IDENTIFICATION HAS CHANGED!"` plus the offending known_hosts line number) to help the user diagnose the change.
+
+`SshShellDidNotStart` is the catch-all for "ssh exited with no shell-started sentinel and stderr matched no known failure pattern"; `stderr_tail` carries up to the last 2 KiB of stderr to aid post-mortem.
 
 ## 5. DockerOverSshTransport
 
@@ -650,6 +682,30 @@ Recommended test locations:
 - `crates/terminal-mesh-transport-ssh/tests/sentinel.rs`
 - `crates/terminal-mesh-transport-ssh/tests/control_master.rs`
 - `crates/terminal-mesh-transport-ssh/tests/ssh_state_machine.rs`
+
+### SshTransport Phase A negative paths (pre-shell failures)
+
+These tests assert the §4.6 Phase A invariant: failures before `am-shell-started` produce a typed `TransportError` from `Transport::spawn` AND do NOT enqueue a Done entry AND do NOT persist a `WorkspaceRecord`.
+
+Each test below MUST assert all THREE conditions:
+
+1. `Transport::spawn(...).await` returns `Err(TransportError::<expected variant with expected fields>)`.
+2. After the spawn error, `WorkspaceLifecycleSnapshot::done` is empty (no phantom Done entry was enqueued).
+3. After the spawn error, `WorkspaceStore::list()` does not contain a record for the failed workspace (no half-broken record was persisted).
+
+Required negative-path coverage:
+
+- **Auth failure**: simulate ssh exit with stderr containing `Permission denied (publickey)` → `TransportError::SshAuth { user, host, port }` with all three fields populated from the spawn request.
+- **Host-key changed**: simulate ssh exit with stderr containing `REMOTE HOST IDENTIFICATION HAS CHANGED!` → `TransportError::SshHostKeyChanged { host, port, message }` with the stderr line preserved in `message`.
+- **Connect failure (no TCP handshake)**: simulate ssh exit with stderr matching connection-refused / DNS / no-route / timeout patterns → `TransportError::SshConnect { host, port, message }`.
+- **Remote path invalid**: simulate ssh exit code `77` with NO `am-shell-started` sentinel observed → `TransportError::RemotePathInvalid { path, host, port, message }` with `path` equal to the requested `AM_REMOTE_CWD`.
+- **Catch-all (`SshShellDidNotStart`)**: simulate ssh exit with an unknown non-zero code and no recognized stderr pattern → `TransportError::SshShellDidNotStart { host, port, ssh_exit, stderr_tail }`.
+- **Phase A vs Phase B disambiguation**: simulate `am-shell-started` followed by a network drop (no `am-exit-status` sentinel, ssh exits non-zero) → the test MUST observe `Transport::spawn` return `Ok(session)` (Phase A succeeded), then on `session.wait()` see a session-level disconnect, and exactly ONE Done entry tagged with `AttentionKind::Disconnect`. This anchors the boundary between "no Done entry" (Phase A) and "Done entry permitted" (Phase B).
+
+Recommended test location:
+
+- `crates/terminal-mesh-transport-ssh/tests/phase_a_negative.rs`
+- `crates/terminal-mesh-transport-ssh/tests/phase_boundary.rs`
 
 ### DockerOverSsh wrapper cleanup
 

@@ -12,6 +12,7 @@ pub mod events;
 pub mod osc_agent_marker;
 pub mod prompt_detector;
 pub mod ring_buffer;
+pub mod transport;
 
 pub use actor::{ActorCommand, ActorError, TerminalActor, TerminalHandle, TerminalSpec};
 pub use ansi_scanner::{AnsiScanner, AnsiState};
@@ -23,3 +24,8 @@ pub use events::{
 pub use osc_agent_marker::{OscAgentMarkerParser, OSC_MAX_PAYLOAD_BYTES};
 pub use prompt_detector::PromptDetector;
 pub use ring_buffer::{BufferTruncatedInfo, RingBuffer, RING_CAPACITY_BYTES};
+pub use transport::{
+    DisconnectReason, LocalTransport, PathBufOrRemote, PtySize as TransportPtySize, ShellCommand,
+    ShutdownMode, Transport, TransportError, TransportExitStatus, TransportOutputStream,
+    TransportSession, TransportSpawnRequest, TransportStdinSink, WorkspaceLocation,
+};
