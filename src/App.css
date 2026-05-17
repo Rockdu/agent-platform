@@ -594,6 +594,19 @@
   border-top: 1px solid #2a2a2a;
   margin: 12px 0;
 }
+/* In-panel typed IDE error block. Sits inside the overlay scroll
+   area so it remains visible while the user is in the settings
+   panel — the parent's strip-level `.terminal-mesh-view__ide-error`
+   is covered by the overlay and would otherwise hide failures from
+   panel-originating Cursor/Finder actions and preference saves. */
+.terminal-mesh-view__settings-error {
+  margin: 8px 0 0 0;
+  padding: 6px 8px;
+  background: #5a1818;
+  color: #ffd0d0;
+  font-size: 12px;
+  border-radius: 3px;
+}
 .terminal-mesh-view__settings-subhead {
   margin: 0 0 8px 0;
   font-size: 12px;

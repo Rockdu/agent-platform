@@ -300,6 +300,7 @@ export function TerminalMeshView({ active, cwd, workspaceName }: TerminalMeshVie
         <WorkspaceSettingsPanel
           workspacePath={cwd}
           workspaceName={workspaceName}
+          ideError={ideError}
           onOpenIde={onOpenIde}
           onRevealFinder={onRevealFinder}
           onClose={() => setSettingsOpen(false)}
@@ -313,6 +314,11 @@ export function TerminalMeshView({ active, cwd, workspaceName }: TerminalMeshVie
 function WorkspaceSettingsPanel(props: {
   workspacePath: string;
   workspaceName?: string;
+  /// Most recent typed IDE handoff error from the surrounding view.
+  /// The panel overlays the strip-level `.terminal-mesh-view__ide-
+  /// error` line, so we render the same error inside the overlay so
+  /// it stays visible while the user is in the panel.
+  ideError: IdeHandoffErrorDto | null;
   onOpenIde: () => Promise<void> | void;
   onRevealFinder: () => Promise<void> | void;
   onClose: () => void;
@@ -321,6 +327,7 @@ function WorkspaceSettingsPanel(props: {
   const {
     workspacePath,
     workspaceName,
+    ideError,
     onOpenIde,
     onRevealFinder,
     onClose,
@@ -362,6 +369,15 @@ function WorkspaceSettingsPanel(props: {
             Finder 中显示
           </button>
         </div>
+        {ideError && (
+          <aside
+            className="terminal-mesh-view__settings-error"
+            role="alert"
+            data-ide-handoff-error={ideError.kind}
+          >
+            <code>{ideError.kind}</code>: {ideErrorMessage(ideError)}
+          </aside>
+        )}
         <hr className="terminal-mesh-view__settings-divider" />
         <h4 className="terminal-mesh-view__settings-subhead">IDE 偏好</h4>
         <IdePreferencePane onError={onIdeError} />
