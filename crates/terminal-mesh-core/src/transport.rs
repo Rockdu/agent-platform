@@ -1,14 +1,19 @@
 //! Transport abstraction for terminal-mesh sessions.
 //!
-//! Spec: `docs/specs/transport.md` sections 2, 3, 4.7. Round 1 ships
-//! the trait + `LocalTransport` in isolation; task3 (Round 2+) will
-//! refactor `TerminalActor::spawn` to consume `Arc<dyn Transport>`.
-//! Until then the existing `actor.rs` path remains the live spawner
-//! and these types are exercised only via this module's unit tests.
+//! The `Transport` trait describes how an interactive PTY-like session
+//! is created (`spawn`), and `TransportSession` owns the resulting
+//! lifecycle: output stream, stdin sink, resize, shutdown, wait, and
+//! cleanup. `LocalTransport` is the in-process implementation backed
+//! by `portable_pty::native_pty_system()`; remote implementations
+//! (SSH, SSH-in-Docker) live in their own crates and plug in through
+//! the same trait.
+//!
+//! Spec: `docs/specs/transport.md`.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use portable_pty::{
     native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize as PpPtySize,
@@ -22,7 +27,7 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 pub enum WorkspaceLocation {
     Local { path: Option<PathBuf> },
-    // Remote { ... } variants land with task14/task16.
+    // Remote variants are added when remote-workspace support lands.
 }
 
 #[derive(Debug, Clone)]
@@ -40,7 +45,7 @@ pub struct PtySize {
 #[derive(Debug, Clone)]
 pub enum PathBufOrRemote {
     Local(PathBuf),
-    // Remote { ... } variants land with task14/task16.
+    // Remote variants are added when remote-workspace support lands.
 }
 
 #[derive(Debug)]
@@ -91,7 +96,9 @@ pub enum TransportError {
     #[error("wait failed: {message}")]
     WaitFailed { message: String },
 
-    // ---- SSH pre-shell errors (Phase A; scaffolded for task16) ----
+    // ---- SSH pre-shell errors (returned from `Transport::spawn`,
+    //      never emitted as an `AttentionKind` event; consumed by the
+    //      SSH transport implementation when it lands) ----
     #[allow(dead_code)]
     #[error("ssh binary not found in PATH")]
     SshBinaryNotFound,
@@ -132,7 +139,8 @@ pub enum TransportError {
         message: String,
     },
 
-    // ---- Docker (scaffolded for task17) ----
+    // ---- Docker errors (consumed by the SSH-in-Docker transport
+    //      implementation when it lands) ----
     #[allow(dead_code)]
     #[error("docker container missing: {container}")]
     DockerContainerMissing { container: String },
@@ -174,11 +182,30 @@ pub trait Transport: Send + Sync {
 pub trait TransportSession: Send {
     fn output_stream(&mut self) -> Result<Box<dyn TransportOutputStream>, TransportError>;
     fn stdin_sink(&mut self) -> Result<Box<dyn TransportStdinSink>, TransportError>;
+
+    // Concurrent-access escape hatches: see docs/specs/transport.md §2.
+    // Default `None` for implementations that cannot decompose; callers
+    // fall back to the &mut-self methods and accept exclusion with wait.
+    fn take_shutdown_handle(&mut self) -> Option<Box<dyn TransportShutdownHandle>> {
+        None
+    }
+    fn take_resize_handle(&mut self) -> Option<Box<dyn TransportResizeHandle>> {
+        None
+    }
+
     fn resize(&mut self, size: PtySize) -> Result<(), TransportError>;
     fn shutdown(&mut self, mode: ShutdownMode) -> Result<(), TransportError>;
     fn wait(&mut self) -> Result<TransportExitStatus, TransportError>;
     fn disconnect_reason(&self) -> Option<DisconnectReason>;
     fn cleanup(&mut self) -> Result<(), TransportError>;
+}
+
+pub trait TransportShutdownHandle: Send + Sync {
+    fn shutdown(&self, mode: ShutdownMode) -> Result<(), TransportError>;
+}
+
+pub trait TransportResizeHandle: Send + Sync {
+    fn resize(&self, size: PtySize) -> Result<(), TransportError>;
 }
 
 // =====================================================================
@@ -200,7 +227,11 @@ impl Transport for LocalTransport {
         request: TransportSpawnRequest,
     ) -> Result<Box<dyn TransportSession>, TransportError> {
         let TransportSpawnRequest {
-            workspace: _, // Local-only in Round 1; Remote variants land with task14/task16.
+            // The workspace location is informational at this layer:
+            // selecting a transport implementation is the caller's
+            // responsibility; LocalTransport accepts the request as long
+            // as the command + cwd can be honored locally.
+            workspace: _,
             command,
             initial_size,
             env,
@@ -239,6 +270,7 @@ impl Transport for LocalTransport {
         })?;
 
         let killer = child.clone_killer();
+        let child_pid = child.process_id();
         drop(pair.slave);
 
         let reader = pair.master.try_clone_reader().map_err(|e| TransportError::Io {
@@ -251,7 +283,8 @@ impl Transport for LocalTransport {
         Ok(Box::new(LocalTransportSession {
             master: Some(pair.master),
             child: Some(child),
-            killer,
+            killer: Some(killer),
+            child_pid,
             reader: Some(reader),
             writer: Some(writer),
             disconnect_reason: None,
@@ -262,10 +295,100 @@ impl Transport for LocalTransport {
 struct LocalTransportSession {
     master: Option<Box<dyn MasterPty + Send>>,
     child: Option<Box<dyn Child + Send + Sync>>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
+    child_pid: Option<u32>,
     reader: Option<Box<dyn Read + Send>>,
     writer: Option<Box<dyn Write + Send>>,
     disconnect_reason: Option<DisconnectReason>,
+}
+
+struct LocalShutdownHandle {
+    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    child_pid: Option<u32>,
+}
+
+impl TransportShutdownHandle for LocalShutdownHandle {
+    fn shutdown(&self, mode: ShutdownMode) -> Result<(), TransportError> {
+        match mode {
+            ShutdownMode::Graceful => {
+                // portable-pty's `ChildKiller::kill` sends SIGHUP on
+                // Unix; well-behaved children unwind and exit.
+                let mut killer = self.killer.lock().map_err(|e| {
+                    TransportError::ShutdownFailed {
+                        message: format!("killer mutex poisoned: {e}"),
+                    }
+                })?;
+                killer.kill().map_err(|e| TransportError::ShutdownFailed {
+                    message: e.to_string(),
+                })
+            }
+            ShutdownMode::Kill => self.hard_kill(),
+        }
+    }
+}
+
+impl LocalShutdownHandle {
+    #[cfg(unix)]
+    fn hard_kill(&self) -> Result<(), TransportError> {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        if let Some(pid) = self.child_pid {
+            let raw = pid as i32;
+            kill(Pid::from_raw(raw), Signal::SIGKILL).map_err(|e| {
+                TransportError::ShutdownFailed {
+                    message: format!("SIGKILL pid {raw}: {e}"),
+                }
+            })?;
+            // Best-effort process-group kill; portable-pty `setsid`s the
+            // child, so this catches any descendants the shell spawned.
+            // ESRCH (no such process) is expected if the child already
+            // exited between SIGHUP and SIGKILL.
+            let _ = kill(Pid::from_raw(-raw), Signal::SIGKILL);
+            Ok(())
+        } else {
+            // No PID captured; fall back to the cooperative killer
+            // (still SIGHUP on Unix, but it's the best we can do).
+            let mut killer = self.killer.lock().map_err(|e| TransportError::ShutdownFailed {
+                message: format!("killer mutex poisoned: {e}"),
+            })?;
+            killer.kill().map_err(|e| TransportError::ShutdownFailed {
+                message: e.to_string(),
+            })
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn hard_kill(&self) -> Result<(), TransportError> {
+        // Windows: portable-pty's `kill` already does `TerminateProcess`.
+        let mut killer = self.killer.lock().map_err(|e| TransportError::ShutdownFailed {
+            message: format!("killer mutex poisoned: {e}"),
+        })?;
+        killer.kill().map_err(|e| TransportError::ShutdownFailed {
+            message: e.to_string(),
+        })
+    }
+}
+
+struct LocalResizeHandle {
+    master: Mutex<Box<dyn MasterPty + Send>>,
+}
+
+impl TransportResizeHandle for LocalResizeHandle {
+    fn resize(&self, size: PtySize) -> Result<(), TransportError> {
+        let master = self.master.lock().map_err(|e| TransportError::ResizeFailed {
+            message: format!("master mutex poisoned: {e}"),
+        })?;
+        master
+            .resize(PpPtySize {
+                rows: size.rows,
+                cols: size.cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| TransportError::ResizeFailed {
+                message: e.to_string(),
+            })
+    }
 }
 
 struct LocalReaderAdapter(Box<dyn Read + Send>);
@@ -306,9 +429,27 @@ impl TransportSession for LocalTransportSession {
             })
     }
 
+    fn take_shutdown_handle(&mut self) -> Option<Box<dyn TransportShutdownHandle>> {
+        let pid = self.child_pid;
+        self.killer.take().map(|k| {
+            Box::new(LocalShutdownHandle {
+                killer: Mutex::new(k),
+                child_pid: pid,
+            }) as Box<dyn TransportShutdownHandle>
+        })
+    }
+
+    fn take_resize_handle(&mut self) -> Option<Box<dyn TransportResizeHandle>> {
+        self.master.take().map(|m| {
+            Box::new(LocalResizeHandle {
+                master: Mutex::new(m),
+            }) as Box<dyn TransportResizeHandle>
+        })
+    }
+
     fn resize(&mut self, size: PtySize) -> Result<(), TransportError> {
         let master = self.master.as_mut().ok_or(TransportError::ResizeFailed {
-            message: "master pty already dropped".into(),
+            message: "master pty handle already taken or session torn down".into(),
         })?;
         master
             .resize(PpPtySize {
@@ -323,11 +464,13 @@ impl TransportSession for LocalTransportSession {
     }
 
     fn shutdown(&mut self, _mode: ShutdownMode) -> Result<(), TransportError> {
-        // portable-pty's ChildKiller::kill() sends SIGHUP on Unix; both
-        // Graceful and Kill use the same primitive at this layer. The
-        // actor's processor task (actor.rs, ESCALATE_TO_SIGKILL_AFTER)
-        // is the only place that owns SIGKILL escalation timing.
-        self.killer.kill().map_err(|e| TransportError::ShutdownFailed {
+        // `ChildKiller::kill` sends SIGHUP on Unix. SIGKILL escalation
+        // for HUP-trapping children is performed by the caller after a
+        // grace window using the captured child PID.
+        let killer = self.killer.as_mut().ok_or(TransportError::ShutdownFailed {
+            message: "shutdown handle already taken or session torn down".into(),
+        })?;
+        killer.kill().map_err(|e| TransportError::ShutdownFailed {
             message: e.to_string(),
         })
     }
@@ -430,6 +573,59 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn local_transport_stdin_round_trip() {
+        // Spawn a child that reads one line of stdin and echoes it back
+        // with a recognizable prefix. Verifies the full LocalTransport
+        // bidirectional path: stdin_sink writes the line, output_stream
+        // delivers the transformed bytes, wait returns CleanCompletion.
+        let mut session = LocalTransport::new()
+            .spawn(request(
+                "/bin/sh",
+                &["-c", "IFS= read -r line; printf 'stdin:%s\\n' \"$line\""],
+            ))
+            .expect("spawn");
+
+        let mut writer = session.stdin_sink().expect("sink");
+        writer.write(b"hello-stdin\n").expect("write");
+        writer.flush().expect("flush");
+        drop(writer);
+
+        let mut reader = session.output_stream().expect("stream");
+        let mut accum = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    accum.extend_from_slice(&buf[..n]);
+                    if String::from_utf8_lossy(&accum).contains("stdin:hello-stdin") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+            if Instant::now() > deadline {
+                break;
+            }
+        }
+
+        let s = String::from_utf8_lossy(&accum);
+        assert!(
+            s.contains("stdin:hello-stdin"),
+            "expected stdin echo, got {s:?}"
+        );
+
+        let status = session.wait().expect("wait");
+        assert!(
+            matches!(status, TransportExitStatus::CleanCompletion),
+            "expected CleanCompletion, got {status:?}"
+        );
+        session.cleanup().expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn local_transport_shutdown_kills_long_running_child() {
         let mut session = LocalTransport::new()
             .spawn(request("/bin/sleep", &["30"]))
@@ -449,6 +645,50 @@ mod tests {
             "expected non-clean exit after Kill, got {status:?}"
         );
         session.cleanup().expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn take_handles_decompose_session_for_concurrent_dispatch() {
+        // After take_*_handle, the session's own resize/shutdown methods
+        // must return typed errors so the ownership transfer is explicit.
+        // The extracted handles must successfully dispatch from threads
+        // that do not own &mut self on the session.
+        use std::sync::Arc;
+
+        let mut session = LocalTransport::new()
+            .spawn(request("/bin/sleep", &["30"]))
+            .expect("spawn");
+        let shutdown: Arc<dyn TransportShutdownHandle> =
+            Arc::from(session.take_shutdown_handle().expect("shutdown handle"));
+        let resize: Arc<dyn TransportResizeHandle> =
+            Arc::from(session.take_resize_handle().expect("resize handle"));
+
+        assert!(matches!(
+            session.shutdown(ShutdownMode::Kill),
+            Err(TransportError::ShutdownFailed { .. })
+        ));
+        assert!(matches!(
+            session.resize(PtySize { cols: 120, rows: 30 }),
+            Err(TransportError::ResizeFailed { .. })
+        ));
+
+        resize
+            .resize(PtySize { cols: 132, rows: 50 })
+            .expect("resize via handle");
+
+        let shutdown_clone: Arc<dyn TransportShutdownHandle> = Arc::clone(&shutdown);
+        let waiter = std::thread::spawn(move || session.wait());
+        std::thread::sleep(Duration::from_millis(100));
+        shutdown_clone
+            .shutdown(ShutdownMode::Kill)
+            .expect("shutdown via handle");
+
+        let status = waiter.join().expect("waiter join").expect("wait");
+        assert!(
+            !matches!(status, TransportExitStatus::CleanCompletion),
+            "expected non-clean exit after Kill via handle, got {status:?}"
+        );
     }
 
     #[test]

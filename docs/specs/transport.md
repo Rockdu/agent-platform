@@ -38,13 +38,35 @@ pub struct TransportSpawnRequest {
 pub trait TransportSession: Send {
     fn output_stream(&mut self) -> Result<Box<dyn TransportOutputStream>, TransportError>;
     fn stdin_sink(&mut self) -> Result<Box<dyn TransportStdinSink>, TransportError>;
+
+    // Concurrent-access escape hatches. The session's own `resize`,
+    // `shutdown`, and `wait` all take `&mut self`, so a blocking
+    // `wait` excludes resize/shutdown for its entire duration. Callers
+    // that need to dispatch resize/shutdown concurrently with a long
+    // wait take these handles BEFORE moving the session into the wait
+    // thread. Implementations that cannot decompose return `None`; in
+    // that case the caller falls back to the `&mut self` methods and
+    // accepts the exclusion.
+    fn take_shutdown_handle(&mut self) -> Option<Box<dyn TransportShutdownHandle>> { None }
+    fn take_resize_handle(&mut self) -> Option<Box<dyn TransportResizeHandle>> { None }
+
     fn resize(&mut self, size: PtySize) -> Result<(), TransportError>;
     fn shutdown(&mut self, mode: ShutdownMode) -> Result<(), TransportError>;
     fn wait(&mut self) -> Result<TransportExitStatus, TransportError>;
     fn disconnect_reason(&self) -> Option<DisconnectReason>;
     fn cleanup(&mut self) -> Result<(), TransportError>;
 }
+
+pub trait TransportShutdownHandle: Send + Sync {
+    fn shutdown(&self, mode: ShutdownMode) -> Result<(), TransportError>;
+}
+
+pub trait TransportResizeHandle: Send + Sync {
+    fn resize(&self, size: PtySize) -> Result<(), TransportError>;
+}
 ```
+
+`take_shutdown_handle` and `take_resize_handle` are one-shot: after a successful take, the session's own `shutdown`/`resize` methods MUST return a typed error (`TransportError::ShutdownFailed` / `TransportError::ResizeFailed`) so the ownership transfer is explicit. The handles use `&self` so multiple call sites (a tokio task plus a Drop guard, for example) can hold clones / Arcs and dispatch concurrently with the blocking `wait`.
 
 `output_stream()` returns the byte stream read by terminal-mesh-core. This remains the single source for terminal rendering, local scrollback, OSC marker parsing, completion detection, and attention events.
 
@@ -111,6 +133,8 @@ The done queue triggers only on:
 - existing resize behavior
 - existing completion and non-zero-exit behavior
 - existing OSC 1337 `AgentMarker` parsing
+
+LocalTransport's session implements BOTH `take_shutdown_handle` and `take_resize_handle` returning `Some(...)`: the shutdown handle wraps the `Box<dyn ChildKiller + Send + Sync>` cloned out of the child at spawn time; the resize handle wraps the `Box<dyn MasterPty + Send>` under an internal mutex. The `TerminalActor` takes both before moving the residual session into the blocking wait thread so resize/shutdown remain dispatchable while wait owns the session.
 
 Recommended location:
 

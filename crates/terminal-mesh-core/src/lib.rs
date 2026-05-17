@@ -27,5 +27,6 @@ pub use ring_buffer::{BufferTruncatedInfo, RingBuffer, RING_CAPACITY_BYTES};
 pub use transport::{
     DisconnectReason, LocalTransport, PathBufOrRemote, PtySize as TransportPtySize, ShellCommand,
     ShutdownMode, Transport, TransportError, TransportExitStatus, TransportOutputStream,
-    TransportSession, TransportSpawnRequest, TransportStdinSink, WorkspaceLocation,
+    TransportResizeHandle, TransportSession, TransportShutdownHandle, TransportSpawnRequest,
+    TransportStdinSink, WorkspaceLocation,
 };

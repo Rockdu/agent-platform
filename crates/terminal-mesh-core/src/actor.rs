@@ -13,16 +13,14 @@
 //!
 //! Spec: `docs/specs/terminal-events.md`. Targets AC-4.1 + AC-4.2.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-// task22 Round 41: per-actor `DedupArbiter` removed; the host
-// `NotificationService` is now the single notification-dedup point.
-// `dedup_key` is still consumed by host code via `crate::events`.
 use crate::events::{
     dedup_key, AttentionKind, BufferTruncated, NeedsAttentionPayload, TerminalEvent,
     TerminalEventEnvelope, TERMINAL_MESH_PLUGIN_ID,
@@ -30,6 +28,11 @@ use crate::events::{
 use crate::osc_agent_marker::OscAgentMarkerParser;
 use crate::prompt_detector::PromptDetector;
 use crate::ring_buffer::RingBuffer;
+use crate::transport::{
+    LocalTransport, PathBufOrRemote, PtySize as TransportPtySize, ShellCommand, ShutdownMode,
+    Transport, TransportExitStatus, TransportResizeHandle, TransportShutdownHandle,
+    TransportSpawnRequest, TransportStdinSink, WorkspaceLocation,
+};
 
 const READ_CHUNK_BYTES: usize = 16 * 1024;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -82,10 +85,17 @@ pub struct TerminalHandle {
 pub struct TerminalActor;
 
 impl TerminalActor {
-    /// Spawn a Terminal Mesh actor with `spec`. The actor runs on the
-    /// ambient Tokio runtime; the reader is a standalone `std::thread`
-    /// so a blocking PTY read can't starve the runtime.
-    pub fn spawn(spec: TerminalSpec) -> Result<TerminalHandle, ActorError> {
+    /// Spawn a Terminal Mesh actor backed by the supplied `transport`.
+    /// The actor runs on the ambient Tokio runtime; the byte reader is a
+    /// standalone `std::thread` so a blocking PTY read can't starve the
+    /// runtime, and a second thread owns the session for the blocking
+    /// `wait`. Resize and shutdown go through handles extracted from
+    /// the session before `wait` takes ownership, so they remain
+    /// dispatchable while wait is in progress.
+    pub fn spawn(
+        transport: Arc<dyn Transport>,
+        spec: TerminalSpec,
+    ) -> Result<TerminalHandle, ActorError> {
         let TerminalSpec {
             terminal_id,
             command,
@@ -96,54 +106,49 @@ impl TerminalActor {
             rows,
         } = spec;
 
-        let pty_system = native_pty_system();
-        let pty_pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+        let mut env_map: BTreeMap<String, String> = BTreeMap::new();
+        for (k, v) in env {
+            env_map.insert(k, v);
+        }
+        let request = TransportSpawnRequest {
+            workspace: WorkspaceLocation::Local {
+                path: cwd.clone(),
+            },
+            command: ShellCommand {
+                program: command,
+                args,
+            },
+            initial_size: TransportPtySize { cols, rows },
+            env: env_map,
+            cwd: cwd.map(PathBufOrRemote::Local),
+        };
+
+        let mut session = transport
+            .spawn(request)
             .map_err(|e| ActorError::Pty(e.to_string()))?;
 
-        let mut cmd_builder = CommandBuilder::new(&command);
-        for a in &args {
-            cmd_builder.arg(a);
-        }
-        if let Some(dir) = cwd.as_ref() {
-            cmd_builder.cwd(dir);
-        }
-        for (k, v) in &env {
-            cmd_builder.env(k, v);
-        }
-
-        let mut child = pty_pair
-            .slave
-            .spawn_command(cmd_builder)
+        let mut reader = session
+            .output_stream()
             .map_err(|e| ActorError::Pty(e.to_string()))?;
-        // Clone an independent killer BEFORE moving the child into the
-        // wait thread; the killer is non-blocking and lives in the
-        // processor task so Shutdown can fire without racing the
-        // wait-thread's blocking `child.wait()`.
-        let killer: Box<dyn ChildKiller + Send + Sync> = child.clone_killer();
-        // Capture the child's PID for SIGKILL escalation; portable-pty
-        // 0.9's ProcessSignaller::kill() only sends SIGHUP on Unix, so
-        // a child that traps HUP needs an out-of-band hard kill that
-        // the processor task issues if `exit_rx` doesn't resolve
-        // within the escalation window.
-        let child_pid: Option<u32> = child.process_id();
-        // Drop the slave half so the child owns it exclusively.
-        drop(pty_pair.slave);
-
-        let mut reader = pty_pair
-            .master
-            .try_clone_reader()
+        let writer = session
+            .stdin_sink()
             .map_err(|e| ActorError::Pty(e.to_string()))?;
-        let writer = pty_pair
-            .master
-            .take_writer()
-            .map_err(|e| ActorError::Pty(e.to_string()))?;
-        let master: Box<dyn MasterPty + Send> = pty_pair.master;
+        let shutdown_handle: Arc<dyn TransportShutdownHandle> = session
+            .take_shutdown_handle()
+            .ok_or_else(|| {
+                ActorError::Pty(
+                    "transport does not expose a concurrent shutdown handle".into(),
+                )
+            })?
+            .into();
+        let resize_handle: Arc<dyn TransportResizeHandle> = session
+            .take_resize_handle()
+            .ok_or_else(|| {
+                ActorError::Pty(
+                    "transport does not expose a concurrent resize handle".into(),
+                )
+            })?
+            .into();
 
         let (events_tx, events_rx) = mpsc::channel::<TerminalEventEnvelope>(EVENT_CHANNEL_CAPACITY);
         let (status_tx, status_rx) = mpsc::channel::<BufferTruncated>(STATUS_CHANNEL_CAPACITY);
@@ -152,9 +157,10 @@ impl TerminalActor {
         let (reader_done_tx, reader_done_rx) = oneshot::channel::<()>();
         let (exit_tx, exit_rx) = oneshot::channel::<Option<i32>>();
 
-        // Reader thread (sync). Reads from `reader` until EOF or error;
-        // forwards every chunk over `bytes_tx`. Signals `reader_done_tx`
-        // when finished so the processor can drain pending bytes.
+        // Reader thread (sync). Reads from the transport's output stream
+        // until EOF or error; forwards every chunk over `bytes_tx`.
+        // Signals `reader_done_tx` when finished so the processor can
+        // drain pending bytes.
         std::thread::Builder::new()
             .name(format!("terminal-mesh-reader-{terminal_id}"))
             .spawn(move || {
@@ -174,29 +180,28 @@ impl TerminalActor {
             })
             .map_err(|e| ActorError::Io(e.to_string()))?;
 
-        // Exit waiter — `Child::wait` is blocking; offload to a thread
-        // that owns the child outright. Killing happens through the
-        // pre-cloned `killer` in the processor task, so we don't need
-        // any Mutex/Arc indirection here.
+        // Wait thread owns the residual session and calls the blocking
+        // `wait`. Shutdown happens out-of-band via the pre-extracted
+        // shutdown handle, so we don't need any Mutex/Arc indirection
+        // around the session itself.
         std::thread::Builder::new()
             .name(format!("terminal-mesh-wait-{terminal_id}"))
             .spawn(move || {
-                let code = child
-                    .wait()
-                    .ok()
-                    .map(|status| status.exit_code() as i32);
+                let code = match session.wait() {
+                    Ok(TransportExitStatus::CleanCompletion) => Some(0),
+                    Ok(TransportExitStatus::NonZeroExit(n))
+                    | Ok(TransportExitStatus::Signaled(n)) => Some(n),
+                    Ok(TransportExitStatus::Disconnect(_)) | Err(_) => None,
+                };
                 let _ = exit_tx.send(code);
             })
             .map_err(|e| ActorError::Io(e.to_string()))?;
 
-        // Processor + command listener — single tokio task because they
-        // share state (ring buffer, parser, master PTY for resize).
         tokio::spawn(processor_task(
             terminal_id,
-            master,
+            resize_handle,
             writer,
-            killer,
-            child_pid,
+            shutdown_handle,
             bytes_rx,
             command_rx,
             events_tx,
@@ -212,15 +217,21 @@ impl TerminalActor {
             status_rx,
         })
     }
+
+    /// Backward-compatible entry point that uses the in-process
+    /// `LocalTransport`. This is the default path callers reach for when
+    /// they do not need to inject an alternate transport.
+    pub fn spawn_local(spec: TerminalSpec) -> Result<TerminalHandle, ActorError> {
+        Self::spawn(Arc::new(LocalTransport::new()) as Arc<dyn Transport>, spec)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn processor_task(
     terminal_id: Uuid,
-    master: Box<dyn MasterPty + Send>,
-    mut writer: Box<dyn std::io::Write + Send>,
-    mut killer: Box<dyn ChildKiller + Send + Sync>,
-    child_pid: Option<u32>,
+    resize_handle: Arc<dyn TransportResizeHandle>,
+    writer_in: Box<dyn TransportStdinSink>,
+    shutdown_handle: Arc<dyn TransportShutdownHandle>,
     mut bytes_rx: mpsc::Receiver<Vec<u8>>,
     mut command_rx: mpsc::Receiver<ActorCommand>,
     events_tx: mpsc::Sender<TerminalEventEnvelope>,
@@ -228,6 +239,10 @@ async fn processor_task(
     mut reader_done_rx: oneshot::Receiver<()>,
     mut exit_rx: oneshot::Receiver<Option<i32>>,
 ) {
+    // Wrap writer in Option so we can drop it after the child exits to
+    // release the master fd refcount and help the kernel propagate EOF
+    // to the reader thread.
+    let mut writer: Option<Box<dyn TransportStdinSink>> = Some(writer_in);
     let mut ring = RingBuffer::new();
     let mut osc = OscAgentMarkerParser::new();
     let mut prompt = PromptDetector::default_bash_zsh();
@@ -265,10 +280,7 @@ async fn processor_task(
                 exit_observed = true;
                 // Drop the writer so the master fd refcount goes down,
                 // helping the kernel propagate EOF to the reader.
-                drop(std::mem::replace(
-                    &mut writer,
-                    Box::new(std::io::sink()) as Box<dyn std::io::Write + Send>,
-                ));
+                writer = None;
                 drain_deadline = Some(
                     tokio::time::Instant::now() + Duration::from_millis(250),
                 );
@@ -278,18 +290,17 @@ async fn processor_task(
             cmd = command_rx.recv(), if !commands_closed => {
                 match cmd {
                     Some(ActorCommand::WriteStdin(bytes)) => {
-                        if let Err(e) = writer.write_all(&bytes) {
-                            tracing::warn!(%terminal_id, %e, "stdin write failed");
+                        if let Some(w) = writer.as_mut() {
+                            if let Err(e) = write_all_sink(w.as_mut(), &bytes) {
+                                tracing::warn!(%terminal_id, %e, "stdin write failed");
+                            }
+                            let _ = w.flush();
                         }
-                        let _ = writer.flush();
                     }
                     Some(ActorCommand::Resize { cols, rows }) => {
-                        if let Err(e) = master.resize(PtySize {
-                            rows,
-                            cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        }) {
+                        if let Err(e) = resize_handle
+                            .resize(TransportPtySize { cols, rows })
+                        {
                             tracing::warn!(%terminal_id, %e, "pty resize failed");
                         }
                         let envelope = TerminalEventEnvelope::now(
@@ -300,17 +311,17 @@ async fn processor_task(
                     }
                     Some(ActorCommand::Shutdown) => {
                         shutdown_requested = true;
-                        // Step 1 (graceful): SIGHUP via the cloned
-                        // killer (portable-pty 0.9's ProcessSignaller
-                        // on Unix). A well-behaved child unwinds and
-                        // exits; the wait thread then resolves
-                        // `exit_rx`.
-                        if let Err(e) = killer.kill() {
-                            tracing::warn!(%terminal_id, %e, "child kill (SIGHUP) failed");
+                        // Step 1 (graceful): SIGHUP on Unix via the
+                        // pre-extracted shutdown handle. A well-behaved
+                        // child unwinds and exits; the wait thread then
+                        // resolves `exit_rx`.
+                        if let Err(e) = shutdown_handle.shutdown(ShutdownMode::Graceful) {
+                            tracing::warn!(%terminal_id, %e, "graceful shutdown failed");
                         }
                         // Step 2 (escalation): if exit_rx hasn't
-                        // resolved within the grace window, the new
-                        // select arm below sends SIGKILL out-of-band.
+                        // resolved within the grace window, the next
+                        // select arm sends a hard kill via the same
+                        // handle.
                         if escalation_deadline.is_none() && !exit_observed {
                             escalation_deadline = Some(
                                 tokio::time::Instant::now() + ESCALATE_TO_SIGKILL_AFTER,
@@ -399,12 +410,14 @@ async fn processor_task(
                     std::future::pending::<()>().await;
                 }
             }, if escalation_deadline.is_some() && !exit_observed => {
-                send_hard_kill(terminal_id, child_pid, &mut killer);
+                if let Err(e) = shutdown_handle.shutdown(ShutdownMode::Kill) {
+                    tracing::warn!(%terminal_id, %e, "hard kill escalation failed");
+                }
                 // Single-shot: clear the deadline so the arm doesn't
-                // fire repeatedly. If SIGKILL itself somehow fails to
-                // terminate the child, the wait thread stays blocked
-                // and the loop falls through to the drain-deadline
-                // exit path on the next iteration anyway.
+                // fire repeatedly. If the hard kill itself somehow
+                // fails to terminate the child, the wait thread stays
+                // blocked and the loop falls through to the
+                // drain-deadline exit path on the next iteration anyway.
                 escalation_deadline = None;
             }
 
@@ -443,52 +456,34 @@ async fn processor_task(
     }
 }
 
-/// Hard-kill escalation. On Unix this delivers SIGKILL to both the
-/// child PID and (best-effort) its process group — portable-pty
-/// `setsid`s the child, so the negative-pid form catches descendants
-/// the shell spawned. On non-Unix we re-invoke the cloned killer
-/// since portable-pty's Windows path already does `TerminateProcess`.
-fn send_hard_kill(
-    terminal_id: Uuid,
-    child_pid: Option<u32>,
-    killer: &mut Box<dyn ChildKiller + Send + Sync>,
-) {
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        if let Some(pid) = child_pid {
-            let raw = pid as i32;
-            if let Err(e) = kill(Pid::from_raw(raw), Signal::SIGKILL) {
-                tracing::warn!(%terminal_id, pid = raw, %e, "SIGKILL escalation to pid failed");
+/// Drain `bytes` into `sink` using repeated `write` calls until either
+/// all bytes are written or the sink returns an error. `TransportStdinSink`
+/// does not extend `std::io::Write`, so we cannot rely on `write_all`.
+fn write_all_sink(
+    sink: &mut dyn TransportStdinSink,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match sink.write(&bytes[offset..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "transport stdin sink wrote zero bytes",
+                ));
             }
-            // Best-effort process-group kill; portable-pty's `setsid`
-            // makes the child its own session leader, so this catches
-            // any descendants the shell spawned. ESRCH (no such
-            // process) is expected if the child already exited
-            // between the SIGHUP and SIGKILL — log at debug only.
-            if let Err(e) = kill(Pid::from_raw(-raw), Signal::SIGKILL) {
-                tracing::debug!(%terminal_id, pgid = -raw, %e, "SIGKILL pgid (best-effort) failed");
-            }
-        } else {
-            tracing::warn!(%terminal_id, "no child_pid captured; falling back to killer.kill()");
-            let _ = killer.kill();
+            Ok(n) => offset += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = child_pid; // not used
-        if let Err(e) = killer.kill() {
-            tracing::warn!(%terminal_id, %e, "fallback killer.kill() failed on non-unix");
-        }
-    }
+    Ok(())
 }
 
-/// task22 Round 41: emit every classified `NeedsAttention` event
-/// unconditionally. The host `NotificationService` owns dedup; this
-/// helper only handles `dedup_key` formatting and envelope wrapping.
-/// Each call generates a fresh `event_id` so the host arbiter can
-/// distinguish individual events for its suppressed-count tracking.
+/// Emit every classified `NeedsAttention` event unconditionally; the
+/// host `NotificationService` owns dedup. Each call generates a fresh
+/// `event_id` so the host arbiter can distinguish individual events
+/// for its suppressed-count tracking.
 async fn emit_attention(
     terminal_id: Uuid,
     events_tx: &mpsc::Sender<TerminalEventEnvelope>,
@@ -552,7 +547,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn actor_emits_output_then_exit_for_echo_command() {
-        let handle = TerminalActor::spawn(shell_spec("echo hi; exit 0")).expect("spawn");
+        let handle = TerminalActor::spawn_local(shell_spec("echo hi; exit 0")).expect("spawn");
         let TerminalHandle {
             mut events_rx,
             command_tx,
@@ -573,7 +568,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn actor_emits_completion_for_zero_exit_and_nonzero_for_nonzero_exit() {
-        let h0 = TerminalActor::spawn(shell_spec("exit 0")).expect("spawn");
+        let h0 = TerminalActor::spawn_local(shell_spec("exit 0")).expect("spawn");
         let mut rx0 = h0.events_rx;
         let _tx0 = h0.command_tx;
         let evs0 = collect_until(
@@ -600,7 +595,7 @@ mod tests {
             }
         )));
 
-        let h1 = TerminalActor::spawn(shell_spec("exit 7")).expect("spawn");
+        let h1 = TerminalActor::spawn_local(shell_spec("exit 7")).expect("spawn");
         let mut rx1 = h1.events_rx;
         let _tx1 = h1.command_tx;
         let evs1 = collect_until(
@@ -632,7 +627,7 @@ mod tests {
     async fn actor_propagates_stdin_write_to_child() {
         // cat reads stdin and echoes; we write "abc\n", exit on EOF.
         // Use `head -1` to bound the test instead of sending EOF.
-        let h = TerminalActor::spawn(shell_spec("head -1")).expect("spawn");
+        let h = TerminalActor::spawn_local(shell_spec("head -1")).expect("spawn");
         let TerminalHandle {
             mut events_rx,
             command_tx,
@@ -661,7 +656,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn actor_handles_resize_command_without_crash() {
-        let h = TerminalActor::spawn(shell_spec("sleep 0.5")).expect("spawn");
+        let h = TerminalActor::spawn_local(shell_spec("sleep 0.5")).expect("spawn");
         let TerminalHandle {
             mut events_rx,
             command_tx,
@@ -687,7 +682,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn actor_cwd_and_env_are_propagated_to_child() {
         let tmp = tempfile_dir();
-        let h = TerminalActor::spawn(TerminalSpec {
+        let h = TerminalActor::spawn_local(TerminalSpec {
             terminal_id: Uuid::new_v4(),
             command: PathBuf::from("/bin/sh"),
             args: vec!["-c".into(), "echo CWD=$(pwd) MY=$MY_VAR; exit 0".into()],
@@ -739,7 +734,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_kills_long_running_child_and_emits_cancelled() {
         let started = std::time::Instant::now();
-        let h = TerminalActor::spawn(shell_spec("sleep 30")).expect("spawn");
+        let h = TerminalActor::spawn_local(shell_spec("sleep 30")).expect("spawn");
         let TerminalHandle {
             mut events_rx,
             command_tx,
@@ -778,7 +773,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_escalates_to_sigkill_for_hup_trapping_child() {
         let started = std::time::Instant::now();
-        let h = TerminalActor::spawn(shell_spec("trap '' HUP; sleep 30"))
+        let h = TerminalActor::spawn_local(shell_spec("trap '' HUP; sleep 30"))
             .expect("spawn");
         let TerminalHandle {
             mut events_rx,
@@ -822,7 +817,7 @@ mod tests {
         let script = r#"i=1; while [ $i -le 200 ]; do printf 'line %d\n' $i; i=$((i+1)); done; exit 0"#;
         let mut joins = Vec::new();
         for _ in 0..8 {
-            let h = TerminalActor::spawn(shell_spec(script)).expect("spawn");
+            let h = TerminalActor::spawn_local(shell_spec(script)).expect("spawn");
             let TerminalHandle {
                 mut events_rx,
                 command_tx,
@@ -875,7 +870,7 @@ mod tests {
     async fn four_concurrent_actors_all_emit_completion() {
         let mut handles = Vec::new();
         for _ in 0..4 {
-            let h = TerminalActor::spawn(shell_spec("sleep 0.1; exit 0")).expect("spawn");
+            let h = TerminalActor::spawn_local(shell_spec("sleep 0.1; exit 0")).expect("spawn");
             handles.push(h);
         }
         // Run them in parallel; each must observe a Completion event.

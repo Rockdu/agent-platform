@@ -338,7 +338,7 @@ pub(crate) fn spawn_into_registry(
     registry: &TerminalMeshRegistry,
     tab_id: Option<String>,
 ) -> Result<Uuid, TerminalMeshError> {
-    let handle = TerminalActor::spawn(spec).map_err(TerminalMeshError::from)?;
+    let handle = TerminalActor::spawn_local(spec).map_err(TerminalMeshError::from)?;
     let TerminalHandle {
         terminal_id: id,
         events_rx,
@@ -849,7 +849,7 @@ mod tests {
 
         for _ in 0..4 {
             let id = uuid::Uuid::new_v4();
-            let handle = TerminalActor::spawn(TerminalSpec {
+            let handle = TerminalActor::spawn_local(TerminalSpec {
                 terminal_id: id,
                 command: PathBuf::from("/bin/sh"),
                 args: vec!["-c".into(), "sleep 30".into()],
