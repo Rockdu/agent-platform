@@ -175,7 +175,11 @@ pub fn run() {
         .manage(MountRegistry::new())
         .manage(PluginMigrationState::new())
         .manage(AccessTokenCache::new())
-        .manage(SidecarManager::new(SidecarConfig::production_defaults()))
+        .manage({
+            let mgr = std::sync::Arc::new(SidecarManager::new(SidecarConfig::production_defaults()));
+            SidecarManager::install_self_arc(&mgr);
+            mgr
+        })
         .setup(|app| {
             let result = bootstrap::ensure_dirs().and_then(|paths| {
                 // Now that the generated plugin registry is available, create

@@ -977,15 +977,15 @@ fn emit_ts_per_plugin_wrappers(
         // typed import line per plugin.
         let mut type_imports: Vec<String> = Vec::new();
         for cmd in &m.file.commands {
-            if let Some(t) = &cmd.args_type {
-                if !type_imports.contains(t) {
-                    type_imports.push(t.clone());
-                }
+            if let Some(t) = &cmd.args_type
+                && !type_imports.contains(t)
+            {
+                type_imports.push(t.clone());
             }
-            if let Some(t) = &cmd.result_type {
-                if !type_imports.contains(t) {
-                    type_imports.push(t.clone());
-                }
+            if let Some(t) = &cmd.result_type
+                && !type_imports.contains(t)
+            {
+                type_imports.push(t.clone());
             }
         }
 

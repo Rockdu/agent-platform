@@ -47,12 +47,11 @@ fn resolve_workspace_root() -> Result<PathBuf, String> {
     let mut cur: &Path = &start;
     loop {
         let cargo_toml = cur.join("Cargo.toml");
-        if cargo_toml.exists() {
-            if let Ok(s) = std::fs::read_to_string(&cargo_toml) {
-                if s.contains("[workspace]") {
-                    return Ok(cur.to_path_buf());
-                }
-            }
+        if cargo_toml.exists()
+            && let Ok(s) = std::fs::read_to_string(&cargo_toml)
+            && s.contains("[workspace]")
+        {
+            return Ok(cur.to_path_buf());
         }
         match cur.parent() {
             Some(p) => cur = p,
