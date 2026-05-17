@@ -11,6 +11,7 @@ mod generated;
 mod ide_handoff;
 mod logging;
 mod mcp_config;
+mod orchestrator;
 mod plugin_sqlite;
 mod secrets;
 mod sidecar_manager;
@@ -25,6 +26,7 @@ use plugin_sqlite::{run_all_plugin_migrations_at_bootstrap, PluginMigrationState
 use secrets::{AccessTokenCache, SecretsErrorDto, SetupMarker, SetupStatus};
 use sidecar_manager::{SidecarConfig, SidecarManager};
 use ide_handoff::IdePreferenceStore;
+use orchestrator::{OrchestratorBootstrap, OrchestratorState};
 use terminal_mesh::TerminalMeshRegistry;
 use workspaces::WorkspaceRegistry;
 use serde::Serialize;
@@ -286,12 +288,22 @@ pub fn run() {
                     // `ide_get_preference` / `ide_set_preference` and
                     // consumed by `ide_open_workspace` /
                     // `ide_reveal_in_finder`.
-                    let ide_store = IdePreferenceStore::load(app_data_root);
+                    let ide_store = IdePreferenceStore::load(app_data_root.clone());
                     tracing::info!(
                         ide_command = %ide_store.snapshot().ide_command,
                         "ide preference loaded"
                     );
                     app.manage(ide_store);
+
+                    // Round 35 (task20): manage orchestrator bootstrap
+                    // context + empty session state. The orchestrator
+                    // tab's launch path consumes these via
+                    // `orchestrator_launch_claude` / `_status`.
+                    app.manage(OrchestratorState::new());
+                    app.manage(OrchestratorBootstrap {
+                        agent_platform_root: paths.agent_platform.clone(),
+                        app_data_root,
+                    });
                 }
                 Err(err) => tracing::error!(%err, "bootstrap failed"),
             }
@@ -334,6 +346,9 @@ pub fn run() {
             ide_handoff::ide_set_preference,
             ide_handoff::ide_open_workspace,
             ide_handoff::ide_reveal_in_finder,
+            orchestrator::orchestrator_status,
+            orchestrator::orchestrator_launch_claude,
+            orchestrator::orchestrator_shutdown,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

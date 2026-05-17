@@ -240,20 +240,39 @@ pub async fn terminal_spawn(
         .filter(|p| p.exists());
     let command = resolve_default_shell(&req.env);
 
-    let terminal_id = Uuid::new_v4();
     let spec = TerminalSpec {
-        terminal_id,
+        terminal_id: Uuid::new_v4(),
         command,
         args: vec![],
         cwd,
-        env: req.env.clone(),
+        env: req.env,
         cols,
         rows,
     };
 
-    let handle = TerminalActor::spawn(spec).map_err(|e| {
-        TerminalMeshErrorDto::from(&TerminalMeshError::from(e))
-    })?;
+    let terminal_id = spawn_into_registry(spec, &app, &registry)
+        .map_err(|e| TerminalMeshErrorDto::from(&e))?;
+    Ok(TerminalSpawnResponse {
+        terminal_id: terminal_id.to_string(),
+    })
+}
+
+/// Spawn a `TerminalActor` for `spec`, register it under its
+/// `terminal_id` in `registry`, and start the per-terminal event +
+/// status forwarder tasks so the frontend can subscribe via the
+/// standard `terminal://{id}/event` and `/status` topics. Returns
+/// the registered terminal_id on success.
+///
+/// Factored out so the orchestrator (and any future host-side spawn
+/// path that needs a custom command/args) can register with the same
+/// registry + forwarder semantics as `terminal_spawn` without
+/// duplicating wiring.
+pub(crate) fn spawn_into_registry(
+    spec: TerminalSpec,
+    app: &AppHandle,
+    registry: &TerminalMeshRegistry,
+) -> Result<Uuid, TerminalMeshError> {
+    let handle = TerminalActor::spawn(spec).map_err(TerminalMeshError::from)?;
     let TerminalHandle {
         terminal_id: id,
         events_rx,
@@ -261,12 +280,8 @@ pub async fn terminal_spawn(
         status_rx,
     } = handle;
     let scrollback = Arc::new(StdMutex::new(String::new()));
-    registry.record(id, command_tx.clone(), scrollback.clone());
+    registry.record(id, command_tx, scrollback.clone());
 
-    // Per-terminal event-forwarder task: bridges actor envelopes →
-    // Tauri webview events. Lives until both channels close (typically
-    // after the actor's `Exit` envelope flows through and shutdown
-    // drains).
     let app_for_events = app.clone();
     let scrollback_for_events = scrollback.clone();
     tokio::spawn(forward_events_to_webview(
@@ -275,13 +290,10 @@ pub async fn terminal_spawn(
         app_for_events,
         scrollback_for_events,
     ));
-
-    let app_for_status = app;
+    let app_for_status = app.clone();
     tokio::spawn(forward_status_to_webview(id, status_rx, app_for_status));
 
-    Ok(TerminalSpawnResponse {
-        terminal_id: id.to_string(),
-    })
+    Ok(id)
 }
 
 async fn forward_events_to_webview(

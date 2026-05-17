@@ -43,9 +43,21 @@ export interface TerminalMeshViewProps {
   /// remediation): used as the header label for the per-tab
   /// settings panel.
   workspaceName?: string;
+  /// If set, skip spawning a fresh PTY and subscribe directly to an
+  /// existing terminal_id whose lifecycle is owned by another host
+  /// surface (Round 35: the orchestrator launches its own claude
+  /// PTY via `orchestrator_launch_claude` and passes the returned
+  /// terminal_id here). When set, the cleanup path also skips
+  /// `terminal_shutdown` — the orchestrator owns that lifecycle.
+  existingTerminalId?: string;
 }
 
-export function TerminalMeshView({ active, cwd, workspaceName }: TerminalMeshViewProps) {
+export function TerminalMeshView({
+  active,
+  cwd,
+  workspaceName,
+  existingTerminalId,
+}: TerminalMeshViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -115,18 +127,26 @@ export function TerminalMeshView({ active, cwd, workspaceName }: TerminalMeshVie
 
     (async () => {
       try {
-        // cwd is captured at mount; the parent keeps a stable
-        // `key={tab.id}`, so cwd never mutates mid-lifetime.
-        const { terminalId } = await spawnTerminal({
-          cols: term.cols,
-          rows: term.rows,
-          cwd,
-        });
+        // Round 35 (task20): orchestrator path bypasses spawn — the
+        // host already created the PTY and recorded it in the
+        // terminal registry. We just subscribe.
+        const terminalId: string =
+          existingTerminalId ??
+          (
+            await spawnTerminal({
+              cols: term.cols,
+              rows: term.rows,
+              cwd,
+            })
+          ).terminalId;
         // Recheck after each await: if the component unmounted while
         // the await was in flight, shut the just-spawned terminal
-        // down immediately and bail.
+        // down immediately and bail (but NEVER for an existing
+        // terminal — its lifecycle is owned by the caller).
         if (cancelled || disposedRef.current) {
-          await shutdownTerminal(terminalId).catch(() => {});
+          if (!existingTerminalId) {
+            await shutdownTerminal(terminalId).catch(() => {});
+          }
           return;
         }
         terminalIdRef.current = terminalId;
@@ -203,7 +223,12 @@ export function TerminalMeshView({ active, cwd, workspaceName }: TerminalMeshVie
       inputDisposable.dispose();
       if (unlisten) unlisten();
       const id = terminalIdRef.current;
-      if (id) void shutdownTerminal(id).catch(() => {});
+      // Only shut down terminals we own. The orchestrator (or any
+      // future host surface that passes `existingTerminalId`) owns
+      // the underlying PTY lifecycle.
+      if (id && !existingTerminalId) {
+        void shutdownTerminal(id).catch(() => {});
+      }
       term.dispose();
       termRef.current = null;
       fitRef.current = null;

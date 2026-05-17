@@ -29,6 +29,13 @@ import {
 } from "./claude-discovery";
 import { TerminalMeshView } from "./TerminalMeshView";
 import {
+  getOrchestratorStatus,
+  isOrchestratorErrorDto,
+  launchOrchestratorClaude,
+  type OrchestratorErrorDto,
+  type OrchestratorStatus,
+} from "./orchestrator";
+import {
   closeWorkspace,
   isWorkspaceErrorDto,
   listWorkspaces,
@@ -340,6 +347,9 @@ function OrchestratorPlaceholder() {
   const [status, setStatus] = useState<ClaudeDiscoveryStatus | null>(null);
   const [error, setError] = useState<ClaudeDiscoveryErrorDto | null>(null);
   const [busy, setBusy] = useState(false);
+  const [orchStatus, setOrchStatus] = useState<OrchestratorStatus | null>(null);
+  const [orchError, setOrchError] =
+    useState<OrchestratorErrorDto | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -354,6 +364,39 @@ function OrchestratorPlaceholder() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // Round 35 (task20): once claude discovery resolves to `ready`,
+  // ask the orchestrator backend for its current session, then
+  // idempotently `launch_claude` if no session exists yet. The
+  // backend returns the same session on repeated calls, so this is
+  // safe to re-run on every claude-discovery change.
+  useEffect(() => {
+    if (!status || status.kind !== "ready") {
+      setOrchStatus(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const current = await getOrchestratorStatus();
+        if (cancelled) return;
+        if (current.kind === "ready") {
+          setOrchStatus(current);
+          return;
+        }
+        const launched = await launchOrchestratorClaude();
+        if (cancelled) return;
+        setOrchStatus(launched);
+        setOrchError(null);
+      } catch (err) {
+        if (cancelled) return;
+        if (isOrchestratorErrorDto(err)) setOrchError(err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [status]);
 
   const onRedo = useCallback(async () => {
     setBusy(true);
@@ -402,12 +445,42 @@ function OrchestratorPlaceholder() {
 
   if (status.kind === "ready") {
     return (
-      <section className="placeholder">
-        <h2>Orchestrator</h2>
-        <p>
-          特权单实例 tab。后续会自动启动 <code>claude</code> 并预配所有平台 MCP 服务器。
-        </p>
-        <p className="placeholder__hint">当前仅渲染占位；PTY + claude 接入留待后续实现。</p>
+      <section className="orchestrator-pane">
+        <header className="orchestrator-pane__header">
+          <h2>Orchestrator</h2>
+          <p className="placeholder__hint">
+            特权单实例 tab — 自动启动 <code>claude</code> 并预配所有 MVP 平台 MCP 服务器。
+          </p>
+        </header>
+        {orchError && (
+          <aside
+            className="bootstrap-card bootstrap-card--error"
+            role="alert"
+            data-orchestrator-error={orchError.kind}
+          >
+            <h3>Orchestrator 启动失败</h3>
+            <p>
+              <code>{orchError.kind}</code>
+              {"message" in orchError ? `: ${orchError.message}` : null}
+            </p>
+          </aside>
+        )}
+        <div className="orchestrator-pane__terminal">
+          {orchStatus?.kind === "ready" ? (
+            <TerminalMeshView
+              active
+              cwd={status.record.path}
+              workspaceName="Orchestrator"
+              existingTerminalId={orchStatus.session.terminalId}
+            />
+          ) : (
+            <p className="placeholder__hint">
+              {orchStatus?.kind === "notLaunched"
+                ? "正在启动 claude…"
+                : "正在初始化 orchestrator…"}
+            </p>
+          )}
+        </div>
         <ClaudeReadyFooter record={status.record} onRedo={onRedo} busy={busy} />
       </section>
     );

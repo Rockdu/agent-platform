@@ -178,6 +178,29 @@
   word-break: break-all;
 }
 
+/* Orchestrator host-side tab pane (task20). The TerminalMeshView
+   inside needs a positioning context so its absolute settings panel
+   lays out correctly. */
+.orchestrator-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 12px 16px;
+  gap: 12px;
+  box-sizing: border-box;
+}
+.orchestrator-pane__header h2 {
+  margin: 0 0 4px 0;
+}
+.orchestrator-pane__terminal {
+  position: relative;
+  flex: 1;
+  min-height: 360px;
+  background: #1e1e1e;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
 /* Terminal Mesh multi-tab container (task16). */
 .terminal-mesh-container {
   display: flex;
