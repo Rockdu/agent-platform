@@ -7,6 +7,16 @@ import type {
 } from "./migration-status";
 import { PluginRoot } from "./plugin-lifecycle";
 import type { SidecarBinaryDiagnostic } from "./dev-diagnostics";
+import {
+  classifySidecarState,
+  hostUiClientId,
+  type SidecarErrorDto,
+  type SidecarStatusSnapshot,
+} from "./sidecar-status";
+import {
+  spawnSidecarFromManifest,
+  useSidecarStatus,
+} from "./use-sidecar-status";
 import "./App.css";
 
 // Mirrors src-tauri/src/bootstrap.rs::BootstrapPaths
@@ -194,6 +204,7 @@ export default function App() {
             registryEntry={lookupPlugin(active.pluginId)}
             migrationStatus={migrationStatus[active.pluginId]}
             onRetryMigration={retryMigration}
+            diagnostics={diagnostics}
           />
         )}
       </main>
@@ -321,11 +332,13 @@ function PluginBody({
   registryEntry,
   migrationStatus,
   onRetryMigration,
+  diagnostics,
 }: {
   pluginId: string;
   registryEntry: PluginTabEntry | undefined;
   migrationStatus: PluginMigrationStatus | undefined;
   onRetryMigration: (pluginId: string) => void;
+  diagnostics: SidecarBinaryDiagnostic[];
 }) {
   if (!registryEntry) {
     // Static placeholder (MVP plugin not yet packaged as a manifest).
@@ -349,18 +362,80 @@ function PluginBody({
       />
     );
   }
+  // Round 19: per-tab sidecar surface. Migration must be Ok (or absent)
+  // before we attempt to spawn — same gating contract as plugin mounting.
+  return (
+    <SidecarAwarePluginBody
+      registryEntry={registryEntry}
+      diagnostics={diagnostics}
+    />
+  );
+}
+
+function SidecarAwarePluginBody({
+  registryEntry,
+  diagnostics,
+}: {
+  registryEntry: PluginTabEntry;
+  diagnostics: SidecarBinaryDiagnostic[];
+}) {
+  const clientId = useMemo(
+    () => hostUiClientId(registryEntry.pluginId),
+    [registryEntry.pluginId],
+  );
+  const binaryMissing = useMemo(
+    () =>
+      diagnostics.some(
+        (d) => d.pluginId === registryEntry.pluginId && d.status === "missing",
+      ),
+    [diagnostics, registryEntry.pluginId],
+  );
+  const [spawnError, setSpawnError] = useState<SidecarErrorDto | null>(null);
+  const { status, error: pollError, retry } = useSidecarStatus(clientId, {
+    enabled: !binaryMissing,
+  });
+
+  useEffect(() => {
+    if (binaryMissing) return;
+    let cancelled = false;
+    void spawnSidecarFromManifest(clientId).then((err) => {
+      if (!cancelled) setSpawnError(err);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [clientId, binaryMissing]);
+
+  const live = status ? classifySidecarState(status.state) : "unknown";
+  const showRestartPanel =
+    !binaryMissing &&
+    status !== null &&
+    (live === "backingOff" || live === "exited" || live === "unrecoverable");
+
+  const onRetry = useCallback(() => {
+    setSpawnError(null);
+    void retry();
+  }, [retry]);
+
   const LazyComponent = lazyForPlugin(registryEntry);
-  // Round 10 (task7): wrap the plugin component in PluginRoot so it
-  // mounts a capability on render and unmounts it when the tab closes /
-  // remounts on tab change. tabId defaults to `tab-${pluginId}` — one
-  // singleton tab per plugin in the MVP shell; task17 (workspace storage)
-  // will replace this with real workspace tab IDs.
   return (
     <PluginRoot
       pluginId={registryEntry.pluginId}
       label={registryEntry.label}
       tabId={`tab-${registryEntry.pluginId}`}
     >
+      {showRestartPanel && (
+        <SidecarRestartPanel
+          pluginId={registryEntry.pluginId}
+          label={registryEntry.label}
+          status={status}
+          error={pollError ?? spawnError}
+          onRetry={onRetry}
+        />
+      )}
+      {!showRestartPanel && (pollError ?? spawnError) && (
+        <SidecarErrorBanner error={(pollError ?? spawnError) as SidecarErrorDto} />
+      )}
       <Suspense
         fallback={
           <section className="placeholder placeholder--loading">
@@ -372,6 +447,66 @@ function PluginBody({
         <LazyComponent />
       </Suspense>
     </PluginRoot>
+  );
+}
+
+function SidecarRestartPanel({
+  pluginId,
+  label,
+  status,
+  error,
+  onRetry,
+}: {
+  pluginId: string;
+  label: string;
+  status: SidecarStatusSnapshot;
+  error: SidecarErrorDto | null;
+  onRetry: () => void;
+}) {
+  return (
+    <section
+      className="placeholder placeholder--error"
+      role="alert"
+      data-sidecar-status="restart-panel"
+      data-plugin-id={pluginId}
+    >
+      <h2>{label} · 后台进程未就绪</h2>
+      <dl>
+        <dt>状态</dt>
+        <dd>
+          <code>{status.state}</code>
+        </dd>
+        <dt>下一次自动重启</dt>
+        <dd>{status.nextBackoffMs} ms</dd>
+        <dt>近 1 小时重启次数</dt>
+        <dd>{status.recentRestartCount}</dd>
+        <dt>generation</dt>
+        <dd>{status.generation}</dd>
+      </dl>
+      {error && (
+        <p className="bootstrap-card__hint">
+          错误：<code>{error.kind}</code>
+        </p>
+      )}
+      <button type="button" onClick={onRetry}>
+        重试启动
+      </button>
+    </section>
+  );
+}
+
+function SidecarErrorBanner({ error }: { error: SidecarErrorDto }) {
+  return (
+    <aside
+      className="bootstrap-card bootstrap-card--error"
+      role="status"
+      data-sidecar-status="error-banner"
+    >
+      <h3>后台进程错误</h3>
+      <p>
+        <code>{error.kind}</code>
+      </p>
+    </aside>
   );
 }
 

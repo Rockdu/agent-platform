@@ -234,6 +234,10 @@ pub fn run() {
             stronghold_setup_complete,
             stronghold_setup_reset,
             dev_diagnostics::dev_diagnostics_status,
+            sidecar_manager::sidecar_status,
+            sidecar_manager::retry_sidecar,
+            sidecar_manager::shutdown_sidecar,
+            sidecar_manager::spawn_sidecar_from_manifest,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

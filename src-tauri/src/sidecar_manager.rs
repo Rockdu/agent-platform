@@ -273,9 +273,23 @@ pub enum SidecarError {
         command_bin: String,
         candidates: Vec<String>,
     },
+
+    #[error("SIDECAR_ERROR invalid_state: client_id `{client_id}` cannot accept this transition from state `{current_state}`")]
+    InvalidState {
+        client_id: String,
+        current_state: String,
+    },
+
+    #[error("SIDECAR_ERROR invalid_client_id: `{raw}` cannot be parsed as a ClientId: {source}")]
+    InvalidClientId {
+        raw: String,
+        #[source]
+        source: mcp_stdio::ClientIdError,
+    },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SidecarStatusSnapshot {
     pub client_id: String,
     pub plugin_id: String,
@@ -510,17 +524,38 @@ impl SidecarManager {
         }
         self.insert_slot(client_id.clone(), Arc::clone(&slot));
 
-        // Spawn restart driver (auto-restart on unexpected exits).
-        if let Some(mgr_arc) = self.self_arc() {
-            let driver_slot = Arc::clone(&slot);
-            let driver_client = client_id.clone();
-            let handle = tokio::spawn(async move {
-                restart_driver(mgr_arc, driver_client, driver_slot).await;
-            });
-            *slot.restart_task.lock().expect("SidecarManager poisoned") = Some(handle);
-        }
+        // Install restart driver via shared helper so spawn() and retry()
+        // route through the same supervision wiring.
+        self.install_restart_driver(client_id.clone(), Arc::clone(&slot));
 
         Ok(())
+    }
+
+    /// Install (or replace) the per-slot restart driver background task.
+    /// Used by both `spawn()` (initial supervision) and `retry()`
+    /// (re-installing supervision after a manual recovery from
+    /// `Unrecoverable`/`BackingOff`/`Exited`).
+    ///
+    /// Aborts any existing handle before installing the new one — every
+    /// slot has at most one live restart driver at any moment.
+    fn install_restart_driver(&self, client_id: ClientId, slot: Arc<ClientSlot>) {
+        let mgr_arc = match self.self_arc() {
+            Some(arc) => arc,
+            None => return, // install_self_arc not called; no supervision.
+        };
+        let mut rt_guard = slot
+            .restart_task
+            .lock()
+            .expect("SidecarManager poisoned");
+        if let Some(old) = rt_guard.take() {
+            old.abort();
+        }
+        let driver_slot = Arc::clone(&slot);
+        let driver_client = client_id;
+        let handle = tokio::spawn(async move {
+            restart_driver(mgr_arc, driver_client, driver_slot).await;
+        });
+        *rt_guard = Some(handle);
     }
 
     /// Manager-initiated graceful shutdown. Sets `shutdown_requested`, sends
@@ -611,16 +646,36 @@ impl SidecarManager {
         .is_ok()
     }
 
-    /// Manual retry. Resets backoff to initial, clears Unrecoverable state,
-    /// and respawns immediately. Used by the future "Retry now" UI button.
+    /// State-aware single-flight manual retry. Rejects from `Ready` /
+    /// `ShuttingDown` (no double-spawn while a healthy child is up or a
+    /// graceful shutdown is in flight); permits from `Spawning` /
+    /// `BackingOff` / `Exited{..}` / `Unrecoverable{..}`.
+    ///
+    /// Aborts the existing restart-driver task, SIGKILLs any live
+    /// tracked child (in case the slot was mid-`BackingOff` with a
+    /// process that hasn't yet been observed exit), resets `backoff` +
+    /// `budget` + `shutdown_requested`, respawns with bumped
+    /// generation, and reinstalls a fresh restart driver.
     pub async fn retry(&self, client_id: &ClientId) -> Result<(), SidecarError> {
         let slot = self.lookup(client_id).ok_or_else(|| SidecarError::NotFound {
             client_id: client_id.to_string(),
         })?;
 
+        // 1. Reject from non-recoverable states.
         let (command_bin, args, env, next_generation) = {
             let mut s = slot.state.lock().expect("SidecarManager poisoned");
+            match &s.state {
+                SidecarState::Ready | SidecarState::ShuttingDown => {
+                    return Err(SidecarError::InvalidState {
+                        client_id: client_id.to_string(),
+                        current_state: format!("{:?}", s.state),
+                    });
+                }
+                _ => {}
+            }
+            // 2. Reset trackers + clear shutdown flag.
             s.backoff.reset();
+            s.budget.reset();
             s.shutdown_requested = false;
             s.state = SidecarState::Spawning;
             let next = s.generation + 1;
@@ -628,6 +683,32 @@ impl SidecarManager {
             (s.command_bin.clone(), s.args.clone(), s.env.clone(), next)
         };
 
+        // 3. Abort the existing restart driver BEFORE replacing the child
+        //    so the sleeping driver can't wake up and spawn a duplicate.
+        if let Some(handle) = slot
+            .restart_task
+            .lock()
+            .expect("SidecarManager poisoned")
+            .take()
+        {
+            handle.abort();
+        }
+
+        // 4. SIGKILL any live tracked child (best-effort). Drop the
+        //    ChildProcess to close stdin and the exit_watch sender.
+        {
+            let mut proc_guard = slot.process.lock().await;
+            if let Some(prev) = proc_guard.take() {
+                if prev.exit_watch.borrow().is_none()
+                    && let Some(pid_raw) = prev.pid
+                {
+                    let _ = kill(Pid::from_raw(pid_raw as i32), Signal::SIGKILL);
+                }
+                // Drop(prev) releases stdin + exit_watch.
+            }
+        }
+
+        // 5. Respawn.
         let plugin_id = client_id.plugin_id().to_string();
         let child = start_child(client_id, &plugin_id, &command_bin, &args, &env, next_generation)?;
 
@@ -640,6 +721,13 @@ impl SidecarManager {
             s.state = SidecarState::Ready;
             s.backoff.record_start(Instant::now());
         }
+
+        // 6. Reinstall the restart driver so the retried child is
+        //    supervised. After Unrecoverable the previous driver had
+        //    returned permanently; this is what ties the user's
+        //    "Retry now" click to fresh supervision.
+        self.install_restart_driver(client_id.clone(), Arc::clone(&slot));
+
         Ok(())
     }
 }
@@ -907,6 +995,122 @@ async fn restart_driver(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tauri command surface (AC-1.7 frontend integration)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum SidecarErrorDto {
+    AlreadyMounted { client_id: String },
+    NotFound { client_id: String },
+    InvalidState { client_id: String, current_state: String },
+    InvalidClientId { raw: String, message: String },
+    UnknownPlugin { plugin_id: String },
+    MissingBinary {
+        plugin_id: String,
+        command_bin: String,
+        candidates: Vec<String>,
+    },
+    Io { context: String, message: String },
+    EncodeShutdown { message: String },
+    Signal { message: String },
+}
+
+impl From<&SidecarError> for SidecarErrorDto {
+    fn from(err: &SidecarError) -> Self {
+        match err {
+            SidecarError::AlreadyMounted { client_id } => Self::AlreadyMounted {
+                client_id: client_id.clone(),
+            },
+            SidecarError::NotFound { client_id } => Self::NotFound {
+                client_id: client_id.clone(),
+            },
+            SidecarError::InvalidState {
+                client_id,
+                current_state,
+            } => Self::InvalidState {
+                client_id: client_id.clone(),
+                current_state: current_state.clone(),
+            },
+            SidecarError::InvalidClientId { raw, source } => Self::InvalidClientId {
+                raw: raw.clone(),
+                message: source.to_string(),
+            },
+            SidecarError::UnknownPlugin { plugin_id } => Self::UnknownPlugin {
+                plugin_id: plugin_id.clone(),
+            },
+            SidecarError::MissingBinary {
+                plugin_id,
+                command_bin,
+                candidates,
+            } => Self::MissingBinary {
+                plugin_id: plugin_id.clone(),
+                command_bin: command_bin.clone(),
+                candidates: candidates.clone(),
+            },
+            SidecarError::Io { context, source } => Self::Io {
+                context: context.clone(),
+                message: source.to_string(),
+            },
+            SidecarError::EncodeShutdown { source } => Self::EncodeShutdown {
+                message: source.to_string(),
+            },
+            SidecarError::Signal { source } => Self::Signal {
+                message: source.to_string(),
+            },
+        }
+    }
+}
+
+fn parse_client_id_or_dto(raw: &str) -> Result<ClientId, SidecarErrorDto> {
+    ClientId::parse(raw).map_err(|source| {
+        SidecarErrorDto::from(&SidecarError::InvalidClientId {
+            raw: raw.to_string(),
+            source,
+        })
+    })
+}
+
+#[tauri::command]
+pub fn sidecar_status(
+    client_id: String,
+    mgr: tauri::State<'_, Arc<SidecarManager>>,
+) -> Result<Option<SidecarStatusSnapshot>, SidecarErrorDto> {
+    let cid = parse_client_id_or_dto(&client_id)?;
+    Ok(mgr.status(&cid))
+}
+
+#[tauri::command]
+pub async fn retry_sidecar(
+    client_id: String,
+    mgr: tauri::State<'_, Arc<SidecarManager>>,
+) -> Result<(), SidecarErrorDto> {
+    let cid = parse_client_id_or_dto(&client_id)?;
+    mgr.retry(&cid).await.map_err(|err| SidecarErrorDto::from(&err))
+}
+
+#[tauri::command]
+pub async fn shutdown_sidecar(
+    client_id: String,
+    mgr: tauri::State<'_, Arc<SidecarManager>>,
+) -> Result<(), SidecarErrorDto> {
+    let cid = parse_client_id_or_dto(&client_id)?;
+    mgr.shutdown(&cid).await.map_err(|err| SidecarErrorDto::from(&err))
+}
+
+#[tauri::command]
+pub async fn spawn_sidecar_from_manifest(
+    client_id: String,
+    mgr: tauri::State<'_, Arc<SidecarManager>>,
+) -> Result<(), SidecarErrorDto> {
+    let cid = parse_client_id_or_dto(&client_id)?;
+    let workspace_root = dev_diagnostics::workspace_root_for_dev();
+    mgr.spawn_from_manifest(cid, &workspace_root)
+        .await
+        .map_err(|err| SidecarErrorDto::from(&err))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1121,17 +1325,16 @@ mod tests {
             .await
             .expect("status");
         assert!(snap.state.contains("Unrecoverable"));
-        // After Unrecoverable, retry should reset and respawn.
-        // Switch to a long-running script so retry doesn't immediately
-        // re-enter the failure loop.
+        // After Unrecoverable, retry should reset and respawn. Switch
+        // BOTH command_bin AND args to a long-running script so retry
+        // doesn't immediately re-enter the failure loop. (The retry
+        // API doesn't take new args, so the test mutates the persistent
+        // ClientLifecycleState directly.)
         {
             let slot = mgr.lookup(&cid).unwrap();
             let mut s = slot.state.lock().expect("SidecarManager poisoned");
-            // For test simplicity, we rewrite the persistent command to a
-            // sleep loop. Production code wouldn't mutate this — but the
-            // retry API doesn't take new args, so the test demonstrates the
-            // backoff reset + state transition.
             s.command_bin = PathBuf::from("/bin/sh");
+            s.args = vec!["-c".into(), "exec sleep 30".into()];
             s.env = HashMap::new();
         }
         mgr.retry(&cid).await.unwrap();
@@ -1141,6 +1344,123 @@ mod tests {
             "retry should clear Unrecoverable; got {after:?}"
         );
         assert_eq!(after.next_backoff_ms, cfg().backoff_initial.as_millis() as u64);
+        assert_eq!(after.recent_restart_count, 0, "retry should reset budget");
+        let _ = mgr.shutdown(&cid).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_rejects_from_ready_state() {
+        let mgr = mgr_arc();
+        let cid = client_host_ui("example-notes");
+        spawn_shell_script(&mgr, cid.clone(), "exec sleep 30").await.unwrap();
+        // Wait briefly for state to settle into Ready.
+        let _ = wait_for(&mgr, &cid, |s| s.state.contains("Ready"), 200).await;
+        let err = mgr.retry(&cid).await.unwrap_err();
+        match err {
+            SidecarError::InvalidState { client_id, current_state } => {
+                assert_eq!(client_id, cid.to_string());
+                assert!(
+                    current_state.contains("Ready"),
+                    "current_state should be Ready; got {current_state}"
+                );
+            }
+            other => panic!("expected InvalidState; got {other}"),
+        }
+        let _ = mgr.shutdown(&cid).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_after_unrecoverable_reinstalls_restart_driver() {
+        // After Unrecoverable, the original restart driver returned. Calling
+        // retry() must install a fresh driver so the next crash restarts the
+        // sidecar again instead of being unsupervised.
+        let mgr = mgr_arc();
+        let cid = client_host_ui("example-notes");
+        spawn_shell_script(&mgr, cid.clone(), "exit 1").await.unwrap();
+        let _ = wait_for(&mgr, &cid, |s| s.state.contains("Unrecoverable"), 2500).await;
+        let pre_retry_gen = mgr.status(&cid).expect("status").generation;
+
+        // Retry with the same failing command. The new driver should observe
+        // the next crash + restart, advancing generation again.
+        mgr.retry(&cid).await.unwrap();
+        // Now wait for the post-retry crash + at least one supervised
+        // restart-attempt (generation must advance past the bump from retry).
+        let snap = wait_for(
+            &mgr,
+            &cid,
+            |s| s.generation > pre_retry_gen + 1
+                || s.state.contains("Unrecoverable"),
+            2500,
+        )
+        .await
+        .expect("status");
+        assert!(
+            snap.generation > pre_retry_gen + 1 || snap.state.contains("Unrecoverable"),
+            "new driver must observe further restart attempts (or budget-exhaust again); \
+             pre_retry_gen={pre_retry_gen}, snap={snap:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_resets_restart_budget() {
+        let mgr = mgr_arc();
+        let cid = client_host_ui("example-notes");
+        spawn_shell_script(&mgr, cid.clone(), "exit 1").await.unwrap();
+        let _ = wait_for(&mgr, &cid, |s| s.state.contains("Unrecoverable"), 2500).await;
+        // Swap to a long-running script so retry yields a stable Ready state
+        // we can observe budget reset against.
+        {
+            let slot = mgr.lookup(&cid).unwrap();
+            let mut s = slot.state.lock().expect("SidecarManager poisoned");
+            s.command_bin = PathBuf::from("/bin/sh");
+            s.args = vec!["-c".into(), "exec sleep 30".into()];
+        }
+        mgr.retry(&cid).await.unwrap();
+        let after = mgr.status(&cid).expect("status");
+        assert_eq!(after.recent_restart_count, 0, "budget should reset; got {after:?}");
+        let _ = mgr.shutdown(&cid).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retry_while_backing_off_only_spawns_one_child() {
+        // Single-flight guard: while the driver is asleep mid-backoff, a
+        // retry() call must abort the sleeping driver instead of racing with
+        // it. We detect a double-spawn by counting PIDs the sidecar appends
+        // to a temp file in a tight window after retry returns.
+        let mgr = mgr_arc();
+        let cid = client_host_ui("example-notes");
+        let pid_file = std::env::temp_dir()
+            .join(format!("sidecar-pid-{}.log", Uuid::new_v4()));
+        let script = format!("echo $$ >> {}; exit 1", pid_file.display());
+        spawn_shell_script(&mgr, cid.clone(), &script).await.unwrap();
+        // Wait for at least one crash + transition into BackingOff (driver
+        // sleeping). For_tests backoff_initial is 50ms so the BackingOff
+        // window is observable.
+        let _ = wait_for(
+            &mgr,
+            &cid,
+            |s| s.recent_restart_count >= 1 && s.state.contains("BackingOff"),
+            1500,
+        )
+        .await
+        .expect("status reached BackingOff");
+        let pre_count = std::fs::read_to_string(&pid_file)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        mgr.retry(&cid).await.unwrap();
+        // Sample <50ms after retry returns so the retry's own spawn is the
+        // only legitimate new entry. A racing old driver would also wake +
+        // spawn a second child, bumping the count by 2 instead of 1.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let post_count = std::fs::read_to_string(&pid_file)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        let delta = post_count.saturating_sub(pre_count);
+        assert!(
+            delta <= 1,
+            "retry caused a duplicate spawn — pre={pre_count} post={post_count} delta={delta}"
+        );
+        let _ = std::fs::remove_file(&pid_file);
         let _ = mgr.shutdown(&cid).await;
     }
 
@@ -1328,6 +1648,66 @@ mod tests {
         );
         if mgr.lookup(&cid).is_some() {
             let _ = mgr.shutdown(&cid).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SidecarErrorDto serialization tests (separate mod to keep test groupings
+// contained; doesn't need tokio runtime).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod dto_tests {
+    use super::*;
+
+    #[test]
+    fn dto_serializes_invalid_state_with_kind_discriminant() {
+        let dto = SidecarErrorDto::InvalidState {
+            client_id: "host_ui:example-notes".into(),
+            current_state: "Ready".into(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(v.get("kind").and_then(|x| x.as_str()), Some("invalidState"));
+        assert_eq!(
+            v.get("clientId").and_then(|x| x.as_str()),
+            Some("host_ui:example-notes")
+        );
+        assert_eq!(
+            v.get("currentState").and_then(|x| x.as_str()),
+            Some("Ready")
+        );
+    }
+
+    #[test]
+    fn dto_converts_from_sidecar_error_invalid_state() {
+        let err = SidecarError::InvalidState {
+            client_id: "host_ui:example-notes".into(),
+            current_state: "Ready".into(),
+        };
+        let dto = SidecarErrorDto::from(&err);
+        match dto {
+            SidecarErrorDto::InvalidState { client_id, current_state } => {
+                assert_eq!(client_id, "host_ui:example-notes");
+                assert_eq!(current_state, "Ready");
+            }
+            other => panic!("expected InvalidState; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dto_converts_from_missing_binary_preserves_candidates() {
+        let err = SidecarError::MissingBinary {
+            plugin_id: "example-notes".into(),
+            command_bin: "notes-plugin".into(),
+            candidates: vec!["/a".into(), "/b".into()],
+        };
+        let dto = SidecarErrorDto::from(&err);
+        match dto {
+            SidecarErrorDto::MissingBinary { candidates, .. } => {
+                assert_eq!(candidates, vec!["/a", "/b"]);
+            }
+            other => panic!("unexpected variant: {other:?}"),
         }
     }
 }
