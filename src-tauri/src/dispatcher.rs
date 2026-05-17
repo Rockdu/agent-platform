@@ -84,9 +84,12 @@ struct RegistryState {
     mount_index: HashMap<Uuid, String>,
 }
 
-#[derive(Debug, Default)]
+/// task21 / AC-3.3: shared via internal `Arc<Mutex<...>>` so the
+/// Tauri-managed handle and the host RPC bridge clone can both hold
+/// `MountRegistry` by value while sharing the same underlying state.
+#[derive(Debug, Clone, Default)]
 pub struct MountRegistry {
-    state: Mutex<RegistryState>,
+    state: std::sync::Arc<Mutex<RegistryState>>,
 }
 
 impl MountRegistry {
@@ -246,17 +249,31 @@ fn parse_command_id(command_id: &str) -> Result<(&str, &str), DispatchErrorDto> 
     Ok((plugin_id, command_name))
 }
 
-fn plugin_permissions(plugin_id: &str) -> Option<Vec<String>> {
-    PLUGINS
-        .iter()
-        .find(|p| p.plugin_id == plugin_id)
+/// Plugin-level declared permissions. Falls through to the built-in
+/// metadata table for host-internal MCP sidecars (`terminal-mesh`)
+/// that don't have a frontend plugin manifest. See
+/// `crate::builtin_plugins`.
+pub(crate) fn plugin_permissions(plugin_id: &str) -> Option<Vec<String>> {
+    if let Some(p) = PLUGINS.iter().find(|p| p.plugin_id == plugin_id) {
+        return Some(p.permissions.iter().map(|s| (*s).to_string()).collect());
+    }
+    crate::builtin_plugins::lookup_plugin(plugin_id)
         .map(|p| p.permissions.iter().map(|s| (*s).to_string()).collect())
 }
 
-fn command_required_permissions(plugin_id: &str, command_name: &str) -> Option<Vec<String>> {
-    PLUGIN_COMMANDS
+/// Command-level required permissions. Falls through to built-in
+/// metadata when the command is not in the generated `PLUGIN_COMMANDS`.
+pub(crate) fn command_required_permissions(
+    plugin_id: &str,
+    command_name: &str,
+) -> Option<Vec<String>> {
+    if let Some(c) = PLUGIN_COMMANDS
         .iter()
         .find(|c| c.plugin_id == plugin_id && c.name == command_name)
+    {
+        return Some(c.permissions.iter().map(|s| (*s).to_string()).collect());
+    }
+    crate::builtin_plugins::lookup_command(plugin_id, command_name)
         .map(|c| c.permissions.iter().map(|s| (*s).to_string()).collect())
 }
 
@@ -392,15 +409,22 @@ pub fn insert_orchestrator_mount(
     registry: &MountRegistry,
     plugin_id: &str,
     tab_id: Option<&str>,
-) -> MountResponse {
-    // Host-internal grant: the cross-tab read endpoint is gated on
-    // `cross_tab_read_flag`, not on manifest-declared permissions, so
-    // a missing plugin manifest is acceptable here (the orchestrator's
-    // `terminal-mesh` MCP sidecar contract is host-internal and does
-    // not necessarily have a frontend plugin manifest entry yet). Use
-    // manifest permissions when available so future permission-gated
-    // commands behave correctly; fall back to empty otherwise.
-    let permissions = plugin_permissions(plugin_id).unwrap_or_default();
+) -> Result<MountResponse, DispatchErrorDto> {
+    // Resolve manifest (generated) or built-in permission metadata.
+    // Per `docs/specs/plugin-contract.md`: the orchestrator's
+    // privileged grant requires the target plugin to DECLARE the
+    // `cross_tab_read` permission. Silently granting the flag for
+    // a plugin whose metadata doesn't claim the permission would
+    // sidestep the contract.
+    let permissions = plugin_permissions(plugin_id)
+        .ok_or_else(|| DispatchErrorDto::unknown_plugin(plugin_id))?;
+    if !permissions.iter().any(|p| p == "cross_tab_read") {
+        return Err(DispatchErrorDto::permission_denied(
+            plugin_id,
+            "<orchestrator-mount>",
+            "cross_tab_read",
+        ));
+    }
     let mount_id = Uuid::new_v4();
     let nonce_bytes = fresh_nonce_bytes();
     let handle = encode_handle(mount_id, &nonce_bytes);
@@ -421,13 +445,13 @@ pub fn insert_orchestrator_mount(
         cross_tab_read = true,
         "orchestrator mount granted (Rust-only cross_tab_read_flag)"
     );
-    MountResponse {
+    Ok(MountResponse {
         handle,
         mount_id: mount_id.to_string(),
-    }
+    })
 }
 
-fn insert_mount_with_flag(
+pub(crate) fn insert_mount_with_flag(
     registry: &MountRegistry,
     plugin_id: &str,
     mount_id: Uuid,
@@ -989,7 +1013,7 @@ mod tests {
     #[test]
     fn insert_orchestrator_mount_sets_cross_tab_read_flag_true() {
         let registry = MountRegistry::new();
-        let resp = insert_orchestrator_mount(&registry, "terminal-mesh", Some("tab-orch"));
+        let resp = insert_orchestrator_mount(&registry, "terminal-mesh", Some("tab-orch")).expect("terminal-mesh built-in metadata declares cross_tab_read");
         assert!(resp.handle.starts_with("cap_v1."));
 
         let state = registry.state.lock().unwrap();
@@ -1027,7 +1051,7 @@ mod tests {
         // crossTabRead field, even after the orchestrator privileged
         // mint. The flag lives only in Rust-side MountEntry.
         let registry = MountRegistry::new();
-        let resp = insert_orchestrator_mount(&registry, "terminal-mesh", Some("tab-orch"));
+        let resp = insert_orchestrator_mount(&registry, "terminal-mesh", Some("tab-orch")).expect("terminal-mesh built-in metadata declares cross_tab_read");
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
         assert!(v.get("crossTabRead").is_none());
         assert!(v.get("cross_tab_read").is_none());
@@ -1043,7 +1067,7 @@ mod tests {
     #[test]
     fn authorize_capability_handle_returns_entry_on_valid_handle() {
         let registry = MountRegistry::new();
-        let resp = insert_orchestrator_mount(&registry, "terminal-mesh", Some("tab-orch"));
+        let resp = insert_orchestrator_mount(&registry, "terminal-mesh", Some("tab-orch")).expect("terminal-mesh built-in metadata declares cross_tab_read");
         let entry = authorize_capability_handle(&registry, &resp.handle, "terminal-mesh")
             .expect("valid orchestrator handle authorizes");
         assert!(entry.cross_tab_read_flag, "flag preserved through auth");
@@ -1074,7 +1098,7 @@ mod tests {
         // same mount_id but a fresh nonce: nonce-hash mismatch →
         // CapabilityInvalid.
         let registry = MountRegistry::new();
-        let resp = insert_orchestrator_mount(&registry, "terminal-mesh", None);
+        let resp = insert_orchestrator_mount(&registry, "terminal-mesh", None).expect("terminal-mesh built-in metadata declares cross_tab_read");
         let mount_id = Uuid::parse_str(&resp.mount_id).unwrap();
         let forged = encode_handle(mount_id, &fresh_nonce_bytes());
         let err = authorize_capability_handle(&registry, &forged, "terminal-mesh").unwrap_err();
@@ -1087,6 +1111,44 @@ mod tests {
         let stale = encode_handle(Uuid::new_v4(), &fresh_nonce_bytes());
         let err = authorize_capability_handle(&registry, &stale, "terminal-mesh").unwrap_err();
         assert_eq!(err.kind, "capability_expired");
+    }
+
+    // ----- task21 Round 38 remediation: manifest permission required -----
+
+    #[test]
+    fn insert_orchestrator_mount_fails_for_unknown_plugin() {
+        let registry = MountRegistry::new();
+        let err = insert_orchestrator_mount(&registry, "no-such-plugin", None).unwrap_err();
+        assert_eq!(err.kind, "unknown_plugin");
+    }
+
+    #[test]
+    fn insert_orchestrator_mount_fails_for_plugin_without_cross_tab_read_permission() {
+        // example-notes is a real manifest-registered plugin whose
+        // permissions are `["notify"]` (no `cross_tab_read`). Even
+        // though the plugin exists in PLUGINS, the orchestrator
+        // privileged mount must reject it — the spec requires the
+        // target's declared permissions to include `cross_tab_read`.
+        let registry = MountRegistry::new();
+        let err = insert_orchestrator_mount(&registry, "example-notes", Some("tab-x")).unwrap_err();
+        assert_eq!(err.kind, "permission_denied");
+        assert_eq!(err.permission.as_deref(), Some("cross_tab_read"));
+    }
+
+    #[test]
+    fn insert_orchestrator_mount_succeeds_for_terminal_mesh_via_builtin_metadata() {
+        // The plugin id `terminal-mesh` is NOT in the generated PLUGINS
+        // but IS in BUILTIN_PLUGINS with `cross_tab_read` declared.
+        // The mount must succeed through the built-in fallback path.
+        let registry = MountRegistry::new();
+        let resp = insert_orchestrator_mount(&registry, "terminal-mesh", Some("tab-orch"))
+            .expect("terminal-mesh builtin metadata declares cross_tab_read");
+        let state = registry.state.lock().unwrap();
+        let entry = state.entries.values().next().expect("entry");
+        assert!(entry.cross_tab_read_flag);
+        assert!(entry.permissions.iter().any(|p| p == "cross_tab_read"));
+        drop(state);
+        drop(resp);
     }
 
     #[test]

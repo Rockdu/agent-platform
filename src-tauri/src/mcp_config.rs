@@ -160,6 +160,29 @@ pub fn generate_config(
     app_data: &Path,
     workspace_root_for_dev: &Path,
 ) -> Result<McpConfigDocument, McpConfigError> {
+    generate_config_with_host_rpc_sock(
+        tab_id,
+        workspace,
+        kind,
+        app_data,
+        workspace_root_for_dev,
+        None,
+    )
+}
+
+/// task21 / AC-3.3 — Round 38 variant that also threads
+/// `--host-rpc-sock <path>` into every sidecar's argv. The built-in
+/// `terminal-mesh` MCP sidecar entry is included whenever its binary
+/// can be resolved on the dev paths (production resource bundling
+/// will land with task22+).
+pub fn generate_config_with_host_rpc_sock(
+    tab_id: &str,
+    workspace: &Path,
+    kind: McpConfigKind,
+    app_data: &Path,
+    workspace_root_for_dev: &Path,
+    host_rpc_sock: Option<&Path>,
+) -> Result<McpConfigDocument, McpConfigError> {
     validate_tab_id(tab_id)?;
 
     let workspace_meta = std::fs::metadata(workspace).map_err(|e| McpConfigError::WorkspaceUnavailable {
@@ -174,12 +197,24 @@ pub fn generate_config(
     }
 
     let mut mcp_servers: BTreeMap<String, McpServerEntry> = BTreeMap::new();
-    for plugin in PLUGINS {
-        let candidates = resolve_expected_paths(workspace_root_for_dev, plugin.command_bin);
+    // Iterate the codegen `PLUGINS` AND the built-in `BUILTIN_PLUGINS`
+    // (task21 / AC-3.3). The built-in path covers host-internal MCP
+    // sidecars that don't have a frontend plugin manifest (today:
+    // `terminal-mesh`).
+    let plugin_iter = PLUGINS
+        .iter()
+        .map(|p| (p.plugin_id, p.command_bin))
+        .chain(
+            crate::builtin_plugins::BUILTIN_PLUGINS
+                .iter()
+                .map(|p| (p.plugin_id, p.command_bin)),
+        );
+    for (plugin_id, command_bin) in plugin_iter {
+        let candidates = resolve_expected_paths(workspace_root_for_dev, command_bin);
         let Some(command_path) = candidates.iter().find(|p| p.exists()) else {
             tracing::warn!(
-                plugin_id = plugin.plugin_id,
-                command_bin = plugin.command_bin,
+                plugin_id = plugin_id,
+                command_bin = command_bin,
                 "mcp_config: skipping plugin without a resolvable sidecar binary"
             );
             continue;
@@ -187,11 +222,15 @@ pub fn generate_config(
 
         let mut args = vec![
             "--client-id".to_string(),
-            format!("claude:{tab_id}:{plugin_id}", plugin_id = plugin.plugin_id),
+            format!("claude:{tab_id}:{plugin_id}"),
             "--workspace".to_string(),
             workspace.display().to_string(),
         ];
-        if kind == McpConfigKind::Orchestrator && plugin.plugin_id == ORCHESTRATOR_CROSS_TAB_PLUGIN {
+        if let Some(sock) = host_rpc_sock {
+            args.push("--host-rpc-sock".to_string());
+            args.push(sock.display().to_string());
+        }
+        if kind == McpConfigKind::Orchestrator && plugin_id == ORCHESTRATOR_CROSS_TAB_PLUGIN {
             args.push("--cross-tab-read".to_string());
         }
 
@@ -213,7 +252,7 @@ pub fn generate_config(
         }
 
         mcp_servers.insert(
-            plugin.plugin_id.to_string(),
+            plugin_id.to_string(),
             McpServerEntry {
                 command: command_path.display().to_string(),
                 args,
@@ -565,6 +604,74 @@ mod tests {
         assert!(
             !entry.args.iter().any(|a| a == "--cross-tab-read"),
             "non-terminal-mesh plugins must NOT receive --cross-tab-read; args={:?}",
+            entry.args
+        );
+    }
+
+    // ----- task21 Round 38: terminal-mesh-sidecar entry + --host-rpc-sock -----
+
+    #[test]
+    fn generate_orchestrator_config_includes_terminal_mesh_sidecar_with_cross_tab_read() {
+        let app_data = tempfile::TempDir::new().unwrap();
+        let workspace_root = tempfile::TempDir::new().unwrap();
+        let workspace = make_workspace_dir();
+        // Stub BOTH binaries so the iteration finds them.
+        stub_sidecar_for(workspace_root.path(), "notes-plugin");
+        stub_sidecar_for(workspace_root.path(), "terminal-mesh-sidecar");
+        let doc = generate_config_with_host_rpc_sock(
+            "tab-orch",
+            workspace.path(),
+            McpConfigKind::Orchestrator,
+            app_data.path(),
+            workspace_root.path(),
+            Some(std::path::Path::new("/tmp/host.sock")),
+        )
+        .expect("generate");
+        let entry = doc
+            .mcp_servers
+            .get("terminal-mesh")
+            .expect("terminal-mesh entry in orchestrator config");
+        assert!(
+            entry.args.iter().any(|a| a == "--cross-tab-read"),
+            "orchestrator terminal-mesh entry MUST carry --cross-tab-read; args={:?}",
+            entry.args
+        );
+        // --host-rpc-sock argv threaded through with the right path.
+        let mut iter = entry.args.iter();
+        let has_sock = loop {
+            match iter.next() {
+                Some(a) if a == "--host-rpc-sock" => {
+                    break iter.next().map(|s| s.as_str()) == Some("/tmp/host.sock");
+                }
+                Some(_) => continue,
+                None => break false,
+            }
+        };
+        assert!(has_sock, "--host-rpc-sock /tmp/host.sock missing; args={:?}", entry.args);
+    }
+
+    #[test]
+    fn generate_standard_config_includes_terminal_mesh_sidecar_without_cross_tab_read() {
+        let app_data = tempfile::TempDir::new().unwrap();
+        let workspace_root = tempfile::TempDir::new().unwrap();
+        let workspace = make_workspace_dir();
+        stub_sidecar_for(workspace_root.path(), "notes-plugin");
+        stub_sidecar_for(workspace_root.path(), "terminal-mesh-sidecar");
+        let doc = generate_config(
+            "tab-std",
+            workspace.path(),
+            McpConfigKind::Standard,
+            app_data.path(),
+            workspace_root.path(),
+        )
+        .expect("generate");
+        let entry = doc
+            .mcp_servers
+            .get("terminal-mesh")
+            .expect("terminal-mesh entry in standard config too");
+        assert!(
+            !entry.args.iter().any(|a| a == "--cross-tab-read"),
+            "non-orchestrator terminal-mesh entry MUST NOT carry --cross-tab-read; args={:?}",
             entry.args
         );
     }

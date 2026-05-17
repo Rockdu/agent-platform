@@ -4554,6 +4554,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "terminal-mesh-sidecar"
+version = "0.0.1"
+dependencies = [
+ "mcp-stdio",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,24 @@
+[package]
+name = "terminal-mesh-sidecar"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "terminal-mesh-sidecar"
+path = "src/main.rs"
+
+[lib]
+name = "terminal_mesh_sidecar"
+path = "src/lib.rs"
+
+[dependencies]
+mcp-stdio = { path = "../mcp-stdio" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "net", "io-std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+thiserror = "1"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["src-tauri", "crates/plugin-codegen", "crates/mcp-stdio", "crates/terminal-mesh-core"]
+members = ["src-tauri", "crates/plugin-codegen", "crates/mcp-stdio", "crates/terminal-mesh-core", "crates/terminal-mesh-sidecar"]
 
 [workspace.package]
 edition = "2024"

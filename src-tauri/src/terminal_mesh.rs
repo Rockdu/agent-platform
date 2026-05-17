@@ -113,6 +113,11 @@ pub struct TerminalSpawnRequest {
     pub cols: u16,
     #[serde(default)]
     pub rows: u16,
+    /// task21 / AC-3.3: optional workspace tab id. When set, the
+    /// registry indexes the spawned terminal under this tab id so
+    /// the host RPC bridge can resolve `target_tab_id → terminal_id`.
+    #[serde(default)]
+    pub tab_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -124,11 +129,26 @@ pub struct TerminalSpawnResponse {
 struct TerminalSession {
     command_tx: mpsc::Sender<ActorCommand>,
     scrollback: Arc<StdMutex<String>>,
+    /// task21 / AC-3.3: the tab id this session belongs to (the
+    /// frontend's workspace tab id for regular tabs; the orchestrator's
+    /// `OrchestratorSession::tab_id` for the orchestrator). Used by
+    /// the host RPC bridge to resolve `target_tab_id → terminal_id`.
+    tab_id: Option<String>,
 }
 
 /// Tauri-managed registry of live terminal sessions.
+///
+/// task21 / AC-3.3: shared via internal `Arc<Mutex<...>>` so the
+/// Tauri-managed handle and the host RPC bridge clone can both hold
+/// `TerminalMeshRegistry` by value while sharing the same underlying
+/// state.
+#[derive(Clone)]
 pub struct TerminalMeshRegistry {
-    inner: StdMutex<HashMap<Uuid, TerminalSession>>,
+    inner: Arc<StdMutex<HashMap<Uuid, TerminalSession>>>,
+    /// Secondary index for the host RPC bridge so an authorized
+    /// `target_tab_id` resolves to its current `terminal_id` in O(1).
+    /// Maintained in lockstep with `inner` by `record` and `forget`.
+    tab_index: Arc<StdMutex<HashMap<String, Uuid>>>,
 }
 
 impl Default for TerminalMeshRegistry {
@@ -140,7 +160,8 @@ impl Default for TerminalMeshRegistry {
 impl TerminalMeshRegistry {
     pub fn new() -> Self {
         Self {
-            inner: StdMutex::new(HashMap::new()),
+            inner: Arc::new(StdMutex::new(HashMap::new())),
+            tab_index: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -149,13 +170,19 @@ impl TerminalMeshRegistry {
         id: Uuid,
         command_tx: mpsc::Sender<ActorCommand>,
         scrollback: Arc<StdMutex<String>>,
+        tab_id: Option<String>,
     ) {
         let mut guard = self.inner.lock().expect("TerminalMeshRegistry poisoned");
+        if let Some(t) = tab_id.as_deref() {
+            let mut idx = self.tab_index.lock().expect("TerminalMeshRegistry tab_index poisoned");
+            idx.insert(t.to_string(), id);
+        }
         guard.insert(
             id,
             TerminalSession {
                 command_tx,
                 scrollback,
+                tab_id,
             },
         );
     }
@@ -165,14 +192,31 @@ impl TerminalMeshRegistry {
         guard.get(&id).map(|s| s.command_tx.clone())
     }
 
-    fn lookup_scrollback(&self, id: Uuid) -> Option<Arc<StdMutex<String>>> {
+    pub(crate) fn lookup_scrollback(&self, id: Uuid) -> Option<Arc<StdMutex<String>>> {
         let guard = self.inner.lock().expect("TerminalMeshRegistry poisoned");
         guard.get(&id).map(|s| s.scrollback.clone())
     }
 
+    /// task21 / AC-3.3: tab-id → terminal_id resolution for the host
+    /// RPC bridge's `terminalMesh.readScrollback` request. Returns
+    /// `None` if no live session is registered for `tab_id`.
+    pub fn lookup_terminal_by_tab(&self, tab_id: &str) -> Option<Uuid> {
+        let idx = self.tab_index.lock().expect("TerminalMeshRegistry tab_index poisoned");
+        idx.get(tab_id).copied()
+    }
+
     pub fn forget(&self, id: Uuid) {
         let mut guard = self.inner.lock().expect("TerminalMeshRegistry poisoned");
-        guard.remove(&id);
+        if let Some(session) = guard.remove(&id) {
+            if let Some(t) = session.tab_id.as_deref() {
+                let mut idx = self.tab_index.lock().expect("TerminalMeshRegistry tab_index poisoned");
+                // Only remove if the index still points to this id
+                // (a re-record under the same tab_id should win).
+                if idx.get(t).copied() == Some(id) {
+                    idx.remove(t);
+                }
+            }
+        }
     }
 
     /// True if `id` is currently registered (i.e., the actor has not
@@ -271,7 +315,7 @@ pub async fn terminal_spawn(
         rows,
     };
 
-    let terminal_id = spawn_into_registry(spec, &app, &registry)
+    let terminal_id = spawn_into_registry(spec, &app, &registry, req.tab_id)
         .map_err(|e| TerminalMeshErrorDto::from(&e))?;
     Ok(TerminalSpawnResponse {
         terminal_id: terminal_id.to_string(),
@@ -292,6 +336,7 @@ pub(crate) fn spawn_into_registry(
     spec: TerminalSpec,
     app: &AppHandle,
     registry: &TerminalMeshRegistry,
+    tab_id: Option<String>,
 ) -> Result<Uuid, TerminalMeshError> {
     let handle = TerminalActor::spawn(spec).map_err(TerminalMeshError::from)?;
     let TerminalHandle {
@@ -301,7 +346,7 @@ pub(crate) fn spawn_into_registry(
         status_rx,
     } = handle;
     let scrollback = Arc::new(StdMutex::new(String::new()));
-    registry.record(id, command_tx, scrollback.clone());
+    registry.record(id, command_tx, scrollback.clone(), tab_id);
 
     let app_for_events = app.clone();
     let scrollback_for_events = scrollback.clone();
@@ -491,10 +536,19 @@ pub fn cross_tab_read_inner(
         message: format!("capability rejected: {dto}"),
     })?;
 
-    // 2. Gate on the Rust-only cross_tab_read_flag.
+    // 2. Gate on BOTH the Rust-only cross_tab_read_flag AND the
+    //    declared `cross_tab_read` plugin permission. A privileged-
+    //    looking mount whose metadata doesn't declare the permission
+    //    must still be denied (defense-in-depth matching the spec's
+    //    Permission Gating section).
     if !entry.cross_tab_read_flag {
         return Err(TerminalMeshError::PermissionDenied {
             message: "capability lacks cross-tab read privilege".into(),
+        });
+    }
+    if !entry.permissions.iter().any(|p| p == "cross_tab_read") {
+        return Err(TerminalMeshError::PermissionDenied {
+            message: "capability does not declare cross_tab_read permission".into(),
         });
     }
 
@@ -506,21 +560,96 @@ pub fn cross_tab_read_inner(
             terminal_id: id.to_string(),
         })?;
 
-    // 4. Bound the read: caller's max_bytes, capped by the hard ceiling.
+    Ok(bound_scrollback_tail(&scrollback, max_bytes))
+}
+
+/// task21 / AC-3.3 — same as `cross_tab_read_inner` but keyed by
+/// `target_tab_id` (matching AC text `tab_id=X`). Resolves to the
+/// current terminal id via the `TerminalMeshRegistry` tab index then
+/// reads the bounded scrollback tail. Used by `host_rpc` and the
+/// Tauri command shim for the orchestrator's MCP tool path.
+pub fn cross_tab_read_by_tab(
+    mount_registry: &crate::dispatcher::MountRegistry,
+    terminal_registry: &TerminalMeshRegistry,
+    capability_handle: &str,
+    target_tab_id: &str,
+    max_bytes: usize,
+) -> Result<String, TerminalMeshError> {
+    let entry = crate::dispatcher::authorize_capability_handle(
+        mount_registry,
+        capability_handle,
+        "terminal-mesh",
+    )
+    .map_err(|dto| TerminalMeshError::PermissionDenied {
+        message: format!("capability rejected: {dto}"),
+    })?;
+    if !entry.cross_tab_read_flag {
+        return Err(TerminalMeshError::PermissionDenied {
+            message: "capability lacks cross-tab read privilege".into(),
+        });
+    }
+    if !entry.permissions.iter().any(|p| p == "cross_tab_read") {
+        return Err(TerminalMeshError::PermissionDenied {
+            message: "capability does not declare cross_tab_read permission".into(),
+        });
+    }
+    let terminal_id = terminal_registry
+        .lookup_terminal_by_tab(target_tab_id)
+        .ok_or_else(|| TerminalMeshError::NotFound {
+            terminal_id: target_tab_id.to_string(),
+        })?;
+    let scrollback = terminal_registry
+        .lookup_scrollback(terminal_id)
+        .ok_or_else(|| TerminalMeshError::NotFound {
+            terminal_id: terminal_id.to_string(),
+        })?;
+    Ok(bound_scrollback_tail(&scrollback, max_bytes))
+}
+
+/// task21 / AC-3.3 unauthenticated self-read used by the host RPC
+/// bridge when the calling clientId proves the caller owns the tab
+/// (e.g., `caller_tab_id == target_tab_id` for a regular tab — no
+/// capability handle needed because the clientId itself is the
+/// authorization proof). Bounded the same way as the privileged path.
+pub fn read_tab_scrollback_bounded(
+    terminal_registry: &TerminalMeshRegistry,
+    target_tab_id: &str,
+    max_bytes: usize,
+) -> Result<String, TerminalMeshError> {
+    let terminal_id = terminal_registry
+        .lookup_terminal_by_tab(target_tab_id)
+        .ok_or_else(|| TerminalMeshError::NotFound {
+            terminal_id: target_tab_id.to_string(),
+        })?;
+    let scrollback = terminal_registry
+        .lookup_scrollback(terminal_id)
+        .ok_or_else(|| TerminalMeshError::NotFound {
+            terminal_id: terminal_id.to_string(),
+        })?;
+    Ok(bound_scrollback_tail(&scrollback, max_bytes))
+}
+
+/// Shared tail-bounded read helper. Trims from the front to keep the
+/// most-recent `min(max_bytes, MAX_CROSS_TAB_READ_BYTES)` bytes; rounds
+/// the start index forward to the next UTF-8 char boundary.
+fn bound_scrollback_tail(
+    scrollback: &Arc<StdMutex<String>>,
+    max_bytes: usize,
+) -> String {
     let want = max_bytes.min(MAX_CROSS_TAB_READ_BYTES);
     let guard = scrollback.lock().expect("scrollback mutex poisoned");
     if guard.len() <= want {
-        return Ok(guard.clone());
+        return guard.clone();
     }
     let drop_bytes = guard.len() - want;
     let mut idx = drop_bytes;
     while !guard.is_char_boundary(idx) {
         idx += 1;
         if idx >= guard.len() {
-            return Ok(String::new());
+            return String::new();
         }
     }
-    Ok(guard[idx..].to_string())
+    guard[idx..].to_string()
 }
 
 /// task21 / AC-3.3 Tauri command: orchestrator-side cross-tab scrollback
@@ -559,7 +688,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(String::new()));
-        r.record(id, tx.clone(), buf.clone());
+        r.record(id, tx.clone(), buf.clone(), None);
         assert!(r.lookup_command_tx(id).is_some());
         assert!(r.lookup_scrollback(id).is_some());
         assert_eq!(r.active_count(), 1);
@@ -575,7 +704,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(String::new()));
         assert!(!r.contains(id), "unknown id must report not-contained");
-        r.record(id, tx, buf);
+        r.record(id, tx, buf, None);
         assert!(r.contains(id), "after record, contains true");
         r.forget(id);
         assert!(!r.contains(id), "after forget, contains false");
@@ -678,7 +807,7 @@ mod tests {
                 ..
             } = handle;
             let scrollback = StdArc::new(StdMutex::new(String::new()));
-            registry.record(id, command_tx.clone(), scrollback);
+            registry.record(id, command_tx.clone(), scrollback, None);
             keepalive_receivers.push(events_rx);
             keepalive_statuses.push(status_rx);
             command_txs.push((id, command_tx));
@@ -718,7 +847,21 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(body.to_string()));
-        registry.record(id, tx, buf);
+        registry.record(id, tx, buf, None);
+        (registry, id)
+    }
+
+    /// Like `registry_with_one_scrollback` but also indexes the
+    /// terminal under `tab_id` so `lookup_terminal_by_tab` resolves.
+    fn registry_with_tab_scrollback(
+        body: &str,
+        tab_id: &str,
+    ) -> (TerminalMeshRegistry, Uuid) {
+        let registry = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let buf = StdArc::new(StdMutex::new(body.to_string()));
+        registry.record(id, tx, buf, Some(tab_id.to_string()));
         (registry, id)
     }
 
@@ -730,7 +873,8 @@ mod tests {
             &mount_registry,
             "terminal-mesh",
             Some("tab-orch"),
-        );
+        )
+        .expect("terminal-mesh built-in metadata declares cross_tab_read");
         let out = cross_tab_read_inner(
             &mount_registry,
             &term_registry,
@@ -799,7 +943,8 @@ mod tests {
             &mount_registry,
             "terminal-mesh",
             None,
-        );
+        )
+        .expect("terminal-mesh built-in metadata declares cross_tab_read");
         let out = cross_tab_read_inner(
             &mount_registry,
             &term_registry,
@@ -822,7 +967,8 @@ mod tests {
             &mount_registry,
             "terminal-mesh",
             None,
-        );
+        )
+        .expect("terminal-mesh built-in metadata declares cross_tab_read");
         let out = cross_tab_read_inner(
             &mount_registry,
             &term_registry,
@@ -842,7 +988,8 @@ mod tests {
             &mount_registry,
             "terminal-mesh",
             None,
-        );
+        )
+        .expect("terminal-mesh built-in metadata declares cross_tab_read");
         let unknown = Uuid::new_v4();
         let err = cross_tab_read_inner(
             &mount_registry,
@@ -873,5 +1020,124 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, TerminalMeshError::PermissionDenied { .. }));
+    }
+
+    // ----- task21 Round 38 remediation: tab-id index + permission gate -----
+
+    #[test]
+    fn lookup_terminal_by_tab_resolves_to_recorded_terminal_id() {
+        let (registry, terminal_id) = registry_with_tab_scrollback("hello", "tab-A");
+        assert_eq!(
+            registry.lookup_terminal_by_tab("tab-A"),
+            Some(terminal_id)
+        );
+        assert_eq!(registry.lookup_terminal_by_tab("tab-missing"), None);
+    }
+
+    #[test]
+    fn forget_removes_tab_id_index_entry() {
+        let (registry, terminal_id) = registry_with_tab_scrollback("hello", "tab-A");
+        assert!(registry.lookup_terminal_by_tab("tab-A").is_some());
+        registry.forget(terminal_id);
+        assert!(
+            registry.lookup_terminal_by_tab("tab-A").is_none(),
+            "tab_index must be cleaned up alongside the primary entry"
+        );
+    }
+
+    #[test]
+    fn cross_tab_read_by_tab_resolves_via_tab_index() {
+        let (term_registry, _) = registry_with_tab_scrollback("body-by-tab", "tab-X");
+        let mount_registry = crate::dispatcher::MountRegistry::new();
+        let resp = crate::dispatcher::insert_orchestrator_mount(
+            &mount_registry,
+            "terminal-mesh",
+            None,
+        )
+        .expect("terminal-mesh built-in metadata declares cross_tab_read");
+        let out = cross_tab_read_by_tab(
+            &mount_registry,
+            &term_registry,
+            &resp.handle,
+            "tab-X",
+            8192,
+        )
+        .expect("orchestrator can read tab-X via tab id");
+        assert_eq!(out, "body-by-tab");
+    }
+
+    #[test]
+    fn cross_tab_read_by_tab_returns_not_found_for_unknown_tab() {
+        let (term_registry, _) = registry_with_tab_scrollback("x", "tab-known");
+        let mount_registry = crate::dispatcher::MountRegistry::new();
+        let resp = crate::dispatcher::insert_orchestrator_mount(
+            &mount_registry,
+            "terminal-mesh",
+            None,
+        )
+        .expect("terminal-mesh built-in metadata declares cross_tab_read");
+        let err = cross_tab_read_by_tab(
+            &mount_registry,
+            &term_registry,
+            &resp.handle,
+            "tab-unknown",
+            8192,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TerminalMeshError::NotFound { .. }));
+    }
+
+    #[test]
+    fn cross_tab_read_inner_denies_when_entry_missing_cross_tab_read_permission() {
+        // Synthetic mount with `cross_tab_read_flag = true` BUT empty
+        // permissions vec — must still be denied at read time. Defense
+        // in depth: even if the privileged grant was minted out of
+        // band, the read endpoint requires the declared permission.
+        let (term_registry, target_id) = registry_with_one_scrollback("secret");
+        let mount_registry = crate::dispatcher::MountRegistry::new();
+        let mount_id = Uuid::new_v4();
+        let nonce = crate::dispatcher::fresh_nonce_bytes();
+        let handle = crate::dispatcher::encode_handle(mount_id, &nonce);
+        crate::dispatcher::insert_mount_with_flag(
+            &mount_registry,
+            "terminal-mesh",
+            mount_id,
+            crate::dispatcher::hash_nonce(&nonce),
+            vec![],        // <-- no permissions
+            Some("tab-evil".into()),
+            true,          // <-- flag is true; permission is missing
+        );
+        let err = cross_tab_read_inner(
+            &mount_registry,
+            &term_registry,
+            &handle,
+            &target_id.to_string(),
+            8192,
+        )
+        .unwrap_err();
+        match err {
+            TerminalMeshError::PermissionDenied { message } => {
+                assert!(
+                    message.contains("does not declare cross_tab_read"),
+                    "unexpected permission_denied message: {message}"
+                );
+            }
+            other => panic!("expected PermissionDenied; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_tab_scrollback_bounded_returns_scrollback_for_known_tab() {
+        let (term_registry, _) = registry_with_tab_scrollback("self-read", "tab-self");
+        let out = read_tab_scrollback_bounded(&term_registry, "tab-self", 8192)
+            .expect("self-read for known tab works without capability");
+        assert_eq!(out, "self-read");
+    }
+
+    #[test]
+    fn read_tab_scrollback_bounded_returns_not_found_for_unknown_tab() {
+        let term_registry = TerminalMeshRegistry::new();
+        let err = read_tab_scrollback_bounded(&term_registry, "tab-missing", 8192).unwrap_err();
+        assert!(matches!(err, TerminalMeshError::NotFound { .. }));
     }
 }

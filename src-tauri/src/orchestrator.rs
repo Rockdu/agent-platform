@@ -106,8 +106,13 @@ impl From<&OrchestratorError> for OrchestratorErrorDto {
     }
 }
 
+/// task21 / AC-3.3: shared via internal `Arc<Mutex<...>>` so the
+/// Tauri-managed handle and the host RPC bridge clone can both hold
+/// `OrchestratorState` by value while sharing the same underlying
+/// session slot. `Clone` is cheap (Arc refcount bump).
+#[derive(Clone)]
 pub struct OrchestratorState {
-    inner: Mutex<Option<OrchestratorSession>>,
+    inner: std::sync::Arc<Mutex<Option<OrchestratorSession>>>,
 }
 
 impl Default for OrchestratorState {
@@ -119,7 +124,7 @@ impl Default for OrchestratorState {
 impl OrchestratorState {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(None),
+            inner: std::sync::Arc::new(Mutex::new(None)),
         }
     }
 
@@ -169,6 +174,13 @@ impl OrchestratorState {
 pub struct OrchestratorBootstrap {
     pub agent_platform_root: PathBuf,
     pub app_data_root: PathBuf,
+    /// task21 / AC-3.3: path to the host RPC bridge unix socket. The
+    /// orchestrator's MCP config generation passes this to every
+    /// sidecar via `--host-rpc-sock <path>` so the sidecar can call
+    /// back into the host for `terminal_mesh.read_scrollback`. `None`
+    /// only if the bridge failed to bind at bootstrap (logged; the
+    /// orchestrator still launches but cross-tab read is disabled).
+    pub host_rpc_sock: Option<PathBuf>,
 }
 
 #[tauri::command]
@@ -226,6 +238,7 @@ pub fn orchestrator_launch_claude(
     let claude_path = record.path;
     let agent_platform_root = bootstrap.agent_platform_root.clone();
     let app_data_root = bootstrap.app_data_root.clone();
+    let host_rpc_sock = bootstrap.host_rpc_sock.clone();
 
     let session = state
         .launch_locked(|| {
@@ -236,6 +249,7 @@ pub fn orchestrator_launch_claude(
                 &agent_platform_root,
                 &app_data_root,
                 &claude_path,
+                host_rpc_sock.as_deref(),
             )
         })
         .map_err(|e| OrchestratorErrorDto::from(&e))?;
@@ -254,15 +268,17 @@ pub(crate) fn spawn_orchestrator_claude(
     agent_platform_root: &std::path::Path,
     app_data_root: &std::path::Path,
     claude_path: &std::path::Path,
+    host_rpc_sock: Option<&std::path::Path>,
 ) -> Result<OrchestratorSession, OrchestratorError> {
     let tab_id = Uuid::new_v4().to_string();
     let workspace_root_for_dev_path = workspace_root_for_dev();
-    let doc = mcp_config::generate_config(
+    let doc = mcp_config::generate_config_with_host_rpc_sock(
         &tab_id,
         agent_platform_root,
         McpConfigKind::Orchestrator,
         app_data_root,
         &workspace_root_for_dev_path,
+        host_rpc_sock,
     )
     .map_err(|e| OrchestratorError::McpConfigFailed {
         message: e.to_string(),
@@ -291,20 +307,38 @@ pub(crate) fn spawn_orchestrator_claude(
         rows: 30,
     };
 
-    match spawn_into_registry(spec, app, registry) {
+    match spawn_into_registry(spec, app, registry, Some(tab_id.clone())) {
         Ok(terminal_id) => {
             // task21 / AC-3.3: mint the orchestrator's privileged
             // `terminal-mesh` mount with `cross_tab_read_flag = true`.
             // The handle is stashed on the (Rust-only) session field;
             // it never crosses the IPC boundary because the field is
-            // `#[serde(skip)]`. Host-internal grant — does not depend
-            // on the terminal-mesh frontend plugin manifest.
-            let resp = crate::dispatcher::insert_orchestrator_mount(
+            // `#[serde(skip)]`. `insert_orchestrator_mount` requires
+            // the built-in/manifest metadata to declare
+            // `cross_tab_read` — `terminal-mesh` does (see
+            // `builtin_plugins::BUILTIN_PLUGINS`). Failure here means
+            // the metadata table is misconfigured; surface as
+            // `SpawnFailed` so the round trip is observable to the
+            // frontend.
+            let terminal_mesh_capability = match crate::dispatcher::insert_orchestrator_mount(
                 mount_registry,
                 "terminal-mesh",
                 Some(&tab_id),
-            );
-            let terminal_mesh_capability = Some(resp.handle);
+            ) {
+                Ok(resp) => Some(resp.handle),
+                Err(dto) => {
+                    // Clean up the PTY we just spawned and the config
+                    // we just wrote — without the privileged mount,
+                    // the orchestrator session can't satisfy AC-3.3.
+                    registry.forget(terminal_id);
+                    mcp_config::delete_config(app_data_root, &tab_id);
+                    return Err(OrchestratorError::SpawnFailed {
+                        message: format!(
+                            "failed to mint orchestrator terminal-mesh capability: {dto}"
+                        ),
+                    });
+                }
+            };
             Ok(OrchestratorSession {
                 terminal_id,
                 tab_id,
@@ -644,7 +678,7 @@ mod tests {
         // a no-op channel + scrollback for the contains() check.
         let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
         let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        registry.record(live_id, command_tx, scrollback);
+        registry.record(live_id, command_tx, scrollback, None);
 
         let discovery = DiscoveryCache::empty();
         let status = resolve_status(&state, &discovery, &registry);

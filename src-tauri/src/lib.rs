@@ -4,9 +4,11 @@
 //! the mobile entry point both call `run()`.
 
 mod bootstrap;
+mod builtin_plugins;
 mod claude_discovery;
 mod dev_diagnostics;
 mod dispatcher;
+mod host_rpc;
 mod generated;
 mod ide_handoff;
 mod logging;
@@ -299,10 +301,40 @@ pub fn run() {
                     // context + empty session state. The orchestrator
                     // tab's launch path consumes these via
                     // `orchestrator_launch_claude` / `_status`.
-                    app.manage(OrchestratorState::new());
+                    let orchestrator = OrchestratorState::new();
+                    app.manage(orchestrator.clone());
+                    // Round 38 (task21 remediation): spawn the host
+                    // RPC bridge for sidecar back-channel calls. The
+                    // bridge clones the same internally-Arc'd state
+                    // handles the Tauri commands hold, so updates
+                    // are observed in both places. The socket path
+                    // is recorded in `OrchestratorBootstrap` so the
+                    // orchestrator MCP config generation can pass
+                    // `--host-rpc-sock <path>` to every sidecar.
+                    let mount_registry_handle = app.state::<dispatcher::MountRegistry>().inner().clone();
+                    let terminal_registry_handle = app.state::<TerminalMeshRegistry>().inner().clone();
+                    let host_rpc_sock_path = match host_rpc::prepare_socket_path(&app_data_root) {
+                        Ok(p) => {
+                            host_rpc::spawn_bridge(
+                                p.clone(),
+                                host_rpc::HostRpcState {
+                                    orchestrator: orchestrator.clone(),
+                                    mount_registry: mount_registry_handle,
+                                    terminal_registry: terminal_registry_handle,
+                                },
+                            );
+                            tracing::info!(host_rpc_sock = %p.display(), "host_rpc bridge spawned");
+                            Some(p)
+                        }
+                        Err(err) => {
+                            tracing::error!(%err, "host_rpc bridge socket prep failed; cross-tab read disabled");
+                            None
+                        }
+                    };
                     app.manage(OrchestratorBootstrap {
                         agent_platform_root: paths.agent_platform.clone(),
                         app_data_root,
+                        host_rpc_sock: host_rpc_sock_path,
                     });
                 }
                 Err(err) => tracing::error!(%err, "bootstrap failed"),
