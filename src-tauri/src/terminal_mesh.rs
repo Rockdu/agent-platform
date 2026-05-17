@@ -136,14 +136,28 @@ struct TerminalSession {
     /// `OrchestratorSession::tab_id` for the orchestrator). Used by
     /// the host RPC bridge to resolve `target_tab_id → terminal_id`.
     tab_id: Option<String>,
-    /// Host-side lifecycle snapshot used by the inner-rail Running/Done
-    /// queue, `terminal_mesh.list_tabs`, and the orchestrator-isolation
-    /// auth filter. Mutated under `Arc<Mutex<...>>` by the notification
-    /// path; the read path clones it out for serialization.
-    snapshot: Arc<StdMutex<WorkspaceLifecycleSnapshot>>,
 }
 
-/// Tauri-managed registry of live terminal sessions.
+/// Retained per-terminal lifecycle state that outlives the live actor.
+/// The Done queue and the lifecycle MCP tool both read from this store,
+/// so a natural actor exit must NOT delete it — only an explicit user
+/// close (or orchestrator cleanup) clears the retained record.
+struct RetainedRecord {
+    snapshot: Arc<StdMutex<WorkspaceLifecycleSnapshot>>,
+    tab_id: Option<String>,
+}
+
+/// Tauri-managed registry of live terminal sessions plus retained
+/// lifecycle snapshots.
+///
+/// Two-tier storage: the `inner` / `tab_index` maps describe a tab as
+/// long as its actor channel is open (so command writes, resize,
+/// stdin, scrollback reads work). The `snapshots` / `snapshot_tab_index`
+/// maps describe a tab's lifecycle state from creation until explicit
+/// cleanup, regardless of whether the actor is still running. Done
+/// rows survive a natural actor exit because the snapshot store stays
+/// populated through `forget_live`; only `forget` (full removal) drops
+/// the retained snapshot.
 ///
 /// task21 / AC-3.3: shared via internal `Arc<Mutex<...>>` so the
 /// Tauri-managed handle and the host RPC bridge clone can both hold
@@ -154,8 +168,16 @@ pub struct TerminalMeshRegistry {
     inner: Arc<StdMutex<HashMap<Uuid, TerminalSession>>>,
     /// Secondary index for the host RPC bridge so an authorized
     /// `target_tab_id` resolves to its current `terminal_id` in O(1).
-    /// Maintained in lockstep with `inner` by `record` and `forget`.
+    /// Maintained in lockstep with `inner` by `record` / `forget_live`.
     tab_index: Arc<StdMutex<HashMap<String, Uuid>>>,
+    /// Retained lifecycle store keyed by terminal_id. Lifetime is
+    /// `record` -> `forget` (full removal); a natural actor exit goes
+    /// through `forget_live` and leaves this map intact.
+    snapshots: Arc<StdMutex<HashMap<Uuid, RetainedRecord>>>,
+    /// Tab-id index for the retained snapshot store. Distinct from
+    /// `tab_index` so snapshot lookups by tab_id continue to work
+    /// after the live session has been torn down.
+    snapshot_tab_index: Arc<StdMutex<HashMap<String, Uuid>>>,
 }
 
 impl Default for TerminalMeshRegistry {
@@ -169,6 +191,8 @@ impl TerminalMeshRegistry {
         Self {
             inner: Arc::new(StdMutex::new(HashMap::new())),
             tab_index: Arc::new(StdMutex::new(HashMap::new())),
+            snapshots: Arc::new(StdMutex::new(HashMap::new())),
+            snapshot_tab_index: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -180,53 +204,82 @@ impl TerminalMeshRegistry {
         tab_id: Option<String>,
         tab_kind: TabKind,
     ) {
-        let mut guard = self.inner.lock().expect("TerminalMeshRegistry poisoned");
-        if let Some(t) = tab_id.as_deref() {
-            let mut idx = self.tab_index.lock().expect("TerminalMeshRegistry tab_index poisoned");
-            idx.insert(t.to_string(), id);
+        // Live state.
+        {
+            let mut guard = self.inner.lock().expect("TerminalMeshRegistry poisoned");
+            if let Some(t) = tab_id.as_deref() {
+                let mut idx = self
+                    .tab_index
+                    .lock()
+                    .expect("TerminalMeshRegistry tab_index poisoned");
+                idx.insert(t.to_string(), id);
+            }
+            guard.insert(
+                id,
+                TerminalSession {
+                    command_tx,
+                    scrollback,
+                    tab_id: tab_id.clone(),
+                },
+            );
         }
-        let snapshot = Arc::new(StdMutex::new(
-            WorkspaceLifecycleSnapshot::fresh_local(tab_kind),
-        ));
-        guard.insert(
-            id,
-            TerminalSession {
-                command_tx,
-                scrollback,
-                tab_id,
-                snapshot,
-            },
-        );
+
+        // Retained snapshot state (survives natural actor exit).
+        {
+            let mut snapshots = self.snapshots.lock().expect("retained snapshots poisoned");
+            if let Some(t) = tab_id.as_deref() {
+                let mut snap_idx = self
+                    .snapshot_tab_index
+                    .lock()
+                    .expect("snapshot_tab_index poisoned");
+                snap_idx.insert(t.to_string(), id);
+            }
+            snapshots.insert(
+                id,
+                RetainedRecord {
+                    snapshot: Arc::new(StdMutex::new(
+                        WorkspaceLifecycleSnapshot::fresh_local(tab_kind),
+                    )),
+                    tab_id,
+                },
+            );
+        }
     }
 
-    /// Clone-return the lifecycle snapshot for `terminal_id`. The
-    /// inner-rail polls this on mount and after every
-    /// `lifecycle://updated` event.
+    /// Clone-return the lifecycle snapshot for `terminal_id`. Reads
+    /// from the retained store so a Done snapshot survives natural
+    /// actor exit.
     pub fn snapshot_for_terminal(
         &self,
         terminal_id: Uuid,
     ) -> Option<WorkspaceLifecycleSnapshot> {
-        let guard = self.inner.lock().expect("TerminalMeshRegistry poisoned");
-        guard.get(&terminal_id).map(|s| {
-            s.snapshot
+        let snapshots = self.snapshots.lock().expect("retained snapshots poisoned");
+        snapshots.get(&terminal_id).map(|r| {
+            r.snapshot
                 .lock()
                 .expect("snapshot mutex poisoned")
                 .clone()
         })
     }
 
-    /// Tab-id-keyed snapshot lookup. Returns `None` during the brief
-    /// window between workspace creation and registry insertion (the
-    /// frontend gracefully degrades to a Running placeholder).
+    /// Tab-id-keyed snapshot lookup against the retained store. Returns
+    /// the snapshot for a tab even after the live actor session has
+    /// gone away (Done queue read path).
     pub fn snapshot_for_tab(&self, tab_id: &str) -> Option<WorkspaceLifecycleSnapshot> {
-        let terminal_id = self.lookup_terminal_by_tab(tab_id)?;
+        let snap_idx = self
+            .snapshot_tab_index
+            .lock()
+            .expect("snapshot_tab_index poisoned");
+        let terminal_id = snap_idx.get(tab_id).copied()?;
+        drop(snap_idx);
         self.snapshot_for_terminal(terminal_id)
     }
 
-    /// Apply `mutator` to the snapshot under the lock and return the
-    /// updated value. The notification path is the only writer today;
-    /// it calls `emit_lifecycle_updated` with the returned snapshot.
-    /// Returns `None` if `terminal_id` is not registered.
+    /// Apply `mutator` to the retained snapshot under the lock and
+    /// return the updated value. The notification path is the only
+    /// writer today; it calls `emit_lifecycle_updated` with the
+    /// returned snapshot. Returns `None` if `terminal_id` has no
+    /// retained record (already fully cleared via `forget`).
     #[allow(dead_code)]
     pub fn update_snapshot<F>(
         &self,
@@ -236,9 +289,9 @@ impl TerminalMeshRegistry {
     where
         F: FnOnce(&mut WorkspaceLifecycleSnapshot),
     {
-        let guard = self.inner.lock().expect("TerminalMeshRegistry poisoned");
-        let session = guard.get(&terminal_id)?;
-        let mut snap = session.snapshot.lock().expect("snapshot mutex poisoned");
+        let snapshots = self.snapshots.lock().expect("retained snapshots poisoned");
+        let record = snapshots.get(&terminal_id)?;
+        let mut snap = record.snapshot.lock().expect("snapshot mutex poisoned");
         mutator(&mut snap);
         Some(snap.clone())
     }
@@ -255,21 +308,51 @@ impl TerminalMeshRegistry {
 
     /// task21 / AC-3.3: tab-id → terminal_id resolution for the host
     /// RPC bridge's `terminalMesh.readScrollback` request. Returns
-    /// `None` if no live session is registered for `tab_id`.
+    /// `None` if no LIVE session is registered for `tab_id` (a tab
+    /// whose actor has exited is invisible to this lookup because
+    /// scrollback reads need the live session).
     pub fn lookup_terminal_by_tab(&self, tab_id: &str) -> Option<Uuid> {
         let idx = self.tab_index.lock().expect("TerminalMeshRegistry tab_index poisoned");
         idx.get(tab_id).copied()
     }
 
-    pub fn forget(&self, id: Uuid) {
+    /// Remove only the live actor state (command channel, scrollback,
+    /// live tab index). The retained lifecycle snapshot survives so
+    /// the Done queue and `terminal_mesh.list_tabs` still see the
+    /// final state. Called when the actor's event channel closes on
+    /// natural exit.
+    pub fn forget_live(&self, id: Uuid) {
         let mut guard = self.inner.lock().expect("TerminalMeshRegistry poisoned");
         if let Some(session) = guard.remove(&id) {
             if let Some(t) = session.tab_id.as_deref() {
-                let mut idx = self.tab_index.lock().expect("TerminalMeshRegistry tab_index poisoned");
+                let mut idx = self
+                    .tab_index
+                    .lock()
+                    .expect("TerminalMeshRegistry tab_index poisoned");
                 // Only remove if the index still points to this id
                 // (a re-record under the same tab_id should win).
                 if idx.get(t).copied() == Some(id) {
                     idx.remove(t);
+                }
+            }
+        }
+    }
+
+    /// Full removal: drop both live state and the retained snapshot.
+    /// Used by explicit user close (Tauri `terminal_shutdown`),
+    /// orchestrator cleanup, and failed-spawn cleanup.
+    pub fn forget(&self, id: Uuid) {
+        self.forget_live(id);
+
+        let mut snapshots = self.snapshots.lock().expect("retained snapshots poisoned");
+        if let Some(record) = snapshots.remove(&id) {
+            if let Some(t) = record.tab_id.as_deref() {
+                let mut snap_idx = self
+                    .snapshot_tab_index
+                    .lock()
+                    .expect("snapshot_tab_index poisoned");
+                if snap_idx.get(t).copied() == Some(id) {
+                    snap_idx.remove(t);
                 }
             }
         }
@@ -461,12 +544,14 @@ async fn forward_events_to_webview(
         }
     }
     // The actor's event channel closed: the PTY exited naturally (or
-    // crashed) and no more events will arrive. Evict the registry
-    // entry so liveness checks (e.g. `orchestrator_status`) observe
-    // the missing terminal and clear stale recorded sessions.
-    // Idempotent with the explicit `terminal_shutdown` path.
+    // crashed) and no more events will arrive. Drop only the live
+    // session state so liveness checks (e.g. `orchestrator_status`)
+    // observe the missing terminal — the retained lifecycle snapshot
+    // stays so the Done queue and `terminal_mesh.list_tabs` still
+    // show this tab's final state until the user explicitly closes
+    // it via `terminal_shutdown`.
     if let Some(registry) = app.try_state::<TerminalMeshRegistry>() {
-        registry.forget(id);
+        registry.forget_live(id);
     }
 }
 
@@ -920,6 +1005,98 @@ mod tests {
         let r = TerminalMeshRegistry::new();
         let result = r.update_snapshot(Uuid::new_v4(), |_| panic!("should not run"));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn snapshot_survives_forget_live_natural_exit() {
+        // Natural actor exit (event channel close) must drop only the
+        // live session — the retained snapshot stays so the Done queue
+        // can still render this tab. This is the core invariant the
+        // host-side AC-7 store depends on.
+        let r = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let buf = StdArc::new(StdMutex::new(String::new()));
+        r.record(id, tx, buf, Some("tab-natural".into()), TabKind::Workspace);
+
+        r.forget_live(id);
+
+        assert!(!r.contains(id), "live session must be cleared by forget_live");
+        assert!(
+            r.lookup_command_tx(id).is_none(),
+            "live command_tx must be cleared by forget_live"
+        );
+        assert!(
+            r.lookup_terminal_by_tab("tab-natural").is_none(),
+            "live tab index must be cleared by forget_live"
+        );
+        assert!(
+            r.snapshot_for_terminal(id).is_some(),
+            "retained snapshot must survive forget_live"
+        );
+        assert!(
+            r.snapshot_for_tab("tab-natural").is_some(),
+            "retained tab index must survive forget_live"
+        );
+    }
+
+    #[test]
+    fn forget_full_clears_snapshot_and_live_state() {
+        // Explicit user close (terminal_shutdown / orchestrator
+        // cleanup) drops both live state and the retained snapshot.
+        let r = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let buf = StdArc::new(StdMutex::new(String::new()));
+        r.record(id, tx, buf, Some("tab-full".into()), TabKind::Workspace);
+
+        r.forget(id);
+
+        assert!(!r.contains(id));
+        assert!(r.lookup_command_tx(id).is_none());
+        assert!(r.lookup_terminal_by_tab("tab-full").is_none());
+        assert!(
+            r.snapshot_for_terminal(id).is_none(),
+            "retained snapshot must be cleared by full forget"
+        );
+        assert!(
+            r.snapshot_for_tab("tab-full").is_none(),
+            "retained tab index must be cleared by full forget"
+        );
+    }
+
+    #[test]
+    fn update_snapshot_after_forget_live_still_succeeds() {
+        // After the actor has exited (live state gone) the snapshot
+        // must still be mutable so a user stdin write to a Done tab
+        // can transition it back to Running.
+        use crate::workspace_lifecycle::{DoneReason, TabStatus};
+        let r = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let buf = StdArc::new(StdMutex::new(String::new()));
+        r.record(id, tx, buf, Some("tab-resurrect".into()), TabKind::Workspace);
+
+        // Mark Done while still live (as task6's notification path will).
+        r.update_snapshot(id, |snap| {
+            snap.status = TabStatus::Done;
+            snap.done_reason = Some(DoneReason::CleanCompletion);
+        })
+        .expect("first mutation");
+
+        r.forget_live(id);
+
+        // Re-mutate to Running after live removal.
+        let after = r
+            .update_snapshot(id, |snap| {
+                snap.status = TabStatus::Running;
+                snap.done_reason = None;
+                snap.last_activity_at_unix_ms = 1_700_000_000_999;
+            })
+            .expect("retained snapshot must remain writable after forget_live");
+        assert!(matches!(after.status, TabStatus::Running));
+        assert!(after.done_reason.is_none());
+        assert_eq!(after.last_activity_at_unix_ms, 1_700_000_000_999);
     }
 
     #[test]

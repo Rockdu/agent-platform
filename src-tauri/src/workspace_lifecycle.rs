@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
+use terminal_mesh_core::AttentionKind;
 use uuid::Uuid;
 
 /// Tauri event topic for snapshot updates. The frontend subscribes to
@@ -43,7 +44,7 @@ pub enum TabStatus {
     Done,
 }
 
-/// Per AC-7.3, the four reasons a tab transitions into the Done section.
+/// The four reasons a tab transitions into the Done section.
 /// `Disconnected` covers transport-level loss (SSH/Docker channel drop);
 /// `TaskComplete` carries the OSC-emitted summary so the frontend can
 /// render it inline with the badge.
@@ -102,10 +103,9 @@ pub struct LifecycleUpdateEvent {
 
 /// Emit `LIFECYCLE_UPDATED_TOPIC` with the supplied snapshot. The
 /// notification-driven update path calls this AFTER applying the
-/// mutation under `TerminalMeshRegistry::update_snapshot`. Wiring it
-/// to the notification surface is the next implementation step in the
-/// AC-7 thread; the helper is declared here so that step is a pure
-/// call-site change.
+/// mutation under `TerminalMeshRegistry::update_snapshot`. The helper
+/// is declared here so the wiring change in the notification surface
+/// becomes a pure call-site change.
 #[allow(dead_code)]
 pub fn emit_lifecycle_updated(
     app: &AppHandle,
@@ -122,6 +122,28 @@ pub fn emit_lifecycle_updated(
             error = %e,
             "failed to emit lifecycle://updated"
         );
+    }
+}
+
+/// Classify an `AttentionKind` into the lifecycle Done reason it
+/// should produce, if any. The Done queue transitions Running -> Done
+/// on the first event that returns `Some(...)`. `PromptWaiting` and
+/// `AgentMarker` deliberately return `None` so general agent activity
+/// does not flicker tabs into Done — only Completion / NonZeroExit /
+/// Disconnect / TaskComplete trigger the transition.
+#[allow(dead_code)]
+pub fn done_reason_from_attention(kind: &AttentionKind) -> Option<DoneReason> {
+    match kind {
+        AttentionKind::Completion { .. } => Some(DoneReason::CleanCompletion),
+        AttentionKind::NonZeroExit { exit_code } => Some(DoneReason::NonZeroExit {
+            code: *exit_code,
+        }),
+        AttentionKind::Disconnect => Some(DoneReason::Disconnected),
+        AttentionKind::TaskComplete { summary } => Some(DoneReason::TaskComplete {
+            summary: summary.clone(),
+        }),
+        AttentionKind::PromptWaiting => None,
+        AttentionKind::AgentMarker { .. } => None,
     }
 }
 
@@ -172,6 +194,44 @@ mod tests {
     fn lifecycle_updated_topic_is_stable_lifecycle_scheme() {
         // Pin the topic string; the frontend subscribes to it directly.
         assert_eq!(LIFECYCLE_UPDATED_TOPIC, "lifecycle://updated");
+    }
+
+    #[test]
+    fn done_reason_from_attention_maps_terminal_events_to_done_reasons() {
+        use terminal_mesh_core::AttentionKind;
+        assert!(matches!(
+            done_reason_from_attention(&AttentionKind::Completion { exit_code: 0 }),
+            Some(DoneReason::CleanCompletion)
+        ));
+        match done_reason_from_attention(&AttentionKind::NonZeroExit { exit_code: 7 }) {
+            Some(DoneReason::NonZeroExit { code }) => assert_eq!(code, 7),
+            other => panic!("expected NonZeroExit, got {other:?}"),
+        }
+        assert!(matches!(
+            done_reason_from_attention(&AttentionKind::Disconnect),
+            Some(DoneReason::Disconnected)
+        ));
+        match done_reason_from_attention(&AttentionKind::TaskComplete {
+            summary: "shipped".into(),
+        }) {
+            Some(DoneReason::TaskComplete { summary }) => assert_eq!(summary, "shipped"),
+            other => panic!("expected TaskComplete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn done_reason_from_attention_returns_none_for_non_done_triggering_kinds() {
+        use terminal_mesh_core::{AttentionKind, AttentionSeverity};
+        // PromptWaiting must NOT transition Running -> Done (long-running
+        // tasks emit prompt-like output frequently; flicker would be bad).
+        assert!(done_reason_from_attention(&AttentionKind::PromptWaiting).is_none());
+        // AgentMarker is general agent activity, NOT a done signal. Only
+        // the dedicated TaskComplete OSC marker should transition Done.
+        assert!(done_reason_from_attention(&AttentionKind::AgentMarker {
+            summary: Some("partial progress".into()),
+            severity: AttentionSeverity::Info,
+        })
+        .is_none());
     }
 
     #[test]

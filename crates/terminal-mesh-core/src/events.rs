@@ -41,17 +41,31 @@ pub enum AttentionKind {
         summary: Option<String>,
         severity: AttentionSeverity,
     },
+    /// Transport-layer disconnect after the remote shell was already
+    /// running. Distinct from pre-shell `TransportError` variants,
+    /// which surface as create-time errors and never reach the
+    /// attention surface.
+    Disconnect,
+    /// User-program-emitted task-complete marker (OSC sequence parsed
+    /// by the host). Carries the verbatim summary so the Done badge
+    /// can render it inline. Disjoint from `AgentMarker` so the Done
+    /// queue can distinguish "task finished" from general agent
+    /// notifications.
+    TaskComplete { summary: String },
 }
 
 impl AttentionKind {
     /// Canonical kind name used in `dedup_key`. Spec examples:
-    /// "Completion", "NonZeroExit", "PromptWaiting", "AgentMarker".
+    /// "Completion", "NonZeroExit", "PromptWaiting", "AgentMarker",
+    /// "Disconnect", "TaskComplete".
     pub fn kind_name(&self) -> &'static str {
         match self {
             Self::Completion { .. } => "Completion",
             Self::NonZeroExit { .. } => "NonZeroExit",
             Self::PromptWaiting => "PromptWaiting",
             Self::AgentMarker { .. } => "AgentMarker",
+            Self::Disconnect => "Disconnect",
+            Self::TaskComplete { .. } => "TaskComplete",
         }
     }
 }
@@ -185,6 +199,33 @@ mod tests {
             }
             .kind_name(),
             "AgentMarker"
+        );
+        assert_eq!(AttentionKind::Disconnect.kind_name(), "Disconnect");
+        assert_eq!(
+            AttentionKind::TaskComplete {
+                summary: "shipped".into(),
+            }
+            .kind_name(),
+            "TaskComplete"
+        );
+    }
+
+    #[test]
+    fn dedup_key_matches_spec_example_for_disconnect_and_task_complete() {
+        let tid: Uuid = "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
+        assert_eq!(
+            dedup_key(TERMINAL_MESH_PLUGIN_ID, tid, &AttentionKind::Disconnect),
+            "terminal_mesh:550e8400-e29b-41d4-a716-446655440000:Disconnect"
+        );
+        assert_eq!(
+            dedup_key(
+                TERMINAL_MESH_PLUGIN_ID,
+                tid,
+                &AttentionKind::TaskComplete {
+                    summary: "anything".into(),
+                },
+            ),
+            "terminal_mesh:550e8400-e29b-41d4-a716-446655440000:TaskComplete"
         );
     }
 }

@@ -308,6 +308,8 @@ fn kind_name_str(kind: &AttentionKind) -> &'static str {
         AttentionKind::NonZeroExit { .. } => "nonZeroExit",
         AttentionKind::PromptWaiting => "promptWaiting",
         AttentionKind::AgentMarker { .. } => "agentMarker",
+        AttentionKind::Disconnect => "disconnect",
+        AttentionKind::TaskComplete { .. } => "taskComplete",
     }
 }
 
@@ -340,6 +342,14 @@ fn summarize(kind: &AttentionKind) -> (String, String) {
         AttentionKind::AgentMarker { summary, severity } => (
             summary.clone().unwrap_or_else(|| "Agent marker".to_string()),
             severity_name(*severity),
+        ),
+        AttentionKind::Disconnect => (
+            "Disconnected".to_string(),
+            severity_name(AttentionSeverity::Error),
+        ),
+        AttentionKind::TaskComplete { summary } => (
+            summary.clone(),
+            severity_name(AttentionSeverity::Info),
         ),
     }
 }
