@@ -21,7 +21,9 @@ pub use events::{
     dedup_key, AttentionKind, AttentionSeverity, BufferTruncated, NeedsAttentionPayload,
     TerminalEvent, TerminalEventEnvelope, TERMINAL_MESH_PLUGIN_ID,
 };
-pub use osc_agent_marker::{OscAgentMarkerParser, OSC_MAX_PAYLOAD_BYTES};
+pub use osc_agent_marker::{
+    AgentMarkerEvent, OscAttentionEvent, OscAttentionParser, OSC_MAX_PAYLOAD_BYTES,
+};
 pub use prompt_detector::PromptDetector;
 pub use ring_buffer::{BufferTruncatedInfo, RingBuffer, RING_CAPACITY_BYTES};
 pub use transport::{

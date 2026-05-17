@@ -182,6 +182,61 @@ pub fn update_snapshot_for_attention(
     })
 }
 
+/// Pure mutator: when the snapshot is currently `Done`, transition it
+/// back to `Running`, clear `done_reason`, and refresh the activity
+/// timestamp. Returns `true` if the snapshot actually changed,
+/// `false` if it was already `Running`. Used by the user-initiated
+/// stdin path to resume a Done tab without recreating its session.
+pub fn resume_running_from_done(
+    snap: &mut WorkspaceLifecycleSnapshot,
+    now_unix_ms: i64,
+) -> bool {
+    match snap.status {
+        TabStatus::Done => {
+            snap.status = TabStatus::Running;
+            snap.done_reason = None;
+            snap.last_activity_at_unix_ms = now_unix_ms;
+            true
+        }
+        TabStatus::Running => false,
+    }
+}
+
+/// Registry-side half of the user-stdin path: apply
+/// `resume_running_from_done` under the retained-snapshot lock and
+/// return the new snapshot if a transition actually fired. Returns
+/// `None` when no mutation should fire (snapshot already Running, or
+/// the retained record is gone because the tab was fully cleared via
+/// `forget`).
+pub fn update_snapshot_for_user_stdin(
+    registry: &crate::terminal_mesh::TerminalMeshRegistry,
+    terminal_id: Uuid,
+) -> Option<WorkspaceLifecycleSnapshot> {
+    let now = now_unix_ms();
+    let mut transitioned = false;
+    let updated = registry.update_snapshot(terminal_id, |snap| {
+        transitioned = resume_running_from_done(snap, now);
+    })?;
+    if transitioned {
+        Some(updated)
+    } else {
+        None
+    }
+}
+
+/// End-to-end user-stdin entry point: transition Done → Running on
+/// the retained snapshot and emit `lifecycle://updated`. No-op when
+/// the tab is already Running.
+pub fn on_user_stdin(
+    registry: &crate::terminal_mesh::TerminalMeshRegistry,
+    app: &AppHandle,
+    terminal_id: Uuid,
+) {
+    if let Some(updated) = update_snapshot_for_user_stdin(registry, terminal_id) {
+        emit_lifecycle_updated(app, terminal_id, &updated);
+    }
+}
+
 /// End-to-end notification-path entry point: classify, mutate, and
 /// emit `lifecycle://updated` so the inner-rail React hook can
 /// reconcile. Thin wrapper over `update_snapshot_for_attention` +
@@ -350,6 +405,95 @@ mod tests {
             "later Done-triggering signal must overwrite earlier reason"
         );
         assert_eq!(snap.last_activity_at_unix_ms, 2);
+    }
+
+    #[test]
+    fn resume_running_from_done_transitions_done_snapshot_and_returns_true() {
+        let mut snap = WorkspaceLifecycleSnapshot::fresh_local(TabKind::Workspace);
+        snap.status = TabStatus::Done;
+        snap.done_reason = Some(DoneReason::CleanCompletion);
+        snap.last_activity_at_unix_ms = 0;
+
+        let did = resume_running_from_done(&mut snap, 1_700_000_000_111);
+
+        assert!(did, "must report a transition happened");
+        assert!(matches!(snap.status, TabStatus::Running));
+        assert!(snap.done_reason.is_none());
+        assert_eq!(snap.last_activity_at_unix_ms, 1_700_000_000_111);
+    }
+
+    #[test]
+    fn resume_running_from_done_is_noop_for_running_snapshot_and_returns_false() {
+        let mut snap = WorkspaceLifecycleSnapshot::fresh_local(TabKind::Workspace);
+        let baseline = snap.last_activity_at_unix_ms;
+        assert!(matches!(snap.status, TabStatus::Running));
+
+        let did = resume_running_from_done(&mut snap, baseline + 9_999);
+
+        assert!(!did, "no transition when already Running");
+        assert!(matches!(snap.status, TabStatus::Running));
+        assert!(snap.done_reason.is_none());
+        assert_eq!(
+            snap.last_activity_at_unix_ms, baseline,
+            "no-op must NOT bump activity for an already-Running tab"
+        );
+    }
+
+    #[test]
+    fn update_snapshot_for_user_stdin_returns_some_when_transitioning_done_to_running() {
+        use crate::terminal_mesh::TerminalMeshRegistry;
+        use terminal_mesh_core::ActorCommand;
+        use tokio::sync::mpsc;
+
+        let registry = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        registry.record(id, tx, scrollback, None, TabKind::Workspace);
+
+        // Drive to Done first.
+        registry
+            .update_snapshot(id, |s| {
+                s.status = TabStatus::Done;
+                s.done_reason = Some(DoneReason::CleanCompletion);
+            })
+            .expect("recorded");
+
+        let updated = update_snapshot_for_user_stdin(&registry, id)
+            .expect("user stdin on Done tab must return Some");
+        assert!(matches!(updated.status, TabStatus::Running));
+        assert!(updated.done_reason.is_none());
+    }
+
+    #[test]
+    fn update_snapshot_for_user_stdin_returns_none_when_already_running() {
+        use crate::terminal_mesh::TerminalMeshRegistry;
+        use terminal_mesh_core::ActorCommand;
+        use tokio::sync::mpsc;
+
+        let registry = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        registry.record(id, tx, scrollback, None, TabKind::Workspace);
+        let baseline = registry.snapshot_for_terminal(id).expect("recorded");
+
+        let result = update_snapshot_for_user_stdin(&registry, id);
+        assert!(result.is_none(), "no-op when already Running");
+
+        let after = registry.snapshot_for_terminal(id).expect("still present");
+        assert_eq!(
+            baseline.last_activity_at_unix_ms, after.last_activity_at_unix_ms,
+            "Running tab activity must NOT be bumped by user stdin"
+        );
+    }
+
+    #[test]
+    fn update_snapshot_for_user_stdin_returns_none_for_unknown_terminal() {
+        use crate::terminal_mesh::TerminalMeshRegistry;
+        let registry = TerminalMeshRegistry::new();
+        let result = update_snapshot_for_user_stdin(&registry, Uuid::new_v4());
+        assert!(result.is_none());
     }
 
     #[test]

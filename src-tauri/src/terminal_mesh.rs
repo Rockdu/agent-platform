@@ -584,6 +584,8 @@ async fn forward_status_to_webview(
 pub async fn terminal_write_stdin(
     terminal_id: String,
     data: String,
+    user_initiated: Option<bool>,
+    app: AppHandle,
     registry: State<'_, TerminalMeshRegistry>,
 ) -> Result<(), TerminalMeshErrorDto> {
     let id = parse_terminal_id(&terminal_id).map_err(|e| TerminalMeshErrorDto::from(&e))?;
@@ -601,6 +603,12 @@ pub async fn terminal_write_stdin(
                 message: e.to_string(),
             })
         })?;
+    // Frontend keyboard input defaults to user-initiated; programmatic
+    // restorers (e.g. scrollback subscribe replays) pass `Some(false)`
+    // so a Done tab stays Done.
+    if user_initiated.unwrap_or(true) {
+        crate::workspace_lifecycle::on_user_stdin(&registry, &app, id);
+    }
     Ok(())
 }
 

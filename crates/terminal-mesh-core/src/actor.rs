@@ -25,7 +25,7 @@ use crate::events::{
     dedup_key, AttentionKind, BufferTruncated, NeedsAttentionPayload, TerminalEvent,
     TerminalEventEnvelope, TERMINAL_MESH_PLUGIN_ID,
 };
-use crate::osc_agent_marker::OscAgentMarkerParser;
+use crate::osc_agent_marker::{OscAttentionEvent, OscAttentionParser};
 use crate::prompt_detector::PromptDetector;
 use crate::ring_buffer::RingBuffer;
 use crate::transport::{
@@ -244,7 +244,7 @@ async fn processor_task(
     // to the reader thread.
     let mut writer: Option<Box<dyn TransportStdinSink>> = Some(writer_in);
     let mut ring = RingBuffer::new();
-    let mut osc = OscAgentMarkerParser::new();
+    let mut osc = OscAttentionParser::new();
     let mut prompt = PromptDetector::default_bash_zsh();
     let mut tick = tokio::time::interval(PROMPT_TICK_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -354,15 +354,18 @@ async fn processor_task(
                                 .await;
                         }
                         for ev in osc.feed(&bytes) {
-                            emit_attention(
-                                terminal_id,
-                                &events_tx,
-                                AttentionKind::AgentMarker {
-                                    summary: ev.summary,
-                                    severity: ev.severity,
-                                },
-                            )
-                            .await;
+                            let kind = match ev {
+                                OscAttentionEvent::AgentMarker(m) => {
+                                    AttentionKind::AgentMarker {
+                                        summary: m.summary,
+                                        severity: m.severity,
+                                    }
+                                }
+                                OscAttentionEvent::TaskComplete { summary } => {
+                                    AttentionKind::TaskComplete { summary }
+                                }
+                            };
+                            emit_attention(terminal_id, &events_tx, kind).await;
                         }
                         let tail = ring.read_scrollback(PROMPT_TAIL_BYTES);
                         if prompt.poll(&tail, Instant::now()).is_some() {
@@ -964,6 +967,54 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "injected transport spawn must be called exactly once (no local fallback)"
+        );
+    }
+
+    /// Cross-crate proof that an OSC 1339 sequence emitted by the
+    /// child PTY surfaces as `AttentionKind::TaskComplete` on the
+    /// actor's event channel. Closes the TaskComplete positive path
+    /// end-to-end (parser + actor + attention envelope).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn osc_1339_task_complete_surfaces_as_task_complete_attention() {
+        // `shipped` base64 = c2hpcHBlZA==
+        let script = r#"printf '\033]1339;am-task-complete;success;c2hpcHBlZA==\007'; exit 0"#;
+        let h = TerminalActor::spawn_local(shell_spec(script)).expect("spawn");
+        let TerminalHandle {
+            mut events_rx,
+            command_tx,
+            ..
+        } = h;
+        let _keep = command_tx;
+
+        let evs = collect_until(
+            &mut events_rx,
+            |e| matches!(
+                e.event,
+                TerminalEvent::NeedsAttention {
+                    payload: NeedsAttentionPayload {
+                        kind: AttentionKind::TaskComplete { .. },
+                        ..
+                    },
+                }
+            ),
+            5000,
+        )
+        .await;
+
+        let task_complete = evs.iter().find_map(|e| match &e.event {
+            TerminalEvent::NeedsAttention {
+                payload:
+                    NeedsAttentionPayload {
+                        kind: AttentionKind::TaskComplete { summary },
+                        ..
+                    },
+            } => Some(summary.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            task_complete.as_deref(),
+            Some("shipped"),
+            "child OSC 1339 must produce AttentionKind::TaskComplete with decoded summary; got {evs:?}"
         );
     }
 }
