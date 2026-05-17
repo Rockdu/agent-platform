@@ -50,18 +50,17 @@ impl PromptDetector {
         self
     }
 
-    /// Observe a fresh ring-buffer tail snapshot. Output arrival
-    /// without a tail-match resets the debounce; tail-match keeps the
-    /// timer running. Call [`take_fired`] to consume any pending fire.
+    /// Observe a fresh ring-buffer tail snapshot. Per spec, EVERY
+    /// output arrival counts as activity that resets the 1-second
+    /// debounce window — even output that still leaves the tail
+    /// matching a prompt. Otherwise prompt-output-prompt cycles could
+    /// fire prematurely against the older timestamp.
     pub fn on_output(&mut self, tail: &str, now: Instant) {
         let matches = self.regexes.iter().any(|re| re.is_match(tail));
         if matches {
-            if self.matching_since.is_none() {
-                self.matching_since = Some(now);
-                self.fired_for_current_match = false;
-            }
+            self.matching_since = Some(now);
+            self.fired_for_current_match = false;
         } else {
-            // Output arrived that does NOT end at a prompt → reset.
             self.matching_since = None;
             self.fired_for_current_match = false;
         }
@@ -138,9 +137,38 @@ mod tests {
 
     #[test]
     fn poll_combines_on_output_and_tick() {
+        // Per the round-23 spec fix, every matching `on_output` resets
+        // the debounce window. So `poll` is best demonstrated as
+        // "observe one prompt, then a silent tick after the debounce
+        // window fires". Re-polling with another matching output
+        // would (correctly, per spec) restart the clock.
         let mut d = PromptDetector::default_bash_zsh();
         let t0 = Instant::now();
         assert!(d.poll("$ ", t0).is_none()); // start debounce
-        assert_eq!(d.poll("$ ", t0 + Duration::from_secs(1)), Some(()));
+        assert_eq!(d.tick(t0 + Duration::from_secs(1)), Some(()));
+    }
+
+    /// Codex round-22 blocker #3 regression: matching output arriving
+    /// inside the debounce window must reset the timer to the latest
+    /// arrival, not keep the older timestamp. Two prompts at t=0 and
+    /// t=500ms must push the fire to t=1500ms, not t=1000ms.
+    #[test]
+    fn repeated_matching_output_resets_debounce_to_latest_arrival() {
+        let mut d = PromptDetector::default_bash_zsh();
+        let t0 = Instant::now();
+        d.on_output("$ ", t0);
+        // A second matching output arrives 500ms later. With the
+        // pre-fix code this kept matching_since=t0 and would fire at
+        // t0+1000. With the fix, matching_since is reset to t0+500.
+        d.on_output("user@host:~$ ", t0 + Duration::from_millis(500));
+        assert!(
+            d.tick(t0 + Duration::from_millis(999)).is_none(),
+            "must NOT fire 999ms after first prompt (only 499ms since the reset)"
+        );
+        assert_eq!(
+            d.tick(t0 + Duration::from_millis(1500)),
+            Some(()),
+            "must fire 1000ms after the latest matching output"
+        );
     }
 }

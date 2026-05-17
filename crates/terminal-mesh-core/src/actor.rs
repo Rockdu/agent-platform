@@ -14,10 +14,9 @@
 //! Spec: `docs/specs/terminal-events.md`. Targets AC-4.1 + AC-4.2.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -111,10 +110,15 @@ impl TerminalActor {
             cmd_builder.env(k, v);
         }
 
-        let child = pty_pair
+        let mut child = pty_pair
             .slave
             .spawn_command(cmd_builder)
             .map_err(|e| ActorError::Pty(e.to_string()))?;
+        // Clone an independent killer BEFORE moving the child into the
+        // wait thread; the killer is non-blocking and lives in the
+        // processor task so Shutdown can fire without racing the
+        // wait-thread's blocking `child.wait()`.
+        let killer: Box<dyn ChildKiller + Send + Sync> = child.clone_killer();
         // Drop the slave half so the child owns it exclusively.
         drop(pty_pair.slave);
 
@@ -157,22 +161,17 @@ impl TerminalActor {
             })
             .map_err(|e| ActorError::Io(e.to_string()))?;
 
-        // Exit waiter — `Child::wait` is blocking; offload to a thread.
-        // Wrap the child in a Mutex so the command listener can issue
-        // `kill` from a different task during Shutdown.
-        let child_for_wait = std::sync::Arc::new(Mutex::new(Some(child)));
-        let child_for_kill = child_for_wait.clone();
+        // Exit waiter — `Child::wait` is blocking; offload to a thread
+        // that owns the child outright. Killing happens through the
+        // pre-cloned `killer` in the processor task, so we don't need
+        // any Mutex/Arc indirection here.
         std::thread::Builder::new()
             .name(format!("terminal-mesh-wait-{terminal_id}"))
             .spawn(move || {
-                let code: Option<i32> = (|| -> Option<i32> {
-                    let mut guard = child_for_wait.lock().ok()?;
-                    let mut child = guard.take()?;
-                    let status = child.wait().ok()?;
-                    // ExitStatus from portable-pty maps via .exit_code()
-                    // returning u32; convert.
-                    Some(status.exit_code() as i32)
-                })();
+                let code = child
+                    .wait()
+                    .ok()
+                    .map(|status| status.exit_code() as i32);
                 let _ = exit_tx.send(code);
             })
             .map_err(|e| ActorError::Io(e.to_string()))?;
@@ -183,7 +182,7 @@ impl TerminalActor {
             terminal_id,
             master,
             writer,
-            child_for_kill,
+            killer,
             bytes_rx,
             command_rx,
             events_tx,
@@ -206,7 +205,7 @@ async fn processor_task(
     terminal_id: Uuid,
     master: Box<dyn MasterPty + Send>,
     mut writer: Box<dyn std::io::Write + Send>,
-    child_handle: std::sync::Arc<Mutex<Option<Box<dyn Child + Send + Sync>>>>,
+    mut killer: Box<dyn ChildKiller + Send + Sync>,
     mut bytes_rx: mpsc::Receiver<Vec<u8>>,
     mut command_rx: mpsc::Receiver<ActorCommand>,
     events_tx: mpsc::Sender<TerminalEventEnvelope>,
@@ -282,10 +281,12 @@ async fn processor_task(
                     }
                     Some(ActorCommand::Shutdown) => {
                         shutdown_requested = true;
-                        if let Ok(mut guard) = child_handle.lock()
-                            && let Some(child) = guard.as_mut()
-                        {
-                            let _ = child.kill();
+                        // Non-blocking signal through the cloned killer
+                        // — the wait thread, which holds the original
+                        // `Child`, observes the exit and forwards the
+                        // code through `exit_rx`.
+                        if let Err(e) = killer.kill() {
+                            tracing::warn!(%terminal_id, %e, "child kill failed");
                         }
                     }
                     None => {
@@ -648,6 +649,43 @@ mod tests {
         let p = std::env::temp_dir().join(format!("tm-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// Codex round-22 blocker #1 regression: a long-running PTY child
+    /// must terminate promptly when Shutdown is sent — proving the
+    /// ChildKiller path no longer races the wait-thread's blocking
+    /// `child.wait()` for a held mutex.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_kills_long_running_child_and_emits_cancelled() {
+        let started = std::time::Instant::now();
+        let h = TerminalActor::spawn(shell_spec("sleep 30")).expect("spawn");
+        let TerminalHandle {
+            mut events_rx,
+            command_tx,
+            ..
+        } = h;
+        // Give the child a moment to actually start.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        command_tx.send(ActorCommand::Shutdown).await.unwrap();
+        let evs = collect_until(
+            &mut events_rx,
+            |e| matches!(e.event, TerminalEvent::Cancelled),
+            3000,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "shutdown must complete well before the 30s natural exit; took {elapsed:?}"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(e.event, TerminalEvent::Exit { .. })),
+            "Exit envelope expected after killer.kill(); got {evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(e.event, TerminalEvent::Cancelled)),
+            "Cancelled envelope expected after Shutdown; got {evs:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

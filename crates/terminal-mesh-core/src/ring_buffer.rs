@@ -101,8 +101,14 @@ impl RingBuffer {
         self.buf.extend(bytes.iter().copied());
 
         // 3. If we're over capacity, drop oldest bytes to the nearest
-        //    safe boundary AFTER the required drop count. If no safe
-        //    boundary is reachable, drop the entire buffer.
+        //    safe boundary AFTER the required drop count. A "true safe
+        //    boundary" is BOTH ANSI-Ground (scanner-emitted candidate)
+        //    AND a UTF-8 codepoint boundary at the physical position
+        //    after eviction. We must iterate past candidates whose
+        //    physical byte is a UTF-8 continuation — bailing on the
+        //    first one would erase usable scrollback around multi-byte
+        //    output. Only fall back to full-buffer drop when no true
+        //    safe boundary exists at all.
         let dropped = if self.buf.len() > self.capacity {
             let must_drop = self.buf.len() - self.capacity;
             let drop_target_logical = self.head_logical + must_drop as u64;
@@ -110,14 +116,12 @@ impl RingBuffer {
                 .safe_boundaries
                 .iter()
                 .copied()
-                .find(|&off| off >= drop_target_logical && off <= self.tail_logical())
-                .filter(|&off| {
-                    // Validate the candidate's UTF-8 byte at the
-                    // physical position post-drop. The byte at logical
-                    // offset `off` must not be a continuation byte.
+                .find(|&off| {
+                    if off < drop_target_logical || off > self.tail_logical() {
+                        return false;
+                    }
                     let physical = (off - self.head_logical) as usize;
-                    physical >= self.buf.len()
-                        || is_utf8_boundary(self.buf[physical])
+                    physical >= self.buf.len() || is_utf8_boundary(self.buf[physical])
                 });
 
             let actual_drop = match chosen {
@@ -170,45 +174,50 @@ impl RingBuffer {
         let raw_start_logical = self.tail_logical() - want as u64;
         let raw_end_logical = self.tail_logical();
 
-        // Round start FORWARD to the nearest safe boundary at or after.
-        let start_logical = match self
-            .safe_boundaries
-            .iter()
-            .copied()
-            .find(|&off| off >= raw_start_logical && off <= raw_end_logical)
-        {
+        // Round start FORWARD: scan ascending, skip candidates whose
+        // physical byte is a UTF-8 continuation (those would split a
+        // codepoint at the slice head).
+        let start_logical = match self.safe_boundaries.iter().copied().find(|&off| {
+            if off < raw_start_logical || off > raw_end_logical {
+                return false;
+            }
+            let physical = (off - self.head_logical) as usize;
+            physical >= self.buf.len() || is_utf8_boundary(self.buf[physical])
+        }) {
             Some(off) => off,
             None => return String::new(),
         };
-        // Round end BACKWARD to the nearest safe boundary at or before.
+        // Round end BACKWARD: scan descending, same UTF-8 filter; allow
+        // `off == tail_logical` (slice goes to end-of-buffer; there's
+        // no byte at that offset to validate).
         let end_logical = match self
             .safe_boundaries
             .iter()
             .copied()
             .rev()
-            .find(|&off| off <= raw_end_logical && off >= start_logical)
-        {
+            .find(|&off| {
+                if off > raw_end_logical || off < start_logical {
+                    return false;
+                }
+                let physical = (off - self.head_logical) as usize;
+                physical >= self.buf.len() || is_utf8_boundary(self.buf[physical])
+            }) {
             Some(off) => off,
             None => return String::new(),
         };
         if end_logical <= start_logical {
             return String::new();
         }
-        // Translate to physical indices and validate UTF-8 ends.
         let phys_start = (start_logical - self.head_logical) as usize;
         let phys_end = (end_logical - self.head_logical) as usize;
         if phys_end > self.buf.len() || phys_start > phys_end {
             return String::new();
         }
-        // Validate the BYTE at phys_start is not a UTF-8 continuation
-        // (defense-in-depth: the scanner already filtered, but a final
-        // sanity check before slicing into &[u8] avoids handing the
-        // caller invalid UTF-8 even in pathological cases).
-        if phys_start < self.buf.len() && !is_utf8_boundary(self.buf[phys_start]) {
-            return String::new();
-        }
         // Materialize the slice. VecDeque may be wrapped; collect into
-        // a Vec<u8> for a contiguous view.
+        // a Vec<u8> for a contiguous view. Final `String::from_utf8`
+        // is the last line of defense — if the safe-boundary filter
+        // missed something pathological, the slice is silently
+        // discarded rather than panicking.
         let slice: Vec<u8> = self
             .buf
             .iter()
@@ -347,5 +356,48 @@ mod tests {
         let mut r = RingBuffer::with_capacity(16);
         r.push(b"abc");
         assert_eq!(r.read_scrollback(0), "");
+    }
+
+    /// Codex round-22 blocker #2 regression: with cap=4 and pushing
+    /// "你好" (6 bytes = 3+3), the first ANSI-Ground candidate at the
+    /// required drop count lands at logical offset 4, which is byte 4
+    /// = 0xA5 (continuation byte of "好"). The fix must scan past
+    /// that to the next candidate (offset 6, end-of-buffer) and drop
+    /// the entire first codepoint + the first byte of the second, but
+    /// only the FIRST codepoint should actually be lost; the second
+    /// must remain intact.
+    #[test]
+    fn overflow_retains_second_complete_codepoint_when_first_drop_lands_inside_a_codepoint() {
+        let mut r = RingBuffer::with_capacity(4);
+        let _ = r.push("你好".as_bytes());
+        let s = r.read_scrollback(64);
+        // Either we retain "好" (3 bytes, fits in cap=4) or we drop
+        // everything; the spec rules out the latter when a true safe
+        // boundary exists. With the fix, the boundary at logical
+        // offset 3 (end of "你") is reachable, so the kept tail is "好".
+        assert_eq!(s, "好", "must retain the second complete codepoint; got {s:?}");
+    }
+
+    /// Codex round-22 blocker #2 regression: when raw_start lands on
+    /// a UTF-8 continuation byte, `read_scrollback` must scan forward
+    /// to the next safe boundary instead of returning empty. Build a
+    /// scenario where the buffer head sits at a continuation byte and
+    /// trailing valid ASCII follows.
+    #[test]
+    fn read_scrollback_skips_continuation_byte_start_to_return_later_valid_text() {
+        // Capacity 8 keeps "好abc" (3 + 3 = 6 bytes) comfortably.
+        // Push "你好abc" (3 + 3 + 3 = 9 bytes); overflow drops the
+        // first codepoint "你" and leaves "好abc" (6 bytes). A partial
+        // read with max_bytes=4 sets raw_start at logical offset 5 —
+        // the middle of "好" (a continuation byte). The fix must scan
+        // forward to the next valid boundary (offset 6, start of "a")
+        // and return "abc".
+        let mut r = RingBuffer::with_capacity(8);
+        let _ = r.push("你好abc".as_bytes());
+        let s = r.read_scrollback(4);
+        assert_eq!(
+            s, "abc",
+            "must skip the continuation-byte start and return trailing ASCII; got {s:?}"
+        );
     }
 }
