@@ -56,6 +56,12 @@ pub struct TrayEntry {
     pub summary: String,
     pub fired_at_unix_ms: u128,
     pub suppressed_count: usize,
+    /// task23 / AC-3.5: true when the event originated from the
+    /// orchestrator's claude PTY (`forward_events_to_webview`
+    /// resolves it from `OrchestratorState::snapshot()`). The
+    /// frontend renders a 🤖 / "claude" badge on these rows so
+    /// orchestrator events are visually distinct from regular tabs.
+    pub is_orchestrator: bool,
 }
 
 /// Wire shape for `notification_get_permission_state`. `unknown` until
@@ -153,6 +159,7 @@ impl NotificationService {
     pub fn on_needs_attention(
         &self,
         envelope: &TerminalEventEnvelope,
+        is_orchestrator: bool,
     ) -> NotificationDecision {
         let TerminalEvent::NeedsAttention { ref payload } = envelope.event else {
             return NotificationDecision::SkippedNonAttention;
@@ -198,6 +205,7 @@ impl NotificationService {
             summary,
             fired_at_unix_ms: system_time_to_unix_ms(envelope.timestamp),
             suppressed_count: 0,
+            is_orchestrator,
         };
         {
             let mut guard = self.inner.entries.lock().expect("entries poisoned");
@@ -209,9 +217,14 @@ impl NotificationService {
 
         match perm {
             NotifyPermissionState::Granted => {
-                self.inner
-                    .sink
-                    .fire(&notification_title(plugin_id, &entry.kind_name), &entry.summary);
+                let (title, body) = format_notification(
+                    plugin_id,
+                    &entry.kind_name,
+                    &payload.kind,
+                    &entry.summary,
+                    is_orchestrator,
+                );
+                self.inner.sink.fire(&title, &body);
                 NotificationDecision::FiredNativeAndTray
             }
             NotifyPermissionState::Denied | NotifyPermissionState::Prompt => {
@@ -333,6 +346,32 @@ fn summarize(kind: &AttentionKind) -> (String, String) {
 
 fn notification_title(plugin_id: &str, kind_name: &str) -> String {
     format!("{plugin_id}: {kind_name}")
+}
+
+/// task23 / AC-3.5: route orchestrator AgentMarker events through a
+/// distinct "claude:" prefix so claude's verbatim task summary
+/// surfaces as e.g. `"claude: 标记 3 封邮件为已读 + 新增 2 条 arXiv
+/// 推荐"`. Non-AgentMarker kinds in the orchestrator (Completion,
+/// NonZeroExit, PromptWaiting) continue to use the regular plugin-
+/// prefixed format — this preserves AC-3.5's negative-test contract
+/// that a non-OSC exit in the orchestrator PTY fires the regular
+/// completion notification, NOT the semantic-summary path.
+pub fn format_notification(
+    plugin_id: &str,
+    kind_name: &str,
+    kind: &AttentionKind,
+    summary: &str,
+    is_orchestrator: bool,
+) -> (String, String) {
+    let is_agent_marker = matches!(kind, AttentionKind::AgentMarker { .. });
+    if is_orchestrator && is_agent_marker {
+        // Title carries the verbatim summary; body repeats it so
+        // macOS notification rendering (which can hide the body
+        // under summary-only conditions) is informative either way.
+        (format!("claude: {summary}"), summary.to_string())
+    } else {
+        (notification_title(plugin_id, kind_name), summary.to_string())
+    }
 }
 
 fn system_time_to_unix_ms(t: SystemTime) -> u128 {
@@ -486,8 +525,8 @@ mod tests {
         let env1 = fake_attention_envelope(tid, AttentionKind::PromptWaiting);
         let env2 = fake_attention_envelope(tid, AttentionKind::PromptWaiting);
 
-        let d1 = svc.on_needs_attention(&env1);
-        let d2 = svc.on_needs_attention(&env2);
+        let d1 = svc.on_needs_attention(&env1, false);
+        let d2 = svc.on_needs_attention(&env2, false);
         assert_eq!(d1, NotificationDecision::FiredNativeAndTray);
         assert_eq!(d2, NotificationDecision::DedupedSuppressed);
         assert_eq!(sink.fire_count(), 1, "native fire only once per dedup window");
@@ -507,9 +546,9 @@ mod tests {
         let env1 = fake_attention_envelope(tid, AttentionKind::PromptWaiting);
         let env2 = fake_attention_envelope(tid, AttentionKind::PromptWaiting);
 
-        let _ = svc.on_needs_attention(&env1);
+        let _ = svc.on_needs_attention(&env1, false);
         thread::sleep(Duration::from_millis(2100));
-        let d2 = svc.on_needs_attention(&env2);
+        let d2 = svc.on_needs_attention(&env2, false);
         assert_eq!(d2, NotificationDecision::FiredNativeAndTray);
         assert_eq!(sink.fire_count(), 2);
     }
@@ -521,7 +560,7 @@ mod tests {
         let tid = Uuid::new_v4();
         let env = fake_attention_envelope(tid, AttentionKind::PromptWaiting);
 
-        let d = svc.on_needs_attention(&env);
+        let d = svc.on_needs_attention(&env, false);
         assert_eq!(d, NotificationDecision::TrayOnlyPermissionDenied);
         assert_eq!(
             sink.fire_count(),
@@ -542,7 +581,7 @@ mod tests {
         let svc = NotificationService::with_sink(sink.clone());
         for _ in 0..(MAX_TRAY_ENTRIES + 10) {
             let env = fake_attention_envelope(Uuid::new_v4(), AttentionKind::PromptWaiting);
-            let _ = svc.on_needs_attention(&env);
+            let _ = svc.on_needs_attention(&env, false);
         }
         let entries = svc.list_recent_entries();
         assert_eq!(entries.len(), MAX_TRAY_ENTRIES);
@@ -554,7 +593,7 @@ mod tests {
         let svc = NotificationService::with_sink(sink.clone());
         for _ in 0..3 {
             let env = fake_attention_envelope(Uuid::new_v4(), AttentionKind::PromptWaiting);
-            let _ = svc.on_needs_attention(&env);
+            let _ = svc.on_needs_attention(&env, false);
         }
         assert_eq!(svc.list_recent_entries().len(), 3);
         svc.clear_entries();
@@ -567,7 +606,7 @@ mod tests {
         let svc = NotificationService::with_sink(sink.clone());
         assert!(matches!(svc.permission_state_dto(), PermissionStateDto::Unknown));
         let env = fake_attention_envelope(Uuid::new_v4(), AttentionKind::PromptWaiting);
-        let _ = svc.on_needs_attention(&env);
+        let _ = svc.on_needs_attention(&env, false);
         assert!(matches!(svc.permission_state_dto(), PermissionStateDto::Granted));
     }
 
@@ -579,7 +618,7 @@ mod tests {
             Uuid::new_v4(),
             TerminalEvent::Output { bytes: vec![1, 2, 3] },
         );
-        let d = svc.on_needs_attention(&env);
+        let d = svc.on_needs_attention(&env, false);
         assert_eq!(d, NotificationDecision::SkippedNonAttention);
         assert_eq!(sink.fire_count(), 0);
         assert_eq!(svc.list_recent_entries().len(), 0);
@@ -612,8 +651,8 @@ mod tests {
         };
         assert_ne!(p1.event_id, p2.event_id, "fresh event_ids per envelope");
 
-        let d1 = svc.on_needs_attention(&env1);
-        let d2 = svc.on_needs_attention(&env2);
+        let d1 = svc.on_needs_attention(&env1, false);
+        let d2 = svc.on_needs_attention(&env2, false);
         assert_eq!(d1, NotificationDecision::FiredNativeAndTray);
         assert_eq!(d2, NotificationDecision::DedupedSuppressed);
         assert_eq!(sink.fire_count(), 1, "host arbiter is the single dedup point");
@@ -623,6 +662,136 @@ mod tests {
             entries[0].suppressed_count, 1,
             "suppressed_count tracks deduped repeats"
         );
+    }
+
+    // ----- task23 / AC-3.5 + AC-8.3: orchestrator semantic-summary -----
+
+    fn agent_marker_envelope(terminal_id: Uuid, summary: &str) -> TerminalEventEnvelope {
+        fake_attention_envelope(
+            terminal_id,
+            AttentionKind::AgentMarker {
+                summary: Some(summary.to_string()),
+                severity: AttentionSeverity::Info,
+            },
+        )
+    }
+
+    #[test]
+    fn orchestrator_agent_marker_fires_semantic_summary_notification() {
+        // The exact AC-3.5 example phrasing — claude emits its
+        // verbatim summary via OSC AgentMarker; the host service
+        // wraps it as `claude: <summary>` for the native title.
+        let sink = RecordingSink::new(NotifyPermissionState::Granted);
+        let svc = NotificationService::with_sink(sink.clone());
+        let summary = "标记 3 封邮件为已读 + 新增 2 条 arXiv 推荐";
+        let env = agent_marker_envelope(Uuid::new_v4(), summary);
+
+        let d = svc.on_needs_attention(&env, true);
+        assert_eq!(d, NotificationDecision::FiredNativeAndTray);
+
+        let fires = sink.fires.lock().unwrap();
+        assert_eq!(fires.len(), 1, "exactly one native fire");
+        let (title, body) = &fires[0];
+        assert_eq!(
+            title,
+            &format!("claude: {summary}"),
+            "title MUST be `claude: <verbatim summary>` per AC-3.5"
+        );
+        assert_eq!(body, summary, "body repeats the verbatim summary");
+        drop(fires);
+
+        let entries = svc.list_recent_entries();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].is_orchestrator, "tray entry tagged orchestrator");
+        assert_eq!(entries[0].summary, summary);
+        assert_eq!(entries[0].kind_name, "agentMarker");
+    }
+
+    #[test]
+    fn orchestrator_completion_uses_regular_path_not_semantic_summary() {
+        // AC-3.5 negative test: a raw exit in the orchestrator PTY
+        // (no OSC AgentMarker) MUST fire the regular completion
+        // notification, NOT the semantic-summary path.
+        let sink = RecordingSink::new(NotifyPermissionState::Granted);
+        let svc = NotificationService::with_sink(sink.clone());
+        let env = fake_attention_envelope(
+            Uuid::new_v4(),
+            AttentionKind::Completion { exit_code: 0 },
+        );
+
+        let d = svc.on_needs_attention(&env, true);
+        assert_eq!(d, NotificationDecision::FiredNativeAndTray);
+
+        let fires = sink.fires.lock().unwrap();
+        let (title, body) = &fires[0];
+        assert!(
+            !title.starts_with("claude:"),
+            "non-AgentMarker orchestrator events MUST NOT use the semantic-summary prefix; got: {title}"
+        );
+        assert_eq!(title, "terminal_mesh: completion");
+        assert_eq!(body, "Completed (exit 0)");
+        drop(fires);
+
+        let entries = svc.list_recent_entries();
+        assert!(
+            entries[0].is_orchestrator,
+            "tray entry still tagged orchestrator (informational); only the formatting differs"
+        );
+    }
+
+    #[test]
+    fn non_orchestrator_agent_marker_uses_regular_path() {
+        // A regular tab's AgentMarker (e.g., a non-orchestrator
+        // claude or another agent-emitting tool) MUST NOT use the
+        // `claude:` prefix — that prefix is reserved for the
+        // orchestrator's privileged claude session.
+        let sink = RecordingSink::new(NotifyPermissionState::Granted);
+        let svc = NotificationService::with_sink(sink.clone());
+        let env = agent_marker_envelope(Uuid::new_v4(), "some plugin task");
+
+        let d = svc.on_needs_attention(&env, false);
+        assert_eq!(d, NotificationDecision::FiredNativeAndTray);
+
+        let fires = sink.fires.lock().unwrap();
+        let (title, _) = &fires[0];
+        assert!(
+            !title.starts_with("claude:"),
+            "non-orchestrator AgentMarker MUST NOT use the claude prefix; got: {title}"
+        );
+        assert_eq!(title, "terminal_mesh: agentMarker");
+        drop(fires);
+
+        let entries = svc.list_recent_entries();
+        assert!(!entries[0].is_orchestrator);
+    }
+
+    #[test]
+    fn orchestrator_agent_marker_dedups_under_window() {
+        // The AC-8.3 path inherits the AC-8.1 dedup contract — two
+        // back-to-back orchestrator AgentMarker envelopes with the
+        // same dedup key within the 2s window yield one native fire
+        // and one tray entry with suppressed_count=1.
+        let sink = RecordingSink::new(NotifyPermissionState::Granted);
+        let svc = NotificationService::with_sink(sink.clone());
+        let tid = Uuid::new_v4();
+        let env1 = agent_marker_envelope(tid, "first summary");
+        let env2 = agent_marker_envelope(tid, "second summary");
+
+        let d1 = svc.on_needs_attention(&env1, true);
+        let d2 = svc.on_needs_attention(&env2, true);
+        assert_eq!(d1, NotificationDecision::FiredNativeAndTray);
+        assert_eq!(d2, NotificationDecision::DedupedSuppressed);
+        assert_eq!(sink.fire_count(), 1);
+
+        let entries = svc.list_recent_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].suppressed_count, 1);
+        assert!(entries[0].is_orchestrator);
+        // First-emitted summary wins — the dedup-suppress path only
+        // bumps suppressed_count; it does not replace the entry's
+        // body. UX-wise: the user sees the first event's summary
+        // with a "+1" badge indicating more were suppressed.
+        assert_eq!(entries[0].summary, "first summary");
     }
 
     // Round 41 (task22 remediation): unit-testable tray-toggle

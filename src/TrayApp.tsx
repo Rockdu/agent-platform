@@ -74,8 +74,18 @@ export function TrayApp() {
       ) : (
         <ul className="tray-app__list">
           {entries.map((e) => (
-            <li key={e.id} className={`tray-app__item tray-app__item--${e.severity}`}>
+            <li
+              key={e.id}
+              className={`tray-app__item tray-app__item--${e.severity}${
+                e.isOrchestrator ? " tray-app__item--orchestrator" : ""
+              }`}
+            >
               <div className="tray-app__item-head">
+                {e.isOrchestrator && (
+                  <span className="tray-app__orch-badge" title="orchestrator (claude)">
+                    🤖 claude
+                  </span>
+                )}
                 <code className="tray-app__source">
                   {e.pluginId} · {e.terminalId.slice(0, 8)}…
                 </code>

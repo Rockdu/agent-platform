@@ -14,6 +14,13 @@ export interface TrayEntryDto {
   summary: string;
   firedAtUnixMs: number;
   suppressedCount: number;
+  /**
+   * task23 / AC-3.5: true when this event originated from the
+   * orchestrator's claude PTY. The tray UI renders a 🤖 / "claude"
+   * badge on these rows so orchestrator events are visually distinct
+   * from regular tabs.
+   */
+  isOrchestrator: boolean;
 }
 
 export async function notificationGetPermissionState(): Promise<PermissionStateDto> {

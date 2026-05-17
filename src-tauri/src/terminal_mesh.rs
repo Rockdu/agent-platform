@@ -380,7 +380,18 @@ async fn forward_events_to_webview(
         // (test paths, bootstrap failure) skip silently.
         if matches!(env.event, TerminalEvent::NeedsAttention { .. }) {
             if let Some(service) = app.try_state::<crate::notification::NotificationService>() {
-                let _decision = service.on_needs_attention(&env);
+                // task23 / AC-3.5: resolve whether this terminal is
+                // the orchestrator's claude PTY so the notification
+                // service can format AgentMarker events with the
+                // semantic-summary "claude:" prefix. Best-effort —
+                // when there's no recorded orchestrator session, this
+                // is `false` and the regular path applies.
+                let is_orchestrator = app
+                    .try_state::<crate::orchestrator::OrchestratorState>()
+                    .and_then(|s| s.snapshot())
+                    .map(|sess| sess.terminal_id == env.terminal_id)
+                    .unwrap_or(false);
+                let _decision = service.on_needs_attention(&env, is_orchestrator);
                 // Emit a frontend event so the tray window can
                 // refetch its entries list. Best-effort.
                 if let Err(err) = app.emit("tray://updated", &serde_json::json!({})) {

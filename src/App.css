@@ -773,3 +773,22 @@
   color: #ffd0d0;
   border-radius: 3px;
 }
+
+/* task23 / AC-3.5 — orchestrator-tagged tray rows get a distinct
+   subtle accent + an inline "🤖 claude" badge so the user can tell
+   semantic-summary events from other tabs at a glance. */
+.tray-app__item--orchestrator {
+  border-left: 3px solid #4a9eff;
+  padding-left: 9px;
+}
+.tray-app__orch-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 6px;
+  background: #1a3a5a;
+  color: #c0d8f0;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 600;
+}
