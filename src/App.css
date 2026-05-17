@@ -225,52 +225,107 @@
 }
 
 /* Terminal Mesh multi-tab container (task16). */
+/* Two-level navigation: outer App tab strip stays top-horizontal
+   (see `.tab-strip` rule); Terminal Mesh's inner workspace strip is a
+   vertical left rail so many parallel sessions stay visible without
+   pushing the terminal area. */
 .terminal-mesh-container {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   height: 100%;
+  min-height: 0;
 }
-.terminal-mesh-container__strip {
+.terminal-mesh-container__rail {
+  width: 200px;
+  flex: 0 0 200px;
   display: flex;
+  flex-direction: column;
   gap: 4px;
-  padding: 6px 8px 0;
+  padding: 8px 6px;
   background: #2a2a2a;
-  border-bottom: 1px solid #1a1a1a;
+  border-right: 1px solid #1a1a1a;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
-/* task18: each tab is a wrapper containing a sibling label + close
-   button (no nested role=button inside button). */
-.terminal-mesh-container__tab {
-  display: inline-flex;
+.terminal-mesh-container__rail-row {
+  display: flex;
+  flex-direction: row;
   align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
   background: #3a3a3a;
   color: #ccc;
-  border-radius: 4px 4px 0 0;
-  overflow: hidden;
+  border-radius: 4px;
   font-size: 12px;
+  min-width: 0;
 }
-.terminal-mesh-container__tab--active {
+.terminal-mesh-container__rail-row--active {
   background: #1e1e1e;
   color: #fff;
 }
-.terminal-mesh-container__tab-label {
+.rail-row__transport-icon {
+  flex: 0 0 16px;
+  font-size: 14px;
+  line-height: 1;
+  text-align: center;
+}
+.rail-row__label {
   background: transparent;
   border: none;
   color: inherit;
-  padding: 4px 6px 4px 10px;
+  padding: 0;
   cursor: pointer;
   font: inherit;
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rail-row__status-badge {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 1.4;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.rail-row__status-badge--running {
+  background: #2e7d32;
+  color: #fff;
+}
+.rail-row__status-badge--done {
+  background: #616161;
+  color: #fff;
 }
 .terminal-mesh-container__close {
   background: transparent;
   border: none;
-  padding: 0 6px;
+  padding: 0 2px;
   color: #888;
   cursor: pointer;
   font-size: 14px;
   line-height: 1;
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 .terminal-mesh-container__close:hover {
   color: #fff;
+}
+.terminal-mesh-container__body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: #1e1e1e;
+}
+.terminal-mesh-container__panes {
+  flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
 }
 
 /* task18: workspace switcher modal. */
@@ -486,19 +541,15 @@
   border-top: 1px solid #1a1a1a;
 }
 .terminal-mesh-container__add {
-  margin-left: auto;
-  padding: 4px 10px;
+  margin-top: auto;
+  padding: 6px 10px;
   background: transparent;
   color: #ccc;
   border: 1px dashed #555;
   border-radius: 4px;
   cursor: pointer;
   font-size: 12px;
-}
-.terminal-mesh-container__body {
-  flex: 1;
-  background: #1e1e1e;
-  position: relative;
+  flex: 0 0 auto;
 }
 /* Every open tab's TerminalMeshView stays mounted as an absolutely
    positioned panel so its PTY survives tab switches. Inactive panels

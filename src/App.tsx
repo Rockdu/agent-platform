@@ -992,6 +992,25 @@ interface OpenTab {
 
 type HostModal = "workspace-switcher" | null;
 
+type TransportKindHint = "Local" | "Ssh" | "SshDocker" | undefined;
+type TabStatusHint = "Running" | "Done" | undefined;
+
+function transportKindIcon(kind: TransportKindHint): string {
+  switch (kind) {
+    case "Ssh":
+      return "🌐";
+    case "SshDocker":
+      return "🐳";
+    case "Local":
+    default:
+      return "🖥";
+  }
+}
+
+function statusBadgeLabel(status: TabStatusHint): string {
+  return status === "Done" ? "Done" : "Running";
+}
+
 function MultiTerminalContainer() {
   // task17: every open terminal tab is bound to exactly one
   // persisted workspace. The host registry enforces
@@ -1094,38 +1113,61 @@ function MultiTerminalContainer() {
 
   return (
     <section className="terminal-mesh-container">
-      <nav className="terminal-mesh-container__strip" role="tablist">
-        {tabs.map((t) => (
-          // task18: each tab is a wrapper <div> containing a label
-          // <button role="tab"> + a sibling close <button>. Prior
-          // markup nested a <span role="button"> inside the tab
-          // button, which is invalid interactive markup.
-          <div
-            key={t.tabId}
-            className={`terminal-mesh-container__tab ${
-              activeId === t.tabId ? "terminal-mesh-container__tab--active" : ""
-            }`}
-          >
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeId === t.tabId}
-              className="terminal-mesh-container__tab-label"
-              onClick={() => setActive(t.tabId)}
-              title={t.workspacePath}
+      <aside
+        className="terminal-mesh-container__rail"
+        role="tablist"
+        aria-orientation="vertical"
+      >
+        {tabs.map((t) => {
+          // The transport-kind icon + status badge are placeholders
+          // today (LocalTransport is the only live transport and the
+          // lifecycle snapshot hook lands in a follow-up). The
+          // helpers fall through to Local + Running when no data is
+          // wired in.
+          const transportIcon = transportKindIcon(undefined);
+          const status = statusBadgeLabel(undefined);
+          const isActive = activeId === t.tabId;
+          return (
+            <div
+              key={t.tabId}
+              className={`terminal-mesh-container__rail-row ${
+                isActive ? "terminal-mesh-container__rail-row--active" : ""
+              }`}
             >
-              {t.workspaceName}
-            </button>
-            <button
-              type="button"
-              className="terminal-mesh-container__close"
-              aria-label={`关闭 ${t.workspaceName}`}
-              onClick={() => void closeTab(t.tabId)}
-            >
-              ×
-            </button>
-          </div>
-        ))}
+              <span
+                className="rail-row__transport-icon"
+                aria-label="Local"
+                title="Local transport"
+              >
+                {transportIcon}
+              </span>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={isActive}
+                className="rail-row__label"
+                onClick={() => setActive(t.tabId)}
+                title={t.workspacePath}
+              >
+                {t.workspaceName}
+              </button>
+              <span
+                className={`rail-row__status-badge rail-row__status-badge--${status.toLowerCase()}`}
+                aria-label={`状态：${status}`}
+              >
+                {status}
+              </span>
+              <button
+                type="button"
+                className="terminal-mesh-container__close"
+                aria-label={`关闭 ${t.workspaceName}`}
+                onClick={() => void closeTab(t.tabId)}
+              >
+                ×
+              </button>
+            </div>
+          );
+        })}
         <button
           type="button"
           className="terminal-mesh-container__add"
@@ -1134,40 +1176,42 @@ function MultiTerminalContainer() {
         >
           +
         </button>
-      </nav>
-      {error && (
-        <aside
-          className="bootstrap-card bootstrap-card--error"
-          role="alert"
-          data-workspaces-error={error.kind}
-        >
-          <h3>工作区操作失败</h3>
-          <p>
-            <code>{error.kind}</code>
-          </p>
-        </aside>
-      )}
-      {tabs.length === 0 && (
-        <section className="placeholder">
-          <p>还没有打开任何工作区。</p>
-          <button
-            type="button"
-            onClick={() => setActiveModal("workspace-switcher")}
-          >
-            打开工作区
-          </button>
-        </section>
-      )}
+      </aside>
       <div className="terminal-mesh-container__body">
-        {tabs.map((t) => (
-          <TerminalMeshView
-            key={t.tabId}
-            active={activeId === t.tabId}
-            cwd={t.workspacePath}
-            workspaceName={t.workspaceName}
-            tabId={t.tabId}
-          />
-        ))}
+        {error && (
+          <aside
+            className="bootstrap-card bootstrap-card--error"
+            role="alert"
+            data-workspaces-error={error.kind}
+          >
+            <h3>工作区操作失败</h3>
+            <p>
+              <code>{error.kind}</code>
+            </p>
+          </aside>
+        )}
+        {tabs.length === 0 && (
+          <section className="placeholder">
+            <p>还没有打开任何工作区。</p>
+            <button
+              type="button"
+              onClick={() => setActiveModal("workspace-switcher")}
+            >
+              打开工作区
+            </button>
+          </section>
+        )}
+        <div className="terminal-mesh-container__panes">
+          {tabs.map((t) => (
+            <TerminalMeshView
+              key={t.tabId}
+              active={activeId === t.tabId}
+              cwd={t.workspacePath}
+              workspaceName={t.workspaceName}
+              tabId={t.tabId}
+            />
+          ))}
+        </div>
       </div>
       <WorkspaceSwitcherModal
         open={activeModal === "workspace-switcher"}
