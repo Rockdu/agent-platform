@@ -28,6 +28,16 @@ import {
   type ClaudePathRecord,
 } from "./claude-discovery";
 import { TerminalMeshView } from "./TerminalMeshView";
+import {
+  closeWorkspace,
+  createWorkspace,
+  isWorkspaceErrorDto,
+  listWorkspaces,
+  openWorkspace,
+  registerWorkspace,
+  type WorkspaceErrorDto,
+  type WorkspaceRecord,
+} from "./workspaces";
 import "@xterm/xterm/css/xterm.css";
 import "./App.css";
 
@@ -794,68 +804,161 @@ function BootstrapDebugCard({ state }: { state: BootstrapState }) {
   );
 }
 
-function MultiTerminalContainer() {
-  // ALL open tabs stay mounted so their PTYs survive switching
-  // (AC-4.1 ≥4 PTYs HARD at the UI layer). Closing a tab removes it
-  // from the array → React unmounts ONE TerminalMeshView →
-  // useEffect cleanup fires terminal_shutdown exactly once. Switching
-  // tabs only changes `active`, which the panel uses for visibility.
-  // Workspace binding (task17) will replace the local key array with
-  // persisted workspace tab IDs.
-  const [tabs, setTabs] = useState<Array<{ id: string; label: string }>>([
-    { id: `term-${Date.now()}-0`, label: "终端 1" },
-  ]);
-  const [active, setActive] = useState<string>(tabs[0]?.id ?? "");
+interface OpenTab {
+  tabId: string;
+  workspaceId: string;
+  workspaceName: string;
+  workspacePath: string;
+}
 
-  const addTab = useCallback(() => {
-    const next = {
-      id: `term-${Date.now()}-${tabs.length}`,
-      label: `终端 ${tabs.length + 1}`,
-    };
-    setTabs((prev) => [...prev, next]);
-    setActive(next.id);
-  }, [tabs.length]);
+function MultiTerminalContainer() {
+  // task17: every open terminal tab is bound to exactly one
+  // persisted workspace. The host registry enforces
+  // one-workspace-one-tab via `open_workspace`/`close_workspace`,
+  // and we spawn each PTY at that workspace's canonical path.
+  const [workspaces, setWorkspaces] = useState<WorkspaceRecord[]>([]);
+  const [tabs, setTabs] = useState<OpenTab[]>([]);
+  const [active, setActive] = useState<string>("");
+  const [error, setError] = useState<WorkspaceErrorDto | null>(null);
+
+  const refreshWorkspaces = useCallback(async () => {
+    try {
+      const list = await listWorkspaces();
+      setWorkspaces(list);
+    } catch (err) {
+      if (isWorkspaceErrorDto(err)) setError(err);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshWorkspaces();
+  }, [refreshWorkspaces]);
+
+  const adoptWorkspaceTab = useCallback(
+    async (workspace: WorkspaceRecord) => {
+      const tabId = `tab-${workspace.workspaceId}`;
+      try {
+        const refreshed = await openWorkspace(workspace.workspaceId, tabId);
+        setError(null);
+        setTabs((prev) => {
+          if (prev.some((t) => t.workspaceId === refreshed.workspaceId)) {
+            return prev;
+          }
+          return [
+            ...prev,
+            {
+              tabId,
+              workspaceId: refreshed.workspaceId,
+              workspaceName: refreshed.name,
+              workspacePath: refreshed.path,
+            },
+          ];
+        });
+        setActive(tabId);
+        void refreshWorkspaces();
+      } catch (err) {
+        if (isWorkspaceErrorDto(err)) setError(err);
+      }
+    },
+    [refreshWorkspaces],
+  );
+
+  const onCreateWorkspace = useCallback(async () => {
+    const name = window.prompt("新工作区名称（仅字母、数字、汉字、-、_、.、空格，最多 64 字符）");
+    if (!name) return;
+    try {
+      const created = await createWorkspace(name);
+      await adoptWorkspaceTab(created);
+    } catch (err) {
+      if (isWorkspaceErrorDto(err)) setError(err);
+    }
+  }, [adoptWorkspaceTab]);
+
+  const onRegisterDirectory = useCallback(async () => {
+    try {
+      const picked = await openFileDialog({
+        multiple: false,
+        directory: true,
+        title: "选择已有工作区目录",
+      });
+      if (picked === null) return;
+      const path = Array.isArray(picked) ? picked[0] : picked;
+      if (typeof path !== "string" || path === "") return;
+      const registered = await registerWorkspace(path);
+      await adoptWorkspaceTab(registered);
+    } catch (err) {
+      if (isWorkspaceErrorDto(err)) setError(err);
+    }
+  }, [adoptWorkspaceTab]);
+
+  const onOpenExisting = useCallback(
+    async (workspace: WorkspaceRecord) => {
+      // If already open as a tab locally, just focus it.
+      const existing = tabs.find((t) => t.workspaceId === workspace.workspaceId);
+      if (existing) {
+        setActive(existing.tabId);
+        return;
+      }
+      await adoptWorkspaceTab(workspace);
+    },
+    [tabs, adoptWorkspaceTab],
+  );
 
   const closeTab = useCallback(
-    (id: string) => {
+    async (tabId: string) => {
+      const target = tabs.find((t) => t.tabId === tabId);
+      if (!target) return;
+      try {
+        await closeWorkspace(target.workspaceId);
+      } catch (err) {
+        // Treat backend failures as non-fatal for the close path;
+        // the user still expects the tab to disappear locally.
+        if (isWorkspaceErrorDto(err)) setError(err);
+      }
       setTabs((prev) => {
-        const remaining = prev.filter((t) => t.id !== id);
-        if (active === id && remaining.length > 0) {
-          setActive(remaining[remaining.length - 1].id);
+        const remaining = prev.filter((t) => t.tabId !== tabId);
+        if (active === tabId && remaining.length > 0) {
+          setActive(remaining[remaining.length - 1].tabId);
         }
         return remaining;
       });
+      void refreshWorkspaces();
     },
-    [active],
+    [tabs, active, refreshWorkspaces],
   );
 
-  // Derive a final "currently active" id that defaults to the last
-  // remaining tab when the active tab was just closed.
   const activeId =
-    tabs.find((t) => t.id === active)?.id ?? tabs[tabs.length - 1]?.id ?? null;
+    tabs.find((t) => t.tabId === active)?.tabId ??
+    tabs[tabs.length - 1]?.tabId ??
+    null;
+
+  const unopenedWorkspaces = workspaces.filter(
+    (w) => !tabs.some((t) => t.workspaceId === w.workspaceId),
+  );
 
   return (
     <section className="terminal-mesh-container">
       <nav className="terminal-mesh-container__strip" role="tablist">
         {tabs.map((t) => (
           <button
-            key={t.id}
+            key={t.tabId}
             type="button"
             role="tab"
-            aria-selected={activeId === t.id}
+            aria-selected={activeId === t.tabId}
             className={`terminal-mesh-container__tab ${
-              activeId === t.id ? "terminal-mesh-container__tab--active" : ""
+              activeId === t.tabId ? "terminal-mesh-container__tab--active" : ""
             }`}
-            onClick={() => setActive(t.id)}
+            onClick={() => setActive(t.tabId)}
+            title={t.workspacePath}
           >
-            <span>{t.label}</span>
+            <span>{t.workspaceName}</span>
             <span
               role="button"
-              aria-label={`关闭 ${t.label}`}
+              aria-label={`关闭 ${t.workspaceName}`}
               className="terminal-mesh-container__close"
               onClick={(e) => {
                 e.stopPropagation();
-                closeTab(t.id);
+                void closeTab(t.tabId);
               }}
             >
               ×
@@ -865,19 +968,63 @@ function MultiTerminalContainer() {
         <button
           type="button"
           className="terminal-mesh-container__add"
-          onClick={addTab}
+          onClick={() => void onCreateWorkspace()}
         >
-          + 新终端
+          + 新工作区
+        </button>
+        <button
+          type="button"
+          className="terminal-mesh-container__add"
+          onClick={() => void onRegisterDirectory()}
+        >
+          📂 添加目录
         </button>
       </nav>
+      {error && (
+        <aside
+          className="bootstrap-card bootstrap-card--error"
+          role="alert"
+          data-workspaces-error={error.kind}
+        >
+          <h3>工作区操作失败</h3>
+          <p>
+            <code>{error.kind}</code>
+          </p>
+        </aside>
+      )}
+      {tabs.length === 0 && (
+        <section className="placeholder">
+          <p>
+            还没有打开任何工作区。点击 “+ 新工作区” 创建一个新目录,
+            或 “📂 添加目录” 选择已有目录。
+          </p>
+          {unopenedWorkspaces.length > 0 && (
+            <>
+              <p className="placeholder__hint">最近使用的工作区：</p>
+              <ul>
+                {unopenedWorkspaces.slice(0, 5).map((w) => (
+                  <li key={w.workspaceId}>
+                    <button
+                      type="button"
+                      onClick={() => void onOpenExisting(w)}
+                    >
+                      {w.name}
+                    </button>{" "}
+                    <code>{w.path}</code>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </section>
+      )}
       <div className="terminal-mesh-container__body">
-        {tabs.length === 0 && (
-          <section className="placeholder">
-            <p>所有终端已关闭。点击 “+ 新终端” 创建。</p>
-          </section>
-        )}
         {tabs.map((t) => (
-          <TerminalMeshView key={t.id} active={activeId === t.id} />
+          <TerminalMeshView
+            key={t.tabId}
+            active={activeId === t.tabId}
+            cwd={t.workspacePath}
+          />
         ))}
       </div>
     </section>

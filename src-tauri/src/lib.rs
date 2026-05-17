@@ -14,6 +14,7 @@ mod plugin_sqlite;
 mod secrets;
 mod sidecar_manager;
 mod terminal_mesh;
+mod workspaces;
 
 use bootstrap::{BootstrapError, BootstrapPaths};
 use claude_discovery::DiscoveryCache;
@@ -23,6 +24,7 @@ use plugin_sqlite::{run_all_plugin_migrations_at_bootstrap, PluginMigrationState
 use secrets::{AccessTokenCache, SecretsErrorDto, SetupMarker, SetupStatus};
 use sidecar_manager::{SidecarConfig, SidecarManager};
 use terminal_mesh::TerminalMeshRegistry;
+use workspaces::WorkspaceRegistry;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -256,6 +258,21 @@ pub fn run() {
                             }
                         }
                     }
+
+                    // Round 28 (task17): load the persisted workspace
+                    // registry from `${APP_DATA}/workspaces.json` and
+                    // attach it to the Tauri app state. The workspaces
+                    // root is `paths.workspaces` (the same dir
+                    // bootstrap::ensure_dirs already created).
+                    let registry = WorkspaceRegistry::load(
+                        paths.plugins_root.parent().unwrap_or(&paths.plugins_root).to_path_buf(),
+                        Some(paths.workspaces.clone()),
+                    );
+                    tracing::info!(
+                        workspaces = registry.list().len(),
+                        "workspaces registry loaded"
+                    );
+                    app.manage(registry);
                 }
                 Err(err) => tracing::error!(%err, "bootstrap failed"),
             }
@@ -288,6 +305,12 @@ pub fn run() {
             terminal_mesh::terminal_resize,
             terminal_mesh::terminal_shutdown,
             terminal_mesh::terminal_scrollback,
+            workspaces::list_workspaces,
+            workspaces::create_workspace,
+            workspaces::register_workspace,
+            workspaces::open_workspace,
+            workspaces::close_workspace,
+            workspaces::resolve_workspace_for_tab,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

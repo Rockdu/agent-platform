@@ -27,9 +27,14 @@ export interface TerminalMeshViewProps {
   /// via CSS; on inactive→active transitions we re-run fit+resize so
   /// xterm.js measures the now-visible container correctly.
   active: boolean;
+  /// Working directory for the spawned shell. Round 28 (task17): set
+  /// to the active workspace path so each terminal opens at its
+  /// bound workspace root rather than $HOME. Falls back to backend
+  /// default when undefined.
+  cwd?: string;
 }
 
-export function TerminalMeshView({ active }: TerminalMeshViewProps) {
+export function TerminalMeshView({ active, cwd }: TerminalMeshViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -77,9 +82,12 @@ export function TerminalMeshView({ active }: TerminalMeshViewProps) {
 
     (async () => {
       try {
+        // cwd is captured at mount; the parent keeps a stable
+        // `key={tab.id}`, so cwd never mutates mid-lifetime.
         const { terminalId } = await spawnTerminal({
           cols: term.cols,
           rows: term.rows,
+          cwd,
         });
         // Recheck after each await: if the component unmounted while
         // the await was in flight, shut the just-spawned terminal
