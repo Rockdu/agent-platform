@@ -43,8 +43,17 @@ export function TerminalMeshView({ active }: TerminalMeshViewProps) {
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
-    // Closure-local cancellation flag. Mirrored to disposedRef so the
-    // async event handler can also bail when the component is gone.
+    // Reset the shared dispose flag at the start of every setup so
+    // React StrictMode's setup → cleanup → setup replay doesn't see
+    // the prior cleanup's `true` and immediately bail out of the
+    // scrollback/subscribe path. Each setup gets its own per-setup
+    // `cancelled` closure flag below; the dispose ref is shared
+    // across setups (via useRef) but its meaning is "the CURRENT
+    // setup has been torn down".
+    disposedRef.current = false;
+    // Closure-local cancellation flag — captured per-setup so a
+    // stale event from a PRIOR StrictMode setup's listener cannot
+    // be revived by the newer setup's `disposedRef = false` reset.
     let cancelled = false;
     let unlisten: (() => void) | null = null;
 
@@ -75,7 +84,7 @@ export function TerminalMeshView({ active }: TerminalMeshViewProps) {
         // Recheck after each await: if the component unmounted while
         // the await was in flight, shut the just-spawned terminal
         // down immediately and bail.
-        if (cancelled) {
+        if (cancelled || disposedRef.current) {
           await shutdownTerminal(terminalId).catch(() => {});
           return;
         }
@@ -89,15 +98,22 @@ export function TerminalMeshView({ active }: TerminalMeshViewProps) {
           if (cancelled || disposedRef.current) return;
           if (scrollback) term.write(scrollback);
         } catch {
-          // Best-effort restore; ignore failures.
+          // Best-effort restore; if cancellation happened mid-flight
+          // bail out before installing a listener — otherwise the
+          // post-unmount listener-leak guarantee is lost.
+          if (cancelled || disposedRef.current) return;
         }
 
         const resolvedUnlisten = await subscribeTerminalEvents(
           terminalId,
           (env) => {
-            // Guard against disposed terminals (close/switch raced
-            // the in-flight listen()).
-            if (disposedRef.current) return;
+            // Dual guard: closure-local `cancelled` (per-setup) AND
+            // shared `disposedRef` (current setup). The closure
+            // local catches the StrictMode-replay case where a
+            // newer setup resets `disposedRef` to false — without
+            // this guard, a stale event from a PRIOR setup's
+            // listener could write into its disposed `term`.
+            if (cancelled || disposedRef.current) return;
             handleEvent(env, term, setStatus);
           },
         );
