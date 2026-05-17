@@ -31,9 +31,9 @@ use portable_pty::{
 use sha2::{Digest, Sha256};
 
 use crate::transport::{
-    DisconnectReason, PtySize, ShellCommand, ShutdownMode, Transport, TransportError,
-    TransportExitStatus, TransportOutputStream, TransportResizeHandle, TransportSession,
-    TransportShutdownHandle, TransportSpawnRequest, TransportStdinSink, WorkspaceLocation,
+    DisconnectReason, PtySize, ShutdownMode, Transport, TransportError, TransportExitStatus,
+    TransportOutputStream, TransportResizeHandle, TransportSession, TransportShutdownHandle,
+    TransportSpawnRequest, TransportStdinSink, WorkspaceLocation,
 };
 
 // ---------------------------------------------------------------------------
@@ -574,121 +574,112 @@ impl Transport for SshTransport {
         &self,
         request: TransportSpawnRequest,
     ) -> Result<Box<dyn TransportSession>, TransportError> {
-        let TransportSpawnRequest {
-            workspace,
-            command: ShellCommand { .. },
-            initial_size,
-            env: _,
-            cwd: _,
-        } = request;
-
-        let location =
-            SshLocation::from_workspace(&workspace).ok_or_else(|| TransportError::Protocol {
+        let location = SshLocation::from_workspace(&request.workspace).ok_or_else(|| {
+            TransportError::Protocol {
                 message: "SshTransport requires WorkspaceLocation::Remote".into(),
-            })?;
-
-        let control_path = ssh_control_path_for(&self.control_dir, &location);
-        // Refuse to hand a foreign-owned existing socket file to
-        // OpenSSH — that would let another user MITM the SSH session
-        // through their ControlMaster. The common case (socket
-        // missing) is a no-op.
-        ensure_control_socket_owner_safe(&control_path)?;
+            }
+        })?;
         let wrapper = build_sentinel_wrapper_script(Some(&location.canonical_remote_path));
-        let argv = build_ssh_argv(&control_path, &location, &wrapper);
+        spawn_ssh_with_wrapper_script(
+            &self.ssh_program,
+            &self.control_dir,
+            &location,
+            &wrapper,
+            request.initial_size,
+        )
+    }
+}
 
-        // Allocate a local PTY for `ssh -tt`. portable_pty's
-        // CommandBuilder handles stdin/stdout/stderr-to-PTY wiring;
-        // stderr is redirected separately so we can preserve the
-        // last 2 KiB for pre-shell phase classification.
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PpPtySize {
-                rows: initial_size.rows,
-                cols: initial_size.cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| TransportError::SpawnFailed {
-                program: self.ssh_program.display().to_string(),
-                message: format!("openpty: {e}"),
-            })?;
+/// Shared spawn engine extracted from `SshTransport::spawn` so
+/// `DockerOverSshTransport` can compose against it without
+/// duplicating the local-PTY allocation + sentinel parser thread +
+/// pre-shell phase gate. The wrapper script is composed by the
+/// caller; this helper builds the argv, spawns ssh under a PTY,
+/// runs the gate, and returns either a live session or a typed
+/// pre-shell phase error.
+pub(crate) fn spawn_ssh_with_wrapper_script(
+    ssh_program: &Path,
+    control_dir: &Path,
+    location: &SshLocation,
+    wrapper_script: &str,
+    initial_size: PtySize,
+) -> Result<Box<dyn TransportSession>, TransportError> {
+    let control_path = ssh_control_path_for(control_dir, location);
+    // Refuse to hand a foreign-owned existing socket file to
+    // OpenSSH — that would let another user MITM the SSH session
+    // through their ControlMaster. The common case (socket missing)
+    // is a no-op.
+    ensure_control_socket_owner_safe(&control_path)?;
+    let argv = build_ssh_argv(&control_path, location, wrapper_script);
 
-        // portable_pty's spawn_command attaches stderr to the PTY,
-        // which would merge it into the visible terminal. We want
-        // stderr captured separately for `stderr_tail`. Use the
-        // lower-level pattern: spawn via std::process::Command for
-        // stderr capture, then attach the PTY for stdin/stdout via
-        // file descriptors.
-        //
-        // portable_pty does not expose a hook to redirect stderr
-        // independently. As a pragmatic workaround for v1 we route
-        // stderr through the PTY (it will appear in the terminal
-        // output) AND scrape the sentinel parser's output for the
-        // known stderr patterns. The parser strips OSC 1338 frames
-        // before forwarding; OpenSSH stderr lines remain visible.
-        let mut cmd_builder = CommandBuilder::new(&self.ssh_program);
-        for a in &argv {
-            cmd_builder.arg(a);
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PpPtySize {
+            rows: initial_size.rows,
+            cols: initial_size.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| TransportError::SpawnFailed {
+            program: ssh_program.display().to_string(),
+            message: format!("openpty: {e}"),
+        })?;
+
+    // portable_pty does not expose a hook to redirect stderr
+    // independently. As a pragmatic workaround for v1 we route
+    // stderr through the PTY (it will appear in the terminal
+    // output) AND scrape the sentinel parser's output for the
+    // known stderr patterns. The parser strips OSC 1338 frames
+    // before forwarding; OpenSSH stderr lines remain visible.
+    let mut cmd_builder = CommandBuilder::new(ssh_program);
+    for a in &argv {
+        cmd_builder.arg(a);
+    }
+    let child = pair.slave.spawn_command(cmd_builder).map_err(|e| {
+        TransportError::SpawnFailed {
+            program: ssh_program.display().to_string(),
+            message: format!("spawn_command: {e}"),
         }
-        // Strip any env that could perturb ssh behaviour; the spec
-        // does not require env passthrough here.
-        let child = pair.slave.spawn_command(cmd_builder).map_err(|e| {
-            TransportError::SpawnFailed {
-                program: self.ssh_program.display().to_string(),
-                message: format!("spawn_command: {e}"),
+    })?;
+    let killer = child.clone_killer();
+    let child_pid = child.process_id();
+    drop(pair.slave);
+
+    let reader = pair.master.try_clone_reader().map_err(|e| TransportError::Io {
+        message: format!("try_clone_reader: {e}"),
+    })?;
+    let writer = pair.master.take_writer().map_err(|e| TransportError::Io {
+        message: format!("take_writer: {e}"),
+    })?;
+
+    let shared = Arc::new(SharedSshState::new());
+    let reader_thread = spawn_reader_thread(reader, Arc::clone(&shared));
+    let child = Arc::new(Mutex::new(Some(child)));
+    let phase_a = await_phase_a(Arc::clone(&shared), Arc::clone(&child), PHASE_A_DEADLINE);
+
+    match phase_a {
+        PhaseAOutcome::ShellStarted => Ok(Box::new(SshTransportSession {
+            master: Some(pair.master),
+            child,
+            killer: Some(killer),
+            child_pid,
+            writer: Some(writer),
+            shared,
+            reader_thread: Some(reader_thread),
+            disconnect_reason: None,
+        })),
+        PhaseAOutcome::FailedBeforeShell { ssh_exit } => {
+            let tail = shared.stderr_tail();
+            let err = classify_phase_a_failure(false, ssh_exit, &tail, location);
+            // Best-effort clean up the child if it is still alive
+            // (deadline case).
+            if let Ok(mut guard) = child.lock()
+                && let Some(mut c) = guard.take()
+            {
+                let _ = c.kill();
+                let _ = c.wait();
             }
-        })?;
-        let killer = child.clone_killer();
-        let child_pid = child.process_id();
-        drop(pair.slave);
-
-        let reader = pair.master.try_clone_reader().map_err(|e| TransportError::Io {
-            message: format!("try_clone_reader: {e}"),
-        })?;
-        let writer = pair.master.take_writer().map_err(|e| TransportError::Io {
-            message: format!("take_writer: {e}"),
-        })?;
-
-        // pre-shell phase gate: spawn a reader thread that pulls bytes from
-        // the PTY, feeds them through the sentinel parser, and
-        // surfaces shell-started + a bounded stderr/stdout tail for
-        // classification. Block until either:
-        //   (a) ShellStarted sentinel observed → pre-shell phase OK.
-        //   (b) child exits without ShellStarted → pre-shell phase failure.
-        //   (c) deadline expires → SshShellDidNotStart timeout.
-        let shared = Arc::new(SharedSshState::new());
-        let reader_thread = spawn_reader_thread(reader, Arc::clone(&shared));
-        let child = Arc::new(Mutex::new(Some(child)));
-        let phase_a = await_phase_a(
-            Arc::clone(&shared),
-            Arc::clone(&child),
-            PHASE_A_DEADLINE,
-        );
-
-        match phase_a {
-            PhaseAOutcome::ShellStarted => Ok(Box::new(SshTransportSession {
-                master: Some(pair.master),
-                child,
-                killer: Some(killer),
-                child_pid,
-                writer: Some(writer),
-                shared,
-                reader_thread: Some(reader_thread),
-                disconnect_reason: None,
-            })),
-            PhaseAOutcome::FailedBeforeShell { ssh_exit } => {
-                let tail = shared.stderr_tail();
-                let err = classify_phase_a_failure(false, ssh_exit, &tail, &location);
-                // Best-effort clean up the child if it is still alive
-                // (deadline case).
-                if let Ok(mut guard) = child.lock()
-                    && let Some(mut c) = guard.take()
-                {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                }
-                Err(err)
-            }
+            Err(err)
         }
     }
 }

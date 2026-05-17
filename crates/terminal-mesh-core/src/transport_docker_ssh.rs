@@ -1,0 +1,580 @@
+//! Docker-over-SSH transport composing `SshTransport` per
+//! `docs/specs/transport.md` §5.1–§5.4.
+//!
+//! Remote command shape (§5.1):
+//!
+//! ```text
+//! docker exec -it <container> /bin/sh -lc '<wrapper-script>'
+//! ```
+//!
+//! The wrapper script (§5.2) writes its own PID to
+//! `/tmp/agentmesh-wrapper-<session-id>.pid` inside the container,
+//! installs an EXIT/HUP/INT/TERM trap to remove the PID file, emits
+//! the standard SSH `am-shell-started` / `am-exit-status` OSC 1338
+//! sentinels, optionally `cd $AM_REMOTE_CWD`, and execs the login
+//! shell. The SSH sentinel parser (`transport_ssh::SentinelParser`)
+//! handles the OSC stream unchanged — the container's wrapper emits
+//! the same protocol the SSH wrapper does.
+//!
+//! On `shutdown(Kill)` the transport issues a separate `ssh ...
+//! docker exec <container> sh -lc 'kill ...'` over the SAME
+//! ControlMaster socket (the connection is multiplexed). The
+//! container is NEVER stopped, started, created, or removed; v1
+//! attaches to existing user-managed containers only (§5.4).
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use uuid::Uuid;
+
+use crate::transport::{
+    DisconnectReason, PtySize, ShutdownMode, Transport, TransportError, TransportExitStatus,
+    TransportOutputStream, TransportResizeHandle, TransportSession, TransportShutdownHandle,
+    TransportSpawnRequest, TransportStdinSink, WorkspaceLocation,
+};
+use crate::transport_ssh::{
+    compose_remote_command, shell_single_quote, spawn_ssh_with_wrapper_script, ssh_control_path_for,
+    SshLocation, SSH_OSC_EXIT_STATUS_PREFIX, SSH_OSC_NUMBER, SSH_OSC_SHELL_STARTED,
+};
+
+// ---------------------------------------------------------------------------
+// DockerLocation — spec §5.1 + §6.1
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerLocation {
+    pub container_id: String,
+    pub cwd_in_container: Option<String>,
+}
+
+impl DockerLocation {
+    /// Extract container info from a `WorkspaceLocation::Remote`
+    /// whose `container` field is `Some(...)`. Returns `None` for
+    /// Local workspaces or Remote workspaces without a container
+    /// — those routes belong to `LocalTransport` / `SshTransport`.
+    pub fn from_workspace(workspace: &WorkspaceLocation) -> Option<Self> {
+        match workspace {
+            WorkspaceLocation::Remote {
+                container: Some(container_id),
+                ..
+            } => Some(Self {
+                container_id: container_id.clone(),
+                cwd_in_container: None,
+            }),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers — spec §5.1 + §5.2
+// ---------------------------------------------------------------------------
+
+/// PID-file path inside the container for the wrapper. Bound to a
+/// per-session UUID so concurrent sessions against the same
+/// container don't collide.
+fn wrapper_pid_file_for(session_id: &str) -> String {
+    format!("/tmp/agentmesh-wrapper-{session_id}.pid")
+}
+
+/// Build the inner shell script that runs INSIDE the container.
+/// Writes the wrapper PID, traps EXIT/HUP/INT/TERM for cleanup,
+/// emits `am-shell-started`, optionally `cd $AM_REMOTE_CWD`, execs
+/// the login shell, and emits `am-exit-status;<n>`. Returns the
+/// raw script body (the caller is responsible for shell-quoting it
+/// when embedding it in a `docker exec ... sh -lc '...'` argv slot).
+fn build_docker_wrapper_script(
+    session_id: &str,
+    canonical_remote_path: Option<&str>,
+) -> String {
+    let pid_file = wrapper_pid_file_for(session_id);
+    let mut script = String::new();
+    script.push_str(&format!(
+        "pid_file={}\n",
+        shell_single_quote(&pid_file),
+    ));
+    script.push_str("printf '%s\\n' \"$$\" > \"$pid_file\"\n");
+    script.push_str("cleanup_pid_file() { rm -f \"$pid_file\"; }\n");
+    script.push_str("trap cleanup_pid_file EXIT HUP INT TERM\n");
+    script.push_str(&format!(
+        "printf '\\033]{osc};{started}\\a'\n",
+        osc = SSH_OSC_NUMBER,
+        started = SSH_OSC_SHELL_STARTED,
+    ));
+    script.push_str("status=0\n");
+    if let Some(cwd) = canonical_remote_path {
+        let escaped = shell_single_quote(cwd);
+        script.push_str(&format!(
+            "AM_REMOTE_CWD={escaped}\nif ! cd \"$AM_REMOTE_CWD\" 2>/dev/null; then status=$?; fi\n",
+        ));
+    }
+    script.push_str("if [ \"$status\" -eq 0 ]; then if [ -n \"$SHELL\" ] && [ -x \"$SHELL\" ]; then \"$SHELL\" -l; status=$?; else /bin/sh -l; status=$?; fi; fi\n");
+    script.push_str(&format!(
+        "printf '\\033]{osc};{prefix}%s\\a' \"$status\"\nexit \"$status\"\n",
+        osc = SSH_OSC_NUMBER,
+        prefix = SSH_OSC_EXIT_STATUS_PREFIX,
+    ));
+    script
+}
+
+/// Compose the remote command for the SSH endpoint's final argv
+/// slot: `docker exec -it <container> /bin/sh -lc '<inner>'`. The
+/// inner wrapper writes the wrapper PID, traps for cleanup, emits
+/// the OSC 1338 sentinels, optionally `cd` to the container cwd,
+/// and execs the login shell. Container id is shell-quoted; the
+/// inner script is single-quoted via the POSIX `'\''` idiom so
+/// apostrophes inside the wrapper round-trip safely.
+pub fn compose_docker_remote_command(
+    container_id: &str,
+    session_id: &str,
+    canonical_remote_path: Option<&str>,
+) -> String {
+    let inner = build_docker_wrapper_script(session_id, canonical_remote_path);
+    format!(
+        "docker exec -it {container} /bin/sh -lc {inner_quoted}",
+        container = shell_single_quote(container_id),
+        inner_quoted = shell_single_quote(&inner),
+    )
+}
+
+/// Compose the cleanup command sent over the same ControlMaster on
+/// `shutdown(Kill)`. The container is NEVER stopped — this just
+/// signals the wrapper process inside the existing container and
+/// removes the PID file.
+pub fn compose_docker_cleanup_command(container_id: &str, session_id: &str) -> String {
+    let pid_file = wrapper_pid_file_for(session_id);
+    let inner = format!(
+        "kill \"$(cat {pid_quoted})\" 2>/dev/null || true; rm -f {pid_quoted}",
+        pid_quoted = shell_single_quote(&pid_file),
+    );
+    format!(
+        "docker exec {container} sh -lc {inner_quoted}",
+        container = shell_single_quote(container_id),
+        inner_quoted = shell_single_quote(&inner),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// DockerOverSshTransport
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct DockerOverSshTransport {
+    pub ssh_program: PathBuf,
+    pub control_dir: PathBuf,
+}
+
+impl DockerOverSshTransport {
+    pub fn new(ssh_program: PathBuf, control_dir: PathBuf) -> Self {
+        Self {
+            ssh_program,
+            control_dir,
+        }
+    }
+
+    /// Production constructor mirroring `SshTransport::from_app_data`.
+    pub fn from_app_data(
+        ssh_program: PathBuf,
+        app_data: &Path,
+    ) -> Result<Self, TransportError> {
+        let control_dir = crate::transport_ssh::init_control_master_dir(app_data)?;
+        if let Err(e) = crate::transport_ssh::cleanup_stale_master_sockets(&control_dir) {
+            tracing::warn!(
+                control_dir = %control_dir.display(),
+                error = %e,
+                "DockerOverSshTransport::from_app_data: stale-master cleanup failed (continuing)"
+            );
+        }
+        Ok(Self {
+            ssh_program,
+            control_dir,
+        })
+    }
+}
+
+impl Transport for DockerOverSshTransport {
+    fn spawn(
+        &self,
+        request: TransportSpawnRequest,
+    ) -> Result<Box<dyn TransportSession>, TransportError> {
+        let ssh_location = SshLocation::from_workspace(&request.workspace).ok_or_else(|| {
+            TransportError::Protocol {
+                message: "DockerOverSshTransport requires WorkspaceLocation::Remote".into(),
+            }
+        })?;
+        let docker = DockerLocation::from_workspace(&request.workspace).ok_or_else(|| {
+            TransportError::Protocol {
+                message:
+                    "DockerOverSshTransport requires WorkspaceLocation::Remote with a container"
+                        .into(),
+            }
+        })?;
+        let session_id = Uuid::new_v4().to_string();
+        let docker_cmd = compose_docker_remote_command(
+            &docker.container_id,
+            &session_id,
+            Some(&ssh_location.canonical_remote_path),
+        );
+        let inner_session = spawn_ssh_with_wrapper_script(
+            &self.ssh_program,
+            &self.control_dir,
+            &ssh_location,
+            &docker_cmd,
+            request.initial_size,
+        )?;
+        Ok(Box::new(DockerOverSshTransportSession {
+            inner: Some(inner_session),
+            ssh_program: self.ssh_program.clone(),
+            control_dir: self.control_dir.clone(),
+            ssh_location,
+            container_id: docker.container_id,
+            session_id,
+            cleanup_done: Mutex::new(false),
+        }))
+    }
+}
+
+pub struct DockerOverSshTransportSession {
+    inner: Option<Box<dyn TransportSession>>,
+    ssh_program: PathBuf,
+    control_dir: PathBuf,
+    ssh_location: SshLocation,
+    container_id: String,
+    session_id: String,
+    cleanup_done: Mutex<bool>,
+}
+
+impl DockerOverSshTransportSession {
+    /// Fire the docker-exec-kill cleanup over the same ControlMaster.
+    /// Idempotent: subsequent calls are no-ops. Errors are surfaced
+    /// as `DockerCleanupFailed` but do NOT block the local shutdown.
+    fn run_container_cleanup(&self) -> Result<(), TransportError> {
+        let mut done = self
+            .cleanup_done
+            .lock()
+            .map_err(|e| TransportError::DockerCleanupFailed {
+                container: self.container_id.clone(),
+                message: format!("cleanup mutex poisoned: {e}"),
+            })?;
+        if *done {
+            return Ok(());
+        }
+        *done = true;
+        drop(done);
+        let control_path = ssh_control_path_for(&self.control_dir, &self.ssh_location);
+        let cleanup_cmd = compose_docker_cleanup_command(&self.container_id, &self.session_id);
+        let port = self.ssh_location.port.unwrap_or(22);
+        let user_host = self.ssh_location.user_host();
+        // Reuse the same ControlMaster so this multiplexes through
+        // the existing connection.
+        let mut cmd = std::process::Command::new(&self.ssh_program);
+        cmd.arg("-o").arg("BatchMode=yes")
+            .arg("-o").arg("ControlMaster=auto")
+            .arg("-o").arg("ControlPersist=yes")
+            .arg("-o").arg(format!("ControlPath={}", control_path.display()))
+            .arg("-o").arg("StrictHostKeyChecking=accept-new")
+            .arg("-o").arg("ConnectTimeout=10")
+            .arg("-p").arg(port.to_string())
+            .arg(user_host)
+            .arg(compose_remote_command(&cleanup_cmd));
+        let output = cmd.output().map_err(|e| TransportError::DockerCleanupFailed {
+            container: self.container_id.clone(),
+            message: format!("spawn cleanup ssh: {e}"),
+        })?;
+        if !output.status.success() {
+            return Err(TransportError::DockerCleanupFailed {
+                container: self.container_id.clone(),
+                message: format!(
+                    "cleanup ssh exited {code:?}: stderr={tail}",
+                    code = output.status.code(),
+                    tail = String::from_utf8_lossy(&output.stderr).chars().take(512).collect::<String>(),
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl TransportSession for DockerOverSshTransportSession {
+    fn output_stream(&mut self) -> Result<Box<dyn TransportOutputStream>, TransportError> {
+        self.inner
+            .as_mut()
+            .ok_or(TransportError::Protocol {
+                message: "session already torn down".into(),
+            })?
+            .output_stream()
+    }
+
+    fn stdin_sink(&mut self) -> Result<Box<dyn TransportStdinSink>, TransportError> {
+        self.inner
+            .as_mut()
+            .ok_or(TransportError::Protocol {
+                message: "session already torn down".into(),
+            })?
+            .stdin_sink()
+    }
+
+    fn take_shutdown_handle(&mut self) -> Option<Box<dyn TransportShutdownHandle>> {
+        let inner_handle = self.inner.as_mut()?.take_shutdown_handle()?;
+        Some(Box::new(DockerShutdownHandle {
+            inner: inner_handle,
+            ssh_program: self.ssh_program.clone(),
+            control_dir: self.control_dir.clone(),
+            ssh_location: self.ssh_location.clone(),
+            container_id: self.container_id.clone(),
+            session_id: self.session_id.clone(),
+            cleanup_done: Mutex::new(false),
+        }))
+    }
+
+    fn take_resize_handle(&mut self) -> Option<Box<dyn TransportResizeHandle>> {
+        self.inner.as_mut()?.take_resize_handle()
+    }
+
+    fn resize(&mut self, size: PtySize) -> Result<(), TransportError> {
+        self.inner
+            .as_mut()
+            .ok_or(TransportError::Protocol {
+                message: "session already torn down".into(),
+            })?
+            .resize(size)
+    }
+
+    fn shutdown(&mut self, mode: ShutdownMode) -> Result<(), TransportError> {
+        let inner_result = self
+            .inner
+            .as_mut()
+            .ok_or(TransportError::Protocol {
+                message: "session already torn down".into(),
+            })?
+            .shutdown(mode.clone());
+        // On Kill, fire the container-side cleanup even if the local
+        // shutdown errored — the wrapper inside the container needs
+        // to be reaped regardless.
+        if matches!(mode, ShutdownMode::Kill) {
+            // Log container cleanup failures but do not mask the
+            // inner shutdown's outcome.
+            if let Err(e) = self.run_container_cleanup() {
+                tracing::warn!(
+                    container = %self.container_id,
+                    error = %e,
+                    "docker container cleanup failed"
+                );
+            }
+        }
+        inner_result
+    }
+
+    fn wait(&mut self) -> Result<TransportExitStatus, TransportError> {
+        self.inner
+            .as_mut()
+            .ok_or(TransportError::Protocol {
+                message: "session already torn down".into(),
+            })?
+            .wait()
+    }
+
+    fn disconnect_reason(&self) -> Option<DisconnectReason> {
+        self.inner.as_ref().and_then(|s| s.disconnect_reason())
+    }
+
+    fn cleanup(&mut self) -> Result<(), TransportError> {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.cleanup()?;
+        }
+        self.inner = None;
+        Ok(())
+    }
+}
+
+struct DockerShutdownHandle {
+    inner: Box<dyn TransportShutdownHandle>,
+    ssh_program: PathBuf,
+    control_dir: PathBuf,
+    ssh_location: SshLocation,
+    container_id: String,
+    session_id: String,
+    cleanup_done: Mutex<bool>,
+}
+
+impl DockerShutdownHandle {
+    fn run_container_cleanup(&self) -> Result<(), TransportError> {
+        let mut done = self
+            .cleanup_done
+            .lock()
+            .map_err(|e| TransportError::DockerCleanupFailed {
+                container: self.container_id.clone(),
+                message: format!("cleanup mutex poisoned: {e}"),
+            })?;
+        if *done {
+            return Ok(());
+        }
+        *done = true;
+        drop(done);
+        let control_path = ssh_control_path_for(&self.control_dir, &self.ssh_location);
+        let cleanup_cmd = compose_docker_cleanup_command(&self.container_id, &self.session_id);
+        let port = self.ssh_location.port.unwrap_or(22);
+        let user_host = self.ssh_location.user_host();
+        let mut cmd = std::process::Command::new(&self.ssh_program);
+        cmd.arg("-o").arg("BatchMode=yes")
+            .arg("-o").arg("ControlMaster=auto")
+            .arg("-o").arg("ControlPersist=yes")
+            .arg("-o").arg(format!("ControlPath={}", control_path.display()))
+            .arg("-o").arg("StrictHostKeyChecking=accept-new")
+            .arg("-o").arg("ConnectTimeout=10")
+            .arg("-p").arg(port.to_string())
+            .arg(user_host)
+            .arg(compose_remote_command(&cleanup_cmd));
+        let output = cmd.output().map_err(|e| TransportError::DockerCleanupFailed {
+            container: self.container_id.clone(),
+            message: format!("spawn cleanup ssh: {e}"),
+        })?;
+        if !output.status.success() {
+            return Err(TransportError::DockerCleanupFailed {
+                container: self.container_id.clone(),
+                message: format!(
+                    "cleanup ssh exited {code:?}: stderr={tail}",
+                    code = output.status.code(),
+                    tail = String::from_utf8_lossy(&output.stderr).chars().take(512).collect::<String>(),
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl TransportShutdownHandle for DockerShutdownHandle {
+    fn shutdown(&self, mode: ShutdownMode) -> Result<(), TransportError> {
+        let inner_result = self.inner.shutdown(mode.clone());
+        if matches!(mode, ShutdownMode::Kill)
+            && let Err(e) = self.run_container_cleanup()
+        {
+            tracing::warn!(
+                container = %self.container_id,
+                error = %e,
+                "docker container cleanup failed (via shutdown handle)"
+            );
+        }
+        inner_result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compose_docker_remote_command_starts_with_docker_exec() {
+        let cmd = compose_docker_remote_command("my-container", "sess-1", Some("/srv"));
+        assert!(
+            cmd.starts_with("docker exec -it 'my-container' /bin/sh -lc '"),
+            "cmd should start with docker exec -it; got {cmd}"
+        );
+        assert!(cmd.ends_with('\''), "cmd should end with closing quote");
+    }
+
+    #[test]
+    fn compose_docker_remote_command_contains_session_pid_file() {
+        let cmd = compose_docker_remote_command("c", "abc-123", None);
+        assert!(
+            cmd.contains("/tmp/agentmesh-wrapper-abc-123.pid"),
+            "PID file path must include session id; got {cmd}"
+        );
+    }
+
+    #[test]
+    fn compose_docker_remote_command_uses_session_id_to_avoid_collision() {
+        let a = compose_docker_remote_command("c", "session-A", None);
+        let b = compose_docker_remote_command("c", "session-B", None);
+        assert_ne!(a, b, "different session ids must yield different commands");
+        assert!(a.contains("session-A"));
+        assert!(b.contains("session-B"));
+    }
+
+    #[test]
+    fn compose_docker_remote_command_contains_both_osc_sentinels() {
+        let cmd = compose_docker_remote_command("c", "s", Some("/srv"));
+        assert!(cmd.contains("am-shell-started"));
+        assert!(cmd.contains("am-exit-status;"));
+    }
+
+    #[test]
+    fn compose_docker_remote_command_escapes_apostrophe_in_remote_cwd() {
+        let cmd = compose_docker_remote_command("c", "s", Some("/srv/it's mine"));
+        // The path embeds inside two layers of single-quoting (outer
+        // docker `sh -lc '...'` + inner POSIX escape). Round-trip via
+        // /bin/sh -c proves the wrapper still parses correctly.
+        // We can't actually invoke docker, but we can at least check
+        // that the apostrophe is escaped (no bare `'` left dangling).
+        assert!(
+            !cmd.contains("/srv/it's mine"),
+            "raw apostrophe must NOT survive — should be POSIX-escaped"
+        );
+        assert!(cmd.contains("/srv/it"), "path prefix should still appear");
+    }
+
+    #[test]
+    fn compose_docker_cleanup_command_targets_session_pid_file() {
+        let cmd = compose_docker_cleanup_command("my-container", "sess-1");
+        assert!(cmd.contains("docker exec 'my-container'"));
+        assert!(cmd.contains("kill"));
+        assert!(cmd.contains("/tmp/agentmesh-wrapper-sess-1.pid"));
+        assert!(cmd.contains("rm -f"));
+    }
+
+    /// Spec §5.4: NEVER `docker stop`, `docker run`, `docker start`,
+    /// `docker rm`, `docker create`. The spawn + cleanup commands
+    /// must not contain any of these forbidden subcommands.
+    #[test]
+    fn neither_spawn_nor_cleanup_emits_forbidden_docker_subcommands() {
+        let spawn_cmd = compose_docker_remote_command("c", "s", Some("/srv"));
+        let cleanup_cmd = compose_docker_cleanup_command("c", "s");
+        for forbidden in [
+            "docker stop",
+            "docker run",
+            "docker start",
+            "docker rm",
+            "docker create",
+        ] {
+            assert!(
+                !spawn_cmd.contains(forbidden),
+                "spawn command must not contain `{forbidden}`; got {spawn_cmd}",
+            );
+            assert!(
+                !cleanup_cmd.contains(forbidden),
+                "cleanup command must not contain `{forbidden}`; got {cleanup_cmd}",
+            );
+        }
+    }
+
+    #[test]
+    fn docker_location_from_workspace_extracts_container() {
+        let ws = WorkspaceLocation::Remote {
+            user: None,
+            host: "h".into(),
+            port: None,
+            canonical_remote_path: "/srv".into(),
+            container: Some("ctr-7".into()),
+        };
+        let loc = DockerLocation::from_workspace(&ws).expect("container present");
+        assert_eq!(loc.container_id, "ctr-7");
+    }
+
+    #[test]
+    fn docker_location_from_workspace_returns_none_for_remote_without_container() {
+        let ws = WorkspaceLocation::Remote {
+            user: None,
+            host: "h".into(),
+            port: None,
+            canonical_remote_path: "/srv".into(),
+            container: None,
+        };
+        assert!(DockerLocation::from_workspace(&ws).is_none());
+    }
+
+    #[test]
+    fn docker_location_from_workspace_returns_none_for_local() {
+        let ws = WorkspaceLocation::Local { path: None };
+        assert!(DockerLocation::from_workspace(&ws).is_none());
+    }
+}

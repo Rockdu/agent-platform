@@ -13,6 +13,7 @@ pub mod osc_agent_marker;
 pub mod prompt_detector;
 pub mod ring_buffer;
 pub mod transport;
+pub mod transport_docker_ssh;
 pub mod transport_ssh;
 
 pub use actor::{ActorCommand, ActorError, TerminalActor, TerminalHandle, TerminalSpec};
@@ -38,4 +39,8 @@ pub use transport_ssh::{
     cleanup_stale_master_sockets, init_control_master_dir, ssh_control_path_for, SentinelEvent,
     SentinelParser, SshLocation, SshTransport, SshTransportSession, REMOTE_PATH_INVALID_EXIT_CODE,
     SSH_OSC_EXIT_STATUS_PREFIX, SSH_OSC_NUMBER, SSH_OSC_SHELL_STARTED,
+};
+pub use transport_docker_ssh::{
+    compose_docker_cleanup_command, compose_docker_remote_command, DockerLocation,
+    DockerOverSshTransport, DockerOverSshTransportSession,
 };
