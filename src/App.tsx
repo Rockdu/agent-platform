@@ -1056,10 +1056,11 @@ interface WorkspaceRailRowProps {
   onSelect: (tabId: string) => void;
   onClose: (tabId: string) => void;
   // When the row is in the Done section, the parent passes a resume
-  // handler that brings the tab back into focus; the first
-  // user-initiated keystroke (handled by Round-6's user_initiated
-  // stdin path) is what actually transitions the snapshot back to
-  // Running, so this click on its own does not mutate lifecycle.
+  // handler that brings the tab back into focus; the user's first
+  // keystroke afterwards flows through `writeTerminalStdin(...,
+  // userInitiated=true)` and that is what actually transitions the
+  // snapshot back to Running. The click on its own does not mutate
+  // lifecycle.
   doneAffordance?: () => void;
 }
 
@@ -1132,11 +1133,20 @@ interface RailSectionsProps {
   activeId: string | null;
   onSelect: (tabId: string) => void;
   onClose: (tabId: string) => void;
+  // Called when the user clicks the 下一条指令 affordance on a Done
+  // row. Distinct from `onSelect` because the parent uses it to
+  // bump a per-tab focus nonce so `TerminalMeshView` will move
+  // keyboard focus into the terminal on the next active render.
+  onResume: (tabId: string) => void;
 }
 
 function RailSections(props: RailSectionsProps) {
-  const { tabs, activeId, onSelect, onClose } = props;
-  const tabIds = tabs.map((t) => t.tabId);
+  const { tabs, activeId, onSelect, onClose, onResume } = props;
+  // Memoize the tab-id array so the lifecycle hook's effect doesn't
+  // re-run on every render. `tabs` is the parent's React state and
+  // only changes reference when a tab is opened or closed, so the
+  // memo recomputes precisely when the tab set actually changes.
+  const tabIds = useMemo(() => tabs.map((t) => t.tabId), [tabs]);
   const { snapshotByTabId } = useWorkspaceLifecycleStatuses(tabIds);
 
   // Partition by snapshot status; filter to Workspace-kind tabs only
@@ -1177,7 +1187,7 @@ function RailSections(props: RailSectionsProps) {
         isActive={activeId === tab.tabId}
         onSelect={onSelect}
         onClose={onClose}
-        doneAffordance={opts.affordance ? () => onSelect(tab.tabId) : undefined}
+        doneAffordance={opts.affordance ? () => onResume(tab.tabId) : undefined}
       />
     );
   };
@@ -1215,6 +1225,22 @@ function MultiTerminalContainer() {
   const [active, setActive] = useState<string>("");
   const [error, setError] = useState<WorkspaceErrorDto | null>(null);
   const [activeModal, setActiveModal] = useState<HostModal>(null);
+  // Per-tab focus nonce: bumped whenever the user clicks the Done-
+  // row 下一条指令 affordance. `TerminalMeshView` watches its own
+  // entry in this map and calls `term.focus()` when the value
+  // changes (and the panel is active). Bare tab-label clicks keep
+  // using plain `setActive` so we never steal focus from other
+  // panes' inputs on an ordinary tab switch.
+  const [focusNonceByTabId, setFocusNonceByTabId] = useState<
+    Record<string, number>
+  >({});
+  const focusTerminal = useCallback((tabId: string) => {
+    setActive(tabId);
+    setFocusNonceByTabId((prev) => ({
+      ...prev,
+      [tabId]: (prev[tabId] ?? 0) + 1,
+    }));
+  }, []);
 
   const refreshWorkspaces = useCallback(async () => {
     try {
@@ -1314,6 +1340,7 @@ function MultiTerminalContainer() {
           activeId={activeId}
           onSelect={setActive}
           onClose={(id) => void closeTab(id)}
+          onResume={focusTerminal}
         />
         <button
           type="button"
@@ -1356,6 +1383,7 @@ function MultiTerminalContainer() {
               cwd={t.workspacePath}
               workspaceName={t.workspaceName}
               tabId={t.tabId}
+              focusNonce={focusNonceByTabId[t.tabId]}
             />
           ))}
         </div>

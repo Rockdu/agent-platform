@@ -51,10 +51,6 @@ export function useWorkspaceLifecycleStatuses(
     Record<string, string | undefined>
   >({});
 
-  // tabIds is a new array each render even when contents are stable,
-  // so memoize the join-key for the effect dependency.
-  const tabIdsKey = tabIds.join(",");
-
   // Mutable maps driving the retry loop and event router. We use refs
   // (not state) so the effect callback always sees the freshest data
   // without re-running. The state setters above keep React in sync
@@ -71,20 +67,34 @@ export function useWorkspaceLifecycleStatuses(
     const targetTabIds = tabIds.slice();
     activeTabIdsRef.current = new Set(targetTabIds);
 
+    const sameKeySet = (
+      prev: Readonly<Record<string, unknown>>,
+      next: ReadonlyArray<string>,
+    ): boolean => {
+      const prevKeys = Object.keys(prev);
+      if (prevKeys.length !== next.length) return false;
+      for (const id of next) {
+        if (!(id in prev)) return false;
+      }
+      return true;
+    };
+
     const seedDefaults = () => {
       setSnapshotByTabId((prev) => {
-        const next: Record<string, WorkspaceLifecycleSnapshot> = {};
+        if (sameKeySet(prev, targetTabIds)) return prev;
+        const nextMap: Record<string, WorkspaceLifecycleSnapshot> = {};
         for (const id of targetTabIds) {
-          next[id] = prev[id] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
+          nextMap[id] = prev[id] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
         }
-        return next;
+        return nextMap;
       });
       setTerminalIdByTabId((prev) => {
-        const next: Record<string, string | undefined> = {};
+        if (sameKeySet(prev, targetTabIds)) return prev;
+        const nextMap: Record<string, string | undefined> = {};
         for (const id of targetTabIds) {
-          next[id] = prev[id];
+          nextMap[id] = prev[id];
         }
-        return next;
+        return nextMap;
       });
     };
 
@@ -165,7 +175,7 @@ export function useWorkspaceLifecycleStatuses(
       timeouts.clear();
       if (unlisten) unlisten();
     };
-  }, [tabIdsKey, tabIds]);
+  }, [tabIds]);
 
   return { snapshotByTabId, terminalIdByTabId };
 }

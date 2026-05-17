@@ -56,6 +56,13 @@ export interface TerminalMeshViewProps {
   /// resolution. Ignored when `existingTerminalId` is set (the
   /// orchestrator's path already supplied its own tab id Rust-side).
   tabId?: string;
+  /// Monotonically increasing counter that requests keyboard focus
+  /// for this terminal. When the value changes AND the panel is
+  /// active, the component calls `term.focus()` so the user can type
+  /// immediately without an extra click. Used by the Done-row
+  /// resume affordance so clicking 下一条指令 actually lands focus
+  /// inside the terminal.
+  focusNonce?: number;
 }
 
 export function TerminalMeshView({
@@ -64,6 +71,7 @@ export function TerminalMeshView({
   workspaceName,
   existingTerminalId,
   tabId,
+  focusNonce,
 }: TerminalMeshViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -267,6 +275,27 @@ export function TerminalMeshView({
       void resizeTerminal(id, term.cols, term.rows).catch(() => {});
     }
   }, [active]);
+
+  // Imperative focus on demand: when `focusNonce` changes and the
+  // panel is active, move keyboard focus into the terminal. This
+  // backs the Done-row resume affordance so the user's next
+  // keystroke flows through `term.onData` (and therefore through
+  // `terminal_write_stdin(..., userInitiated=true)` so the snapshot
+  // transitions back to Running). The nonce is the trigger — when it
+  // changes while inactive, the focus call is deferred until the
+  // panel becomes active and the effect re-runs on that activation.
+  useEffect(() => {
+    if (!active) return;
+    if (focusNonce === undefined) return;
+    const term = termRef.current;
+    if (!term) return;
+    try {
+      term.focus();
+    } catch {
+      // Best-effort — xterm.focus() can throw if the element is not
+      // yet attached. The next nonce bump will retry.
+    }
+  }, [active, focusNonce]);
 
   return (
     <div
