@@ -34,6 +34,40 @@ export const DEFAULT_LIFECYCLE_SNAPSHOT: WorkspaceLifecycleSnapshot = {
   lastActivityAtUnixMs: 0,
 };
 
+/**
+ * Drop entries for tab ids that are no longer active. Mutates both
+ * maps in place: `knownByTabId` loses the stale tab entry, and
+ * `tabIdByTerminalId` loses the corresponding reverse lookup.
+ *
+ * Exported separately so the prune logic is unit-testable without a
+ * React renderer. Without this prune, closing and reopening the same
+ * workspace (which reuses the `tab-${workspaceId}` tab id) leaves
+ * the old terminal id in `knownByTabId`; the retry loop's "have I
+ * resolved this tab yet?" check then short-circuits using the stale
+ * id, and subsequent `lifecycle://updated` events for the new
+ * terminal go to the unknown-id refetch branch which also skips the
+ * tab as already-known.
+ */
+export function pruneStaleRefs(
+  activeTabIds: ReadonlyArray<string>,
+  knownByTabId: Map<string, string>,
+  tabIdByTerminalId: Map<string, string>,
+): void {
+  const active = new Set(activeTabIds);
+  const stale: Array<[string, string]> = [];
+  for (const entry of knownByTabId) {
+    if (!active.has(entry[0])) {
+      stale.push(entry);
+    }
+  }
+  for (const [tabId, terminalId] of stale) {
+    knownByTabId.delete(tabId);
+    if (tabIdByTerminalId.get(terminalId) === tabId) {
+      tabIdByTerminalId.delete(terminalId);
+    }
+  }
+}
+
 export interface LifecycleStatusesMap {
   snapshotByTabId: Readonly<Record<string, WorkspaceLifecycleSnapshot>>;
   terminalIdByTabId: Readonly<Record<string, string | undefined>>;
@@ -141,6 +175,16 @@ export function useWorkspaceLifecycleStatuses(
     };
 
     seedDefaults();
+    // Drop ref entries for tabs that were removed since the previous
+    // effect cycle. Without this, a closed-then-reopened workspace
+    // (same `tab-${workspaceId}` tab id) keeps the old terminal id
+    // around and the retry/refetch paths short-circuit on the stale
+    // entry, leaving the reopened row stuck on the default snapshot.
+    pruneStaleRefs(
+      targetTabIds,
+      knownTerminalIdByTabIdRef.current,
+      tabIdByTerminalIdRef.current,
+    );
 
     // Install the listener BEFORE the initial fetch so a Done event
     // that fires between the fetch and the listener installation is

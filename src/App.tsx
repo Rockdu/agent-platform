@@ -620,22 +620,50 @@ function ClaudeReadyFooter({
   onRedo: () => void;
   busy: boolean;
 }) {
+  // Default to the compact ≤24px pill; the chevron expands to reveal
+  // the path / version / discovered-at / 重新查找 details. The
+  // NotFound and NotRun discovery states are rendered by
+  // ClaudeOnboardingCard above, not by this component, so they are
+  // unaffected by the pill compression.
+  const [expanded, setExpanded] = useState(false);
+  const toggle = () => setExpanded((prev) => !prev);
   return (
-    <aside className="bootstrap-card bootstrap-card--ok" data-claude-discovery="ready">
-      <h3>Claude Code 已就绪</h3>
-      <dl>
-        <dt>路径</dt>
-        <dd>
-          <code>{record.path}</code>
-        </dd>
-        <dt>版本</dt>
-        <dd>{record.version ?? "未知"}</dd>
-        <dt>发现时间</dt>
-        <dd>{record.discoveredAt}</dd>
-      </dl>
-      <button type="button" onClick={onRedo} disabled={busy}>
-        重新查找
-      </button>
+    <aside
+      className={`bootstrap-card bootstrap-card--ok claude-ready-footer claude-ready-footer--pill ${
+        expanded ? "claude-ready-footer--expanded" : ""
+      }`}
+      data-claude-discovery="ready"
+      data-expanded={expanded ? "true" : "false"}
+    >
+      <header className="claude-ready-footer__header">
+        <span className="claude-ready-footer__title">Claude Code 已就绪</span>
+        <button
+          type="button"
+          className="claude-ready-footer__chevron"
+          aria-label={expanded ? "收起 Claude 信息" : "展开 Claude 信息"}
+          aria-expanded={expanded ? "true" : "false"}
+          onClick={toggle}
+        >
+          ▸
+        </button>
+      </header>
+      {expanded && (
+        <section className="claude-ready-footer__expanded">
+          <dl>
+            <dt>路径</dt>
+            <dd>
+              <code>{record.path}</code>
+            </dd>
+            <dt>版本</dt>
+            <dd>{record.version ?? "未知"}</dd>
+            <dt>发现时间</dt>
+            <dd>{record.discoveredAt}</dd>
+          </dl>
+          <button type="button" onClick={onRedo} disabled={busy}>
+            重新查找
+          </button>
+        </section>
+      )}
     </aside>
   );
 }

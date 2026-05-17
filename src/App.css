@@ -137,6 +137,60 @@
   color: #888;
 }
 
+/* Compressed orchestrator footer pill. Collapsed by default to a
+   single ≤24px line; the chevron expands the panel below to reveal
+   the existing path / version / discovered-at / 重新查找 details.
+   The NotFound and NotRun discovery states use ClaudeOnboardingCard
+   above and are unaffected. */
+.claude-ready-footer--pill {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  margin: 8px 0 0 0;
+}
+.claude-ready-footer--pill > .claude-ready-footer__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+  padding: 4px 12px;
+}
+.claude-ready-footer__title {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 600;
+  font-size: 12px;
+  color: inherit;
+}
+.claude-ready-footer__chevron {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0 4px;
+  transition: transform 120ms ease-out;
+}
+.claude-ready-footer--expanded > .claude-ready-footer__header
+  > .claude-ready-footer__chevron {
+  transform: rotate(90deg);
+}
+.claude-ready-footer__expanded {
+  padding: 4px 12px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+/* Inside the expanded panel, the h3 from the prior pre-compression
+   markup is no longer rendered, so we don't need to override its
+   margins. The existing `.bootstrap-card--ok dl` and `dd` rules
+   above continue to render the detail grid. */
+
 /* Plugin meta panel in plugin tab body */
 .plugin-meta {
   display: grid;
