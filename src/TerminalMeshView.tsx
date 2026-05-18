@@ -20,6 +20,7 @@ import {
 } from "./ide-handoff";
 import { IdePreferencePane } from "./IdePreferencePane";
 import type { AutoLaunchErrorDto, WorkspaceLocation } from "./workspaces";
+import { shouldSkipSpawnFallback } from "./should-skip-spawn-fallback";
 
 const INITIAL_SCROLLBACK_BYTES = 64 * 1024;
 
@@ -155,7 +156,18 @@ export function TerminalMeshView({
     // waiting state; the effect re-runs when `existingTerminalId`
     // flips from undefined to the real id (it's in the deps array
     // below) and proceeds through the attach path on that re-run.
-    if (awaitingAutoLaunch && !existingTerminalId) {
+    // Short-circuit when the scheduler still owns the launch
+    // (awaiting), when an auto-launch error is already installed
+    // (banner takes over the pane — no fallback shell), and only
+    // proceed to the normal spawn when none of the above hold.
+    // A resolved `existingTerminalId` always wins (attach path).
+    if (
+      shouldSkipSpawnFallback({
+        awaitingAutoLaunch,
+        autoLaunchError,
+        existingTerminalId,
+      })
+    ) {
       return;
     }
     // Reset the shared dispose flag at the start of every setup so
@@ -311,7 +323,14 @@ export function TerminalMeshView({
     // MUST trigger a re-run so the component subscribes to the new
     // PTY; the previous run's cleanup is a no-op when it parked in
     // the waiting state (no xterm or subscription was created).
-  }, [existingTerminalId, awaitingAutoLaunch, cwd, tabId, workspaceId]);
+  }, [
+    existingTerminalId,
+    awaitingAutoLaunch,
+    autoLaunchError,
+    cwd,
+    tabId,
+    workspaceId,
+  ]);
 
   // Inactive→active transitions: re-fit and push the new size back
   // to the actor. xterm doesn't measure correctly while hidden, so
