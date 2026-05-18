@@ -571,3 +571,31 @@ fn ssh_transport_probe_returns_typed_remote_path_invalid_for_exit_77() {
         Err(other) => panic!("expected RemotePathInvalid; got {other:?}"),
     }
 }
+
+/// Stress regression for the wait-then-classify race: a stub that
+/// emits the OSC sentinels and exits immediately must classify as
+/// `CleanCompletion` every time, not occasionally as `Disconnect`.
+/// Before the fix, `wait()` would briefly sleep 50ms after
+/// `child.wait()` then read the flags; under load (or for
+/// fast-exiting sessions) the reader thread sometimes had not yet
+/// parsed the `am-exit-status` sentinel and `has_exit_status`
+/// stayed false → Disconnect classification. After the fix the
+/// reader thread is joined before classification, so the race is
+/// closed. Run the happy path 20 times to flush out flakiness.
+#[test]
+fn ssh_transport_classifies_clean_exit_consistently_under_fast_exit() {
+    for iteration in 0..20 {
+        let tmp = TempDir::new().unwrap();
+        let t = transport(
+            &tmp,
+            "printf '\\033]1338;am-shell-started\\a'\nprintf '\\033]1338;am-exit-status;0\\a'\nexit 0\n",
+        );
+        let mut session = t.spawn(remote_request("/srv")).expect("spawn ok");
+        let status = session.wait().expect("wait");
+        assert!(
+            matches!(status, TransportExitStatus::CleanCompletion),
+            "iteration {iteration}: expected CleanCompletion, got {status:?}"
+        );
+        session.cleanup().expect("cleanup");
+    }
+}

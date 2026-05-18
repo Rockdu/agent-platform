@@ -178,7 +178,25 @@ fn docker_shutdown_kill_invokes_container_cleanup_via_separate_ssh() {
     let _ = session.wait();
     session.cleanup().expect("cleanup");
 
-    let argv = read_recorder(&recorder);
+    // Cleanup ssh runs on a detached background thread with a
+    // 5-second deadline (the non-blocking cleanup design). Poll
+    // the recorder until both spawn and cleanup argv appear, or
+    // until the deadline. The previous fixed sleep in `wait()`
+    // was implicitly serving as the wait-for-cleanup window;
+    // once `wait()` became a synchronous reader-join (so
+    // fast-exit sessions classify correctly), the
+    // cleanup-async-vs-test race needs an explicit polling loop
+    // here in the test instead.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut argv = String::new();
+    while std::time::Instant::now() < deadline {
+        argv = read_recorder(&recorder);
+        if argv.contains("docker exec") && argv.contains("kill") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
     // Spawn invocation: docker exec -it ... + the SSH wrapper.
     assert!(
         argv.contains("docker exec -it") && argv.contains("my-container") && argv.contains("/bin/sh -lc"),

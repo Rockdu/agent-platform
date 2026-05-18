@@ -1171,11 +1171,25 @@ pub fn open_workspace(
     workspace_id: String,
     tab_id: String,
     registry: State<'_, WorkspaceRegistry>,
+    terminal_registry: State<'_, crate::terminal_mesh::TerminalMeshRegistry>,
 ) -> Result<WorkspaceRecord, WorkspaceErrorDto> {
     let id = parse_workspace_id(&workspace_id)?;
-    registry
+    let record = registry
         .open_workspace(id, &tab_id)
-        .map_err(|e| WorkspaceErrorDto::from(&e))
+        .map_err(|e| WorkspaceErrorDto::from(&e))?;
+    // Clear any stale close-during-launch tombstone the previous
+    // close may have left behind. If the user closes a workspace
+    // whose auto-launch is `Launching` and reopens the same
+    // workspace before that original launch settles, the
+    // executor's `Ok` branch would otherwise consume the
+    // tombstone and immediately shut down the newly-spawned
+    // terminal — leaving the reopened tab parked forever. The
+    // reopen is the user-visible signal that any prior
+    // close-during-launch is no longer relevant; discard the
+    // tombstone here so the executor's post-spawn check is a
+    // no-op for this id.
+    let _ = terminal_registry.take_workspace_closed_during_launch(id);
+    Ok(record)
 }
 
 #[tauri::command]

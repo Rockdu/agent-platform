@@ -34,6 +34,14 @@ type CreateSource =
       cwdInContainer: string;
     };
 
+/// Documented product default for the create-form auto-launch
+/// checkbox: starts CHECKED. Used both for the initial useState
+/// value AND the modal-close reset path so unchecking once does
+/// not silently persist across reopens of the modal. Exported so
+/// the compile-check harness can pin the default-checked
+/// invariant.
+export const DEFAULT_AUTO_LAUNCH_CLAUDE: boolean = true;
+
 function freshRemoteSource(): CreateSource {
   return {
     kind: "remote-ssh",
@@ -82,7 +90,9 @@ export function WorkspaceSwitcherModal({
   // Per the product spec the auto-launch checkbox defaults CHECKED.
   // Persisted into WorkspaceProfile.auto_launch_claude on the chosen
   // create/register path.
-  const [autoLaunchClaude, setAutoLaunchClaude] = useState(true);
+  const [autoLaunchClaude, setAutoLaunchClaude] = useState(
+    DEFAULT_AUTO_LAUNCH_CLAUDE,
+  );
 
   const onCursor = useCallback(async (workspacePath: string) => {
     setIdeError(null);
@@ -117,7 +127,10 @@ export function WorkspaceSwitcherModal({
   }, [open, onClose]);
 
   // Reset transient state when the modal closes so the next open
-  // starts fresh.
+  // starts fresh. `autoLaunchClaude` is included so unchecking it
+  // for one attempt does not silently persist across modal opens
+  // — the documented default is CHECKED and every reopen should
+  // honor that.
   useEffect(() => {
     if (!open) {
       setName("");
@@ -125,6 +138,7 @@ export function WorkspaceSwitcherModal({
       setError(null);
       setBusy(false);
       setMode("create");
+      setAutoLaunchClaude(DEFAULT_AUTO_LAUNCH_CLAUDE);
     }
   }, [open]);
 

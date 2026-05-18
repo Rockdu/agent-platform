@@ -1094,9 +1094,21 @@ impl TransportSession for SshTransportSession {
                 message: e.to_string(),
             })?
         };
-        // Wait briefly for any final sentinel bytes to flush through
-        // the reader thread.
-        thread::sleep(Duration::from_millis(50));
+        // Synchronize with the reader thread: once the ssh child
+        // has exited, its end of the PTY slave is closed and the
+        // master reader will see EOF, so the reader thread will
+        // exit its read loop. Joining it here guarantees every
+        // byte ssh sent — including the final OSC 1338
+        // `am-exit-status` sentinel — has been parsed into
+        // `shared.has_exit_status` / `shared.exit_status` BEFORE
+        // we classify. The previous 50ms sleep was a flakiness
+        // heuristic; under CPU load or for fast-exiting sessions
+        // the reader could still be parsing when the sleep
+        // expired, leaving `has_exit_status=false` and
+        // mis-reporting clean exits as `Disconnect`.
+        if let Some(thread) = self.reader_thread.take() {
+            let _ = thread.join();
+        }
         let shell_started = self.shared.shell_started.load(Ordering::SeqCst);
         let has_exit = self.shared.has_exit_status.load(Ordering::SeqCst);
         let exit_code = self.shared.exit_status.load(Ordering::SeqCst);

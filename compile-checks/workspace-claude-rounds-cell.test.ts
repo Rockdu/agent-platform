@@ -10,6 +10,7 @@
 
 import {
   AUTO_LAUNCH_BOUNDARY_TOOLTIP,
+  DEFAULT_AUTO_LAUNCH_CLAUDE,
   formatClaudeRoundsCell,
   claudeRoundsCellTooltip,
 } from "../src/WorkspaceSwitcherModal";
@@ -131,6 +132,16 @@ assertContains(
   "auto-launch tooltip mentions plugin-mediated writes",
   AUTO_LAUNCH_BOUNDARY_TOOLTIP,
   "插件",
+);
+
+// Default auto-launch checkbox state MUST be CHECKED per the
+// product spec. The modal's reset path resets to this constant
+// on close, so unchecking once does not silently persist across
+// reopens.
+assertEq(
+  "auto-launch default is checked",
+  DEFAULT_AUTO_LAUNCH_CLAUDE,
+  true,
 );
 
 console.log("workspace-claude-rounds-cell: all assertions passed");
