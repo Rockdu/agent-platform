@@ -117,23 +117,25 @@ fn build_docker_wrapper_script(
     }
     match optional_exec {
         None => {
-            // `exec` the login shell so the wrapper PID
-            // (already written to the PID file) becomes the live
-            // foreground shell process — not a parent shell with
-            // a TERM trap. The cleanup sends SIGKILL to that PID
-            // directly, hard-killing the user-facing shell (and
-            // any foreground child like `claude`) without giving
-            // the trap a chance to intercept.
-            script.push_str("if [ \"$status\" -eq 0 ]; then if [ -n \"$SHELL\" ] && [ -x \"$SHELL\" ]; then exec \"$SHELL\" -l; else exec /bin/sh -l; fi; fi\n");
+            // Run the login shell as a child (no `exec`) so the
+            // wrapper survives past it and emits the OSC
+            // `am-exit-status` sentinel that `probe_via_spawn`
+            // and the lifecycle classifier observe. Cleanup
+            // still hard-kills the foreground shell because the
+            // cleanup command targets the wrapper's PROCESS
+            // GROUP via `kill -9 -- -PID` (negative PID =
+            // process group), not just the wrapper PID — SIGKILL
+            // to the group reaps the wrapper AND every child it
+            // spawned.
+            script.push_str("if [ \"$status\" -eq 0 ]; then if [ -n \"$SHELL\" ] && [ -x \"$SHELL\" ]; then \"$SHELL\" -l; status=$?; else /bin/sh -l; status=$?; fi; fi\n");
         }
         Some(cmd) => {
-            // Same shell-quote-and-exec pattern as the SSH
-            // wrapper; the `exec` prefix replaces the wrapper
-            // shell with the requested program so the PID file
-            // references the live process and SIGKILL on cleanup
-            // hard-kills it without going through a trap.
+            // Run the requested program as a child (no `exec`)
+            // so the wrapper survives and emits the exit-status
+            // sentinel. Cleanup via the wrapper's process group
+            // still kills the program reliably.
             let program = shell_single_quote(&cmd.program.display().to_string());
-            let mut line = format!("exec {program}");
+            let mut line = program;
             for a in &cmd.args {
                 line.push(' ');
                 line.push_str(&shell_single_quote(a));
@@ -242,18 +244,22 @@ pub fn docker_phase_a_classifier(container_id: String) -> PhaseAClassifier {
 
 /// Compose the cleanup command sent over the same ControlMaster on
 /// `shutdown(Kill)`. The container is NEVER stopped — this just
-/// signals the wrapper process inside the existing container and
-/// removes the PID file. Uses `kill -9` (SIGKILL): the wrapper
-/// `exec`s into the user-facing login shell (or the explicit
-/// program), so the PID references the live foreground process.
-/// SIGKILL is uncatchable, bypassing any trap the inner program
-/// may install — necessary to guarantee the no-orphan cleanup
-/// contract even when the foreground process holds CPU or
-/// installs its own signal handlers.
+/// signals the wrapper and its children inside the existing
+/// container and removes the PID file. Targets the wrapper's
+/// PROCESS GROUP via `kill -9 -- -<pid>` (POSIX negative-PID = a
+/// process group, `--` ends option parsing). The wrapper is the
+/// process group leader when invoked as `docker exec -it <ctr>
+/// /bin/sh -lc '<body>'`, so SIGKILL to `-pid` reaps the wrapper
+/// AND every child it spawned (the login shell or the explicit
+/// program like `claude`). Process-group cleanup replaces the
+/// `exec` strategy: the wrapper runs its child without `exec` so
+/// the OSC `am-exit-status` sentinel still fires on natural
+/// completion, while group-kill on shutdown still guarantees no
+/// orphans.
 pub fn compose_docker_cleanup_command(container_id: &str, session_id: &str) -> String {
     let pid_file = wrapper_pid_file_for(session_id);
     let inner = format!(
-        "kill -9 \"$(cat {pid_quoted})\" 2>/dev/null || true; rm -f {pid_quoted}",
+        "kill -9 -- -\"$(cat {pid_quoted})\" 2>/dev/null || true; rm -f {pid_quoted}",
         pid_quoted = shell_single_quote(&pid_file),
     );
     format!(
@@ -751,44 +757,65 @@ mod tests {
         assert!(cmd.contains("rm -f"));
     }
 
-    /// The cleanup MUST use SIGKILL (`kill -9`) so the wrapper-
-    /// `exec`'d foreground process cannot intercept the signal
-    /// via a user-installed trap. SIGTERM would let a trap run a
-    /// cleanup-pid-file rm and exit zero, but leave any spawned
-    /// children in the container alive — violating the no-orphan
-    /// cleanup contract.
+    /// The cleanup MUST use SIGKILL targeted at the wrapper's
+    /// process group (`kill -9 -- -PID` — negative PID is POSIX
+    /// shorthand for "process group"). SIGTERM would let any
+    /// user-installed trap intercept and only rm the PID file
+    /// while leaving children alive; SIGKILL to the group reaps
+    /// the wrapper AND every child without giving any trap a
+    /// chance to run.
     #[test]
-    fn compose_docker_cleanup_command_uses_sigkill_not_sigterm() {
+    fn compose_docker_cleanup_command_uses_sigkill_on_process_group() {
         let cmd = compose_docker_cleanup_command("my-container", "sess-1");
         assert!(
             cmd.contains("kill -9"),
-            "cleanup must send SIGKILL (kill -9), not SIGTERM; got:\n{cmd}"
+            "cleanup must send SIGKILL (kill -9); got:\n{cmd}"
+        );
+        assert!(
+            cmd.contains("kill -9 -- -\""),
+            "cleanup must target the wrapper's process group via negative-PID syntax; got:\n{cmd}"
         );
     }
 
-    /// The wrapper's login-shell branch MUST use `exec` so the
-    /// wrapper shell is REPLACED by the user-facing login shell.
-    /// Without `exec`, the wrapper PID would reference the
-    /// parent shell with the TERM trap installed and the inner
-    /// shell would survive cleanup.
+    /// The wrapper's login-shell branch MUST NOT `exec` into the
+    /// login shell. `exec` would replace the wrapper process so
+    /// the trailing `printf 'am-exit-status;%s'` emission never
+    /// runs — `probe_via_spawn` then sees `ShellStarted` without
+    /// an exit-status sentinel and classifies the session as
+    /// `Disconnect`, blocking Docker-over-SSH workspace
+    /// registration. Cleanup correctness is preserved by killing
+    /// the wrapper's process group (see
+    /// `compose_docker_cleanup_command_uses_sigkill_on_process_group`).
     #[test]
-    fn docker_wrapper_login_shell_branch_uses_exec() {
+    fn docker_wrapper_login_shell_branch_does_not_exec_before_sentinel() {
         let script = build_docker_wrapper_script("sess-x", None, None);
         assert!(
-            script.contains("exec \"$SHELL\" -l"),
-            "login-shell branch must use exec; got:\n{script}"
+            !script.contains("exec \"$SHELL\""),
+            "login-shell branch must NOT `exec` before the sentinel; got:\n{script}"
         );
         assert!(
-            script.contains("exec /bin/sh -l"),
-            "fallback login-shell branch must also use exec; got:\n{script}"
+            !script.contains("exec /bin/sh -l"),
+            "fallback login-shell branch must NOT `exec` before the sentinel; got:\n{script}"
+        );
+        // The sentinel emission MUST be reachable.
+        assert!(
+            script.contains("am-exit-status"),
+            "wrapper must still emit the exit-status sentinel; got:\n{script}"
+        );
+        // And status capture must follow the shell invocation.
+        assert!(
+            script.contains("status=$?"),
+            "wrapper must capture $? after the shell exits; got:\n{script}"
         );
     }
 
-    /// Equivalent for the explicit-exec branch: the program is
-    /// invoked via `exec` so the PID file references the live
-    /// program (e.g. `claude`) and SIGKILL hard-kills it.
+    /// Equivalent for the explicit-program branch (auto-launch
+    /// claude, probe `/bin/sh -lc ':'`). Without `exec` the
+    /// wrapper survives past the child, captures status, and
+    /// emits the sentinel — exactly what probe needs to
+    /// classify as `CleanCompletion`.
     #[test]
-    fn docker_wrapper_explicit_exec_branch_uses_exec_prefix() {
+    fn docker_wrapper_explicit_program_branch_does_not_exec_before_sentinel() {
         use crate::transport::ShellCommand;
         let cmd = ShellCommand {
             program: std::path::PathBuf::from("/usr/bin/claude"),
@@ -796,8 +823,16 @@ mod tests {
         };
         let script = build_docker_wrapper_script("sess-y", None, Some(&cmd));
         assert!(
-            script.contains("exec '/usr/bin/claude'"),
-            "explicit-exec branch must prefix the program with `exec`; got:\n{script}"
+            !script.contains("exec '/usr/bin/claude'"),
+            "explicit-program branch must NOT `exec` before the sentinel; got:\n{script}"
+        );
+        assert!(
+            script.contains("'/usr/bin/claude' '--dangerously-skip-permissions'"),
+            "the program must still be invoked verbatim (no exec prefix); got:\n{script}"
+        );
+        assert!(
+            script.contains("am-exit-status"),
+            "wrapper must still emit the exit-status sentinel; got:\n{script}"
         );
     }
 
