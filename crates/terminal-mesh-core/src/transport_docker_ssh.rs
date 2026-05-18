@@ -24,6 +24,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use uuid::Uuid;
 
@@ -324,54 +325,132 @@ pub struct DockerOverSshTransportSession {
     cleanup_done: Mutex<bool>,
 }
 
+/// Maximum time the cleanup ssh is allowed to run before the
+/// watcher thread kills it. The `Transport::shutdown` contract
+/// requires the call to return without waiting, so the cleanup
+/// runs entirely in the background under this deadline.
+const CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Fire the docker-exec-kill cleanup ssh in the background and
+/// return immediately. A detached watcher thread enforces a
+/// 5-second deadline: on timeout it `kill()`s the cleanup process
+/// so the watcher itself exits promptly. Successes and failures
+/// are logged via `tracing::warn!` — the caller's `shutdown` path
+/// does not (and per the spec must not) wait for or surface this.
+fn spawn_cleanup_in_background(
+    ssh_program: PathBuf,
+    control_path: PathBuf,
+    user_host: String,
+    port: u16,
+    cleanup_cmd: String,
+    container_id: String,
+) {
+    let mut cmd = std::process::Command::new(&ssh_program);
+    cmd.arg("-o").arg("BatchMode=yes")
+        .arg("-o").arg("ControlMaster=auto")
+        .arg("-o").arg("ControlPersist=yes")
+        .arg("-o").arg(format!("ControlPath={}", control_path.display()))
+        .arg("-o").arg("StrictHostKeyChecking=accept-new")
+        .arg("-o").arg("ConnectTimeout=10")
+        .arg("-p").arg(port.to_string())
+        .arg(user_host)
+        .arg(compose_remote_command(&cleanup_cmd))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                container = %container_id,
+                error = %e,
+                "docker container cleanup ssh failed to spawn"
+            );
+            return;
+        }
+    };
+    let container_id_for_watcher = container_id;
+    std::thread::spawn(move || {
+        watch_cleanup(child, container_id_for_watcher);
+    });
+}
+
+fn watch_cleanup(mut child: std::process::Child, container_id: String) {
+    let start = std::time::Instant::now();
+    let poll = Duration::from_millis(100);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    let stderr_tail = child
+                        .stderr
+                        .take()
+                        .map(|mut s| {
+                            use std::io::Read;
+                            let mut buf = String::new();
+                            let _ = s.read_to_string(&mut buf);
+                            buf.chars().take(512).collect::<String>()
+                        })
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        container = %container_id,
+                        exit_code = ?status.code(),
+                        stderr = %stderr_tail,
+                        "docker container cleanup ssh exited non-zero"
+                    );
+                }
+                return;
+            }
+            Ok(None) => {
+                if start.elapsed() >= CLEANUP_DEADLINE {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::warn!(
+                        container = %container_id,
+                        deadline_ms = CLEANUP_DEADLINE.as_millis() as u64,
+                        "docker container cleanup ssh exceeded deadline; killed"
+                    );
+                    return;
+                }
+                std::thread::sleep(poll);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    container = %container_id,
+                    error = %e,
+                    "docker container cleanup ssh wait failed"
+                );
+                return;
+            }
+        }
+    }
+}
+
 impl DockerOverSshTransportSession {
-    /// Fire the docker-exec-kill cleanup over the same ControlMaster.
-    /// Idempotent: subsequent calls are no-ops. Errors are surfaced
-    /// as `DockerCleanupFailed` but do NOT block the local shutdown.
-    fn run_container_cleanup(&self) -> Result<(), TransportError> {
-        let mut done = self
-            .cleanup_done
-            .lock()
-            .map_err(|e| TransportError::DockerCleanupFailed {
-                container: self.container_id.clone(),
-                message: format!("cleanup mutex poisoned: {e}"),
-            })?;
+    /// Fire-and-forget container cleanup. Idempotent on the
+    /// `cleanup_done` flag; non-blocking thanks to
+    /// `spawn_cleanup_in_background`. Returns `Ok(())` immediately
+    /// in all cases — failures are logged by the watcher thread.
+    fn run_container_cleanup(&self) {
+        let mut done = match self.cleanup_done.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
         if *done {
-            return Ok(());
+            return;
         }
         *done = true;
         drop(done);
         let control_path = ssh_control_path_for(&self.control_dir, &self.ssh_location);
         let cleanup_cmd = compose_docker_cleanup_command(&self.container_id, &self.session_id);
-        let port = self.ssh_location.port.unwrap_or(22);
-        let user_host = self.ssh_location.user_host();
-        // Reuse the same ControlMaster so this multiplexes through
-        // the existing connection.
-        let mut cmd = std::process::Command::new(&self.ssh_program);
-        cmd.arg("-o").arg("BatchMode=yes")
-            .arg("-o").arg("ControlMaster=auto")
-            .arg("-o").arg("ControlPersist=yes")
-            .arg("-o").arg(format!("ControlPath={}", control_path.display()))
-            .arg("-o").arg("StrictHostKeyChecking=accept-new")
-            .arg("-o").arg("ConnectTimeout=10")
-            .arg("-p").arg(port.to_string())
-            .arg(user_host)
-            .arg(compose_remote_command(&cleanup_cmd));
-        let output = cmd.output().map_err(|e| TransportError::DockerCleanupFailed {
-            container: self.container_id.clone(),
-            message: format!("spawn cleanup ssh: {e}"),
-        })?;
-        if !output.status.success() {
-            return Err(TransportError::DockerCleanupFailed {
-                container: self.container_id.clone(),
-                message: format!(
-                    "cleanup ssh exited {code:?}: stderr={tail}",
-                    code = output.status.code(),
-                    tail = String::from_utf8_lossy(&output.stderr).chars().take(512).collect::<String>(),
-                ),
-            });
-        }
-        Ok(())
+        spawn_cleanup_in_background(
+            self.ssh_program.clone(),
+            control_path,
+            self.ssh_location.user_host(),
+            self.ssh_location.port.unwrap_or(22),
+            cleanup_cmd,
+            self.container_id.clone(),
+        );
     }
 }
 
@@ -430,17 +509,11 @@ impl TransportSession for DockerOverSshTransportSession {
             .shutdown(mode.clone());
         // On Kill, fire the container-side cleanup even if the local
         // shutdown errored — the wrapper inside the container needs
-        // to be reaped regardless.
+        // to be reaped regardless. The cleanup runs in a detached
+        // background thread with its own 5s deadline so this branch
+        // returns immediately per the `Transport::shutdown` contract.
         if matches!(mode, ShutdownMode::Kill) {
-            // Log container cleanup failures but do not mask the
-            // inner shutdown's outcome.
-            if let Err(e) = self.run_container_cleanup() {
-                tracing::warn!(
-                    container = %self.container_id,
-                    error = %e,
-                    "docker container cleanup failed"
-                );
-            }
+            self.run_container_cleanup();
         }
         inner_result
     }
@@ -478,62 +551,38 @@ struct DockerShutdownHandle {
 }
 
 impl DockerShutdownHandle {
-    fn run_container_cleanup(&self) -> Result<(), TransportError> {
-        let mut done = self
-            .cleanup_done
-            .lock()
-            .map_err(|e| TransportError::DockerCleanupFailed {
-                container: self.container_id.clone(),
-                message: format!("cleanup mutex poisoned: {e}"),
-            })?;
+    /// Same fire-and-forget cleanup as the session-side helper.
+    /// `shutdown()` must not wait per the `Transport` contract; the
+    /// detached watcher thread enforces the 5s deadline and logs
+    /// failures via `tracing::warn!`.
+    fn run_container_cleanup(&self) {
+        let mut done = match self.cleanup_done.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
         if *done {
-            return Ok(());
+            return;
         }
         *done = true;
         drop(done);
         let control_path = ssh_control_path_for(&self.control_dir, &self.ssh_location);
         let cleanup_cmd = compose_docker_cleanup_command(&self.container_id, &self.session_id);
-        let port = self.ssh_location.port.unwrap_or(22);
-        let user_host = self.ssh_location.user_host();
-        let mut cmd = std::process::Command::new(&self.ssh_program);
-        cmd.arg("-o").arg("BatchMode=yes")
-            .arg("-o").arg("ControlMaster=auto")
-            .arg("-o").arg("ControlPersist=yes")
-            .arg("-o").arg(format!("ControlPath={}", control_path.display()))
-            .arg("-o").arg("StrictHostKeyChecking=accept-new")
-            .arg("-o").arg("ConnectTimeout=10")
-            .arg("-p").arg(port.to_string())
-            .arg(user_host)
-            .arg(compose_remote_command(&cleanup_cmd));
-        let output = cmd.output().map_err(|e| TransportError::DockerCleanupFailed {
-            container: self.container_id.clone(),
-            message: format!("spawn cleanup ssh: {e}"),
-        })?;
-        if !output.status.success() {
-            return Err(TransportError::DockerCleanupFailed {
-                container: self.container_id.clone(),
-                message: format!(
-                    "cleanup ssh exited {code:?}: stderr={tail}",
-                    code = output.status.code(),
-                    tail = String::from_utf8_lossy(&output.stderr).chars().take(512).collect::<String>(),
-                ),
-            });
-        }
-        Ok(())
+        spawn_cleanup_in_background(
+            self.ssh_program.clone(),
+            control_path,
+            self.ssh_location.user_host(),
+            self.ssh_location.port.unwrap_or(22),
+            cleanup_cmd,
+            self.container_id.clone(),
+        );
     }
 }
 
 impl TransportShutdownHandle for DockerShutdownHandle {
     fn shutdown(&self, mode: ShutdownMode) -> Result<(), TransportError> {
         let inner_result = self.inner.shutdown(mode.clone());
-        if matches!(mode, ShutdownMode::Kill)
-            && let Err(e) = self.run_container_cleanup()
-        {
-            tracing::warn!(
-                container = %self.container_id,
-                error = %e,
-                "docker container cleanup failed (via shutdown handle)"
-            );
+        if matches!(mode, ShutdownMode::Kill) {
+            self.run_container_cleanup();
         }
         inner_result
     }
@@ -773,6 +822,37 @@ mod tests {
         let loc = DockerLocation::from_workspace(&ws).expect("present");
         assert_eq!(loc.container_id, "ctr-9");
         assert_eq!(loc.cwd_in_container.as_deref(), Some("/app/inside"));
+    }
+
+    /// `Transport::shutdown` must return without waiting (spec §2).
+    /// The cleanup dispatcher must therefore return immediately even
+    /// when the cleanup ssh hangs. Drive this with a stub-ssh that
+    /// sleeps 30 seconds; assert the dispatcher returns sub-second.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_dispatcher_returns_immediately_even_for_hung_ssh() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let hung_ssh = tmp.path().join("hung-ssh");
+        std::fs::write(&hung_ssh, b"#!/bin/sh\nsleep 30\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&hung_ssh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hung_ssh, perms).unwrap();
+
+        let t0 = std::time::Instant::now();
+        spawn_cleanup_in_background(
+            hung_ssh,
+            tmp.path().join("ctrl.sock"),
+            "u@h".into(),
+            22,
+            "echo cleanup".into(),
+            "container".into(),
+        );
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "spawn_cleanup_in_background must return immediately; took {elapsed:?}"
+        );
     }
 
     #[test]

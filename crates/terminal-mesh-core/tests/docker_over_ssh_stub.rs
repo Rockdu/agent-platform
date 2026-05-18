@@ -276,35 +276,77 @@ fn docker_missing_binary_returns_typed_docker_error() {
     );
 }
 
-/// Lifecycle-modeling regression per spec §5.3: the stub records
-/// its own PID, ignores cooperative termination signals
-/// (`trap '' HUP TERM`), then sleeps long enough that the spawn
-/// state is unambiguously "running" when the test calls
-/// `shutdown(Kill)`. After Kill + a 5s poll deadline, the test
-/// verifies the modeled spawn process is GONE (kill -0 returns
-/// ESRCH) AND that the cleanup ssh invocation was recorded.
+/// Lifecycle-modeling regression per spec §5.3: prove that
+/// `shutdown(Kill)` triggers the cleanup invocation which actually
+/// terminates a separately-modeled "remote process" within 5s of
+/// `t0` (measured BEFORE shutdown).
+///
+/// The stub-ssh script dispatches on its remote-command argv:
+///
+/// - The CLEANUP invocation (last argv contains `kill` AND
+///   `agentmesh-wrapper`) reads `REMOTE_PID_FILE` and sends
+///   `kill -9` to the modeled remote process. This mirrors what
+///   `docker exec <container> kill <wrapper-pid>` would do against
+///   a real container.
+///
+/// - The SPAWN invocation forks a child that writes its own PID
+///   to `REMOTE_PID_FILE` and sleeps under `trap '' HUP TERM` (so
+///   the cleanup-kill is the ONLY thing that can terminate it).
+///   The stub-ssh process itself stays alive while its modeled
+///   remote child runs.
+///
+/// The test:
+///   1. Spawn the session; wait for the modeled remote PID file.
+///   2. Record `t0 = Instant::now()` BEFORE `shutdown(Kill)`.
+///   3. Call `shutdown(Kill)` — must return well before `t0+5s`
+///      because the cleanup dispatcher is non-blocking.
+///   4. Poll `kill -0 <modeled-remote-pid>` against `t0+5s`.
+///   5. Assert ESRCH within the window (i.e. the cleanup invocation
+///      actually killed the modeled remote process).
 #[test]
-fn docker_shutdown_kill_terminates_spawn_within_5s() {
+fn docker_shutdown_kill_kills_modeled_remote_process_within_5s() {
     let tmp = TempDir::new().unwrap();
     let recorder = tmp.path().join("argv.log");
-    let pid_file = tmp.path().join("spawn.pid");
-    // Stub: write own pid, ignore cooperative signals, emit the
-    // shell-started sentinel so spawn() returns Ok, then sleep.
-    let body = format!(
-        "echo $$ > {pid_file}\ntrap '' HUP TERM\nprintf '\\033]1338;am-shell-started\\a'\nsleep 30\nprintf '\\033]1338;am-exit-status;0\\a'\nexit 0\n",
-        pid_file = pid_file.display(),
+    let remote_pid_file = tmp.path().join("remote.pid");
+    // The stub script:
+    // - Always records argv into the recorder (set up by write_recorder_stub-like prelude).
+    // - Dispatches on the last argv element.
+    let stub_body = format!(
+        r#"REMOTE_PID_FILE='{rpf}'
+last_arg=""
+for a in "$@"; do last_arg="$a"; done
+case "$last_arg" in
+  *"kill"*"agentmesh-wrapper"*)
+    if [ -f "$REMOTE_PID_FILE" ]; then
+      kill -9 "$(cat "$REMOTE_PID_FILE")" 2>/dev/null || true
+      rm -f "$REMOTE_PID_FILE"
+    fi
+    exit 0
+    ;;
+  *)
+    (trap '' HUP TERM; sleep 30) &
+    REMOTE_PID=$!
+    echo "$REMOTE_PID" > "$REMOTE_PID_FILE"
+    printf '\033]1338;am-shell-started\a'
+    wait "$REMOTE_PID" 2>/dev/null
+    printf '\033]1338;am-exit-status;0\a'
+    exit 0
+    ;;
+esac
+"#,
+        rpf = remote_pid_file.display(),
     );
-    let t = docker_transport(&tmp, &recorder, &body);
+    let t = docker_transport(&tmp, &recorder, &stub_body);
     let mut session = t
         .spawn(docker_request("/srv", "my-container"))
         .expect("spawn ok");
 
-    // Wait briefly for the stub to actually record its PID.
-    let pid: i32 = {
+    // Wait for the modeled remote to publish its PID.
+    let remote_pid: i32 = {
         let mut pid: Option<i32> = None;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
-            if let Ok(s) = std::fs::read_to_string(&pid_file)
+            if let Ok(s) = std::fs::read_to_string(&remote_pid_file)
                 && let Ok(n) = s.trim().parse::<i32>()
             {
                 pid = Some(n);
@@ -312,23 +354,33 @@ fn docker_shutdown_kill_terminates_spawn_within_5s() {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        pid.expect("stub spawn must record its PID within 2s")
+        pid.expect("modeled remote process must record its PID within 2s")
     };
 
-    // Trigger Kill and poll for termination.
+    // T0 BEFORE shutdown so the 5s budget covers cleanup dispatch
+    // + the actual kill in one window.
+    let t0 = std::time::Instant::now();
     session.shutdown(ShutdownMode::Kill).expect("shutdown");
+    // The shutdown contract: must return promptly. If it blocked on
+    // cleanup, this single assertion would fail before the polling
+    // loop even runs.
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(2),
+        "shutdown(Kill) must NOT block on cleanup; took {:?}",
+        t0.elapsed(),
+    );
+
     let _ = session.wait();
     session.cleanup().expect("cleanup");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Poll for the modeled remote process to be reaped within the
+    // 5s window measured from BEFORE shutdown.
+    let deadline = t0 + std::time::Duration::from_secs(5);
     let mut still_alive = true;
     while std::time::Instant::now() < deadline {
-        // `kill -0` returns 0 if the process exists, ESRCH otherwise.
-        // We exec /bin/kill instead of the shell builtin so the
-        // probe works regardless of the test environment's shell.
         let probe = std::process::Command::new("kill")
             .arg("-0")
-            .arg(pid.to_string())
+            .arg(remote_pid.to_string())
             .output()
             .expect("kill -0 probe");
         if !probe.status.success() {
@@ -339,10 +391,10 @@ fn docker_shutdown_kill_terminates_spawn_within_5s() {
     }
     assert!(
         !still_alive,
-        "spawn process pid={pid} must be terminated within 5s of shutdown(Kill)",
+        "modeled remote process pid={remote_pid} must be terminated by the cleanup invocation within 5s of shutdown(Kill)",
     );
 
-    // And the cleanup ssh invocation still reached the recorder.
+    // The cleanup ssh invocation reached the recorder.
     let argv = read_recorder(&recorder);
     assert!(
         argv.contains("docker exec") && argv.contains("kill") && argv.contains("rm -f"),
