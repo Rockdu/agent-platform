@@ -308,13 +308,21 @@ impl TerminalMeshRegistry {
 
         // Retained snapshot state (survives natural actor exit).
         // If a pending-launch placeholder existed for this tab (the
-        // auto-launch case), drain it now and let `pending_launch`
-        // start false on the live snapshot — the scheduler will fire
-        // `on_pending_launch_changed(..., false)` shortly anyway, but
-        // taking it here makes the placeholder map self-cleaning.
-        let _drained_placeholder = tab_id
+        // auto-launch case), drain it now. We preserve its
+        // `pending_launch` flag onto the live snapshot so the
+        // subsequent `on_pending_launch_changed(..., false)` call
+        // observes a real transition (from true → false) and emits
+        // the `lifecycle://updated` envelope that carries the
+        // real terminal id; without this seed, queued auto-launches
+        // whose frontend retry window expired would never see the
+        // real-id update and stay parked in the waiting state.
+        let drained_placeholder = tab_id
             .as_deref()
             .and_then(|t| self.take_pending_snapshot_for_tab(t));
+        let seed_pending_launch = drained_placeholder
+            .as_ref()
+            .map(|p| p.pending_launch)
+            .unwrap_or(false);
         {
             let mut snapshots = self.snapshots.lock().expect("retained snapshots poisoned");
             if let Some(t) = tab_id.as_deref() {
@@ -324,16 +332,16 @@ impl TerminalMeshRegistry {
                     .expect("snapshot_tab_index poisoned");
                 snap_idx.insert(t.to_string(), id);
             }
+            let mut fresh = WorkspaceLifecycleSnapshot::fresh_for_workspace_with_kind(
+                tab_kind,
+                workspace_id,
+                transport_kind,
+            );
+            fresh.pending_launch = seed_pending_launch;
             snapshots.insert(
                 id,
                 RetainedRecord {
-                    snapshot: Arc::new(StdMutex::new(
-                        WorkspaceLifecycleSnapshot::fresh_for_workspace_with_kind(
-                            tab_kind,
-                            workspace_id,
-                            transport_kind,
-                        ),
-                    )),
+                    snapshot: Arc::new(StdMutex::new(fresh)),
                     tab_id,
                 },
             );
@@ -2581,15 +2589,52 @@ mod tests {
             TransportKind::Local,
         );
 
-        // Placeholder drained; live snapshot exists with default
-        // pending_launch=false (the scheduler's post-spawn callback
-        // would also set it to false but we test the seam here).
+        // Placeholder drained from the pending map.
         assert!(
             r.clear_pending_for_tab(&tab_id).is_none(),
             "record() must have drained the placeholder"
         );
         let live = r.snapshot_for_tab(&tab_id).expect("live snapshot present");
-        assert!(!live.pending_launch);
+        // Drained placeholder's `pending_launch=true` MUST seed the
+        // live snapshot so the subsequent
+        // `on_pending_launch_changed(_, false)` callback observes a
+        // real true → false transition and emits the lifecycle
+        // update that carries the real terminal id. Without this
+        // seed, queued auto-launches whose frontend retry window
+        // expired would never see the real-id update.
+        assert!(
+            live.pending_launch,
+            "drained placeholder's pending_launch=true must seed the live snapshot"
+        );
+    }
+
+    /// Companion to `record_consumes_pending_placeholder`: when no
+    /// placeholder exists (the immediate / non-queued auto-launch
+    /// case, or any spawn without a prior `set_pending_for_tab`),
+    /// the live snapshot must start with `pending_launch=false`
+    /// as before. Regression so seeding from a stale placeholder
+    /// can never leak into the no-placeholder path.
+    #[test]
+    fn record_without_placeholder_seeds_pending_launch_false() {
+        let r = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let tab_id = Uuid::new_v4().to_string();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let buf = StdArc::new(StdMutex::new(String::new()));
+        r.record(
+            id,
+            tx,
+            buf,
+            Some(tab_id.clone()),
+            TabKind::Workspace,
+            None,
+            TransportKind::Local,
+        );
+        let live = r.snapshot_for_tab(&tab_id).expect("live snapshot present");
+        assert!(
+            !live.pending_launch,
+            "no placeholder → live snapshot starts with pending_launch=false"
+        );
     }
 
     /// `clear_pending_for_tab` removes the placeholder so a queued

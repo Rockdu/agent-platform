@@ -29,7 +29,9 @@ import {
   type ClaudePathRecord,
 } from "./claude-discovery";
 import { TerminalMeshView } from "./TerminalMeshView";
+import { shutdownTerminal } from "./terminal-mesh";
 import type { DoneReason, WorkspaceLifecycleSnapshot } from "./terminal-mesh";
+import { resolveAutoLaunchTerminalToShutdown } from "./close-tab-shutdown";
 import {
   DEFAULT_LIFECYCLE_SNAPSHOT,
   useWorkspaceLifecycleStatuses,
@@ -1067,6 +1069,14 @@ interface OpenTab {
   /// the spawn and the live terminal_id arrives via the lifecycle
   /// subscription.
   awaitingAutoLaunch: boolean;
+  /// `true` when the scheduler created the terminal for this tab
+  /// (i.e. the workspace had auto-launch enabled). The view side
+  /// treats `existingTerminalId` as externally owned and skips
+  /// `terminal_shutdown` in its cleanup, so without this flag the
+  /// PTY + child process would leak past the tab close. `closeTab`
+  /// consults this flag to issue an explicit `shutdownTerminal`
+  /// for the resolved id.
+  ownsAutoLaunchTerminal: boolean;
 }
 
 type HostModal = "workspace-switcher" | null;
@@ -1302,6 +1312,13 @@ function MultiTerminalContainer() {
   // only owns the tab array + open/close/focus calls.
   const [workspaces, setWorkspaces] = useState<WorkspaceRecord[]>([]);
   const [tabs, setTabs] = useState<OpenTab[]>([]);
+  // Tab-set memo + parent-owned lifecycle hook. Hoisted above
+  // adoptWorkspaceTab/closeTab so the close path can read
+  // `terminalIdByTabId` to shut down scheduler-owned terminals
+  // before the tab is dropped from state.
+  const tabIds = useMemo(() => tabs.map((t) => t.tabId), [tabs]);
+  const { snapshotByTabId, terminalIdByTabId } =
+    useWorkspaceLifecycleStatuses(tabIds);
   const [active, setActive] = useState<string>("");
   const [error, setError] = useState<WorkspaceErrorDto | null>(null);
   // Per-tab auto-launch error. Surfaces inside the workspace pane so
@@ -1371,6 +1388,12 @@ function MultiTerminalContainer() {
               workspacePath: localPath(refreshed) ?? "",
               workspaceLocation: refreshed.location,
               awaitingAutoLaunch: willAutoLaunch,
+              // When the scheduler creates the terminal for us,
+              // close-time cleanup is on us — the view's cleanup
+              // path treats `existingTerminalId` as externally
+              // owned and skips `terminal_shutdown`, so without
+              // this flag the PTY + child process would leak.
+              ownsAutoLaunchTerminal: willAutoLaunch,
             },
           ];
         });
@@ -1420,6 +1443,19 @@ function MultiTerminalContainer() {
     async (tabId: string) => {
       const target = tabs.find((t) => t.tabId === tabId);
       if (!target) return;
+      // Scheduler-owned terminals: the view's cleanup path treats
+      // `existingTerminalId` as externally owned and skips
+      // `terminal_shutdown`, so the PTY + child process would
+      // outlive the tab. Issue the shutdown here, fire-and-forget,
+      // BEFORE we drop the tab from state. Ignore errors so a
+      // missing-terminal case (already exited naturally) still
+      // proceeds with the close.
+      const shutdownId = resolveAutoLaunchTerminalToShutdown(target, terminalIdByTabId);
+      if (shutdownId) {
+        void shutdownTerminal(shutdownId).catch((err) => {
+          console.warn("auto-launched terminal shutdown failed", err);
+        });
+      }
       try {
         await closeWorkspace(target.workspaceId);
       } catch (err) {
@@ -1436,7 +1472,7 @@ function MultiTerminalContainer() {
       });
       void refreshWorkspaces();
     },
-    [tabs, active, refreshWorkspaces],
+    [tabs, active, refreshWorkspaces, terminalIdByTabId],
   );
 
   const activeId =
@@ -1450,10 +1486,9 @@ function MultiTerminalContainer() {
   // per-tab `existingTerminalId` resolution that lets auto-launched
   // workspaces attach to the scheduler's PTY instead of spawning a
   // second one. The hook is memoized on `tabIds` so it only re-runs
-  // when the tab set actually changes.
-  const tabIds = useMemo(() => tabs.map((t) => t.tabId), [tabs]);
-  const { snapshotByTabId, terminalIdByTabId } =
-    useWorkspaceLifecycleStatuses(tabIds);
+  // when the tab set actually changes. (The hook is invoked higher
+  // up so the close path can read `terminalIdByTabId`; only the
+  // explanatory comment remains here for readers tracing the flow.)
 
   return (
     <section className="terminal-mesh-container">

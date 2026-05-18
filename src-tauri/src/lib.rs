@@ -200,6 +200,57 @@ impl RealLaunchExecutor {
     }
 }
 
+/// Select the `claude` program path that the auto-launched
+/// terminal should exec. For Local workspaces this is the
+/// absolute path the host's `DiscoveryCache` resolved at
+/// bootstrap. For Remote workspaces it's the bare program name
+/// so the remote shell's PATH resolves it — the local discovery
+/// path means nothing on the remote machine, which typically
+/// has `claude` at a different absolute location (or only as a
+/// shell function / aliased command).
+pub(crate) fn auto_launch_command_for_routing(
+    routing: workspace_launch_scheduler::TransportRouting,
+    local_claude_path: &std::path::Path,
+) -> PathBuf {
+    use workspace_launch_scheduler::TransportRouting;
+    match routing {
+        TransportRouting::Local => local_claude_path.to_path_buf(),
+        TransportRouting::Ssh | TransportRouting::DockerOverSsh => PathBuf::from("claude"),
+    }
+}
+
+/// Surface an auto-launch async failure to the frontend so a
+/// queued tab does not stay parked forever in the waiting /
+/// pending pane. Drains any pending placeholder for the tab and
+/// emits a placeholder lifecycle update with `pending_launch =
+/// false` + `status = Done` + `done_reason = Disconnected` so
+/// the rail moves the tab to Done and the view shows the error.
+/// `tracing::warn!` carries the underlying error so the dev /
+/// support log captures the root cause; the user sees the
+/// transport-kind in the rail badge and the Done state in the
+/// pane.
+fn surface_auto_launch_async_failure(
+    app: &tauri::AppHandle,
+    registry: &TerminalMeshRegistry,
+    tab_id: &str,
+    transport_kind: crate::workspace_lifecycle::TransportKind,
+) {
+    // If a placeholder is still installed (queued auto-launches),
+    // drain it before constructing the Done envelope so the
+    // pending map stops carrying a stale entry. The drained value
+    // is discarded — we rebuild the snapshot below.
+    let _ = registry.clear_pending_for_tab(tab_id);
+    let mut envelope = crate::workspace_lifecycle::WorkspaceLifecycleSnapshot::fresh_for_workspace_with_kind(
+        crate::workspace_lifecycle::TabKind::Workspace,
+        None,
+        transport_kind,
+    );
+    envelope.pending_launch = false;
+    envelope.status = crate::workspace_lifecycle::TabStatus::Done;
+    envelope.done_reason = Some(crate::workspace_lifecycle::DoneReason::Disconnected);
+    crate::workspace_lifecycle::emit_lifecycle_updated_for_placeholder(app, tab_id, &envelope);
+}
+
 impl LaunchExecutor for RealLaunchExecutor {
     fn execute(&self, launch: PendingLaunch) {
         let app = self.app_handle.clone();
@@ -233,6 +284,15 @@ impl LaunchExecutor for RealLaunchExecutor {
                     %tab_id,
                     "auto-launch skipped: claude discovery not ready"
                 );
+                let kind = match routing {
+                    workspace_launch_scheduler::TransportRouting::Local =>
+                        crate::workspace_lifecycle::TransportKind::Local,
+                    workspace_launch_scheduler::TransportRouting::Ssh =>
+                        crate::workspace_lifecycle::TransportKind::Ssh,
+                    workspace_launch_scheduler::TransportRouting::DockerOverSsh =>
+                        crate::workspace_lifecycle::TransportKind::SshDocker,
+                };
+                surface_auto_launch_async_failure(&app, &registry, &tab_id, kind);
                 if let Some(sched) = scheduler {
                     sched.notify_launch_settled(workspace_id);
                 }
@@ -245,7 +305,7 @@ impl LaunchExecutor for RealLaunchExecutor {
             };
             let spec = terminal_mesh_core::TerminalSpec {
                 terminal_id: uuid::Uuid::new_v4(),
-                command: path,
+                command: auto_launch_command_for_routing(routing, &path),
                 args: launch.claude_argv.clone(),
                 cwd: cwd_for_spec,
                 env: Vec::new(),
@@ -273,6 +333,12 @@ impl LaunchExecutor for RealLaunchExecutor {
                             %workspace_id,
                             %tab_id,
                             "auto-launch SSH skipped: app_data_root not available"
+                        );
+                        surface_auto_launch_async_failure(
+                            &app,
+                            &registry,
+                            &tab_id,
+                            crate::workspace_lifecycle::TransportKind::Ssh,
                         );
                         if let Some(sched) = scheduler {
                             sched.notify_launch_settled(workspace_id);
@@ -305,6 +371,12 @@ impl LaunchExecutor for RealLaunchExecutor {
                                 %err,
                                 "SshTransport::from_app_data failed"
                             );
+                            surface_auto_launch_async_failure(
+                                &app,
+                                &registry,
+                                &tab_id,
+                                crate::workspace_lifecycle::TransportKind::Ssh,
+                            );
                             if let Some(sched) = scheduler {
                                 sched.notify_launch_settled(workspace_id);
                             }
@@ -318,6 +390,12 @@ impl LaunchExecutor for RealLaunchExecutor {
                             %workspace_id,
                             %tab_id,
                             "auto-launch Docker skipped: app_data_root not available"
+                        );
+                        surface_auto_launch_async_failure(
+                            &app,
+                            &registry,
+                            &tab_id,
+                            crate::workspace_lifecycle::TransportKind::SshDocker,
                         );
                         if let Some(sched) = scheduler {
                             sched.notify_launch_settled(workspace_id);
@@ -350,6 +428,12 @@ impl LaunchExecutor for RealLaunchExecutor {
                                 %err,
                                 "DockerOverSshTransport::from_app_data failed"
                             );
+                            surface_auto_launch_async_failure(
+                                &app,
+                                &registry,
+                                &tab_id,
+                                crate::workspace_lifecycle::TransportKind::SshDocker,
+                            );
                             if let Some(sched) = scheduler {
                                 sched.notify_launch_settled(workspace_id);
                             }
@@ -369,6 +453,21 @@ impl LaunchExecutor for RealLaunchExecutor {
                         %err,
                         "auto-launch spawn failed"
                     );
+                    // The spawn itself failed (transport-level or
+                    // PTY-allocation error). Mirror the surface
+                    // behavior so the React tab stops waiting and
+                    // moves to Done. Local routing also benefits
+                    // because `spawn_into_registry` can fail (rare,
+                    // but possible for /bin/zsh missing etc.).
+                    let kind = match routing {
+                        workspace_launch_scheduler::TransportRouting::Local =>
+                            crate::workspace_lifecycle::TransportKind::Local,
+                        workspace_launch_scheduler::TransportRouting::Ssh =>
+                            crate::workspace_lifecycle::TransportKind::Ssh,
+                        workspace_launch_scheduler::TransportRouting::DockerOverSsh =>
+                            crate::workspace_lifecycle::TransportKind::SshDocker,
+                    };
+                    surface_auto_launch_async_failure(&app, &registry, &tab_id, kind);
                 }
             }
             if let Some(sched) = scheduler {
@@ -710,4 +809,38 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Local routing reuses the host's resolved absolute Claude
+    /// path. Remote routing (SSH or Docker-over-SSH) switches to
+    /// the bare program name so the remote shell's PATH resolves
+    /// it — the local absolute path means nothing on the remote
+    /// host. Regression for the case where the remote wrapper
+    /// would silently fail because it tried to exec a local-only
+    /// binary path.
+    #[test]
+    fn auto_launch_command_for_routing_picks_local_or_bare_remote() {
+        use workspace_launch_scheduler::TransportRouting;
+        let local_path = std::path::PathBuf::from("/opt/homebrew/bin/claude");
+
+        assert_eq!(
+            auto_launch_command_for_routing(TransportRouting::Local, &local_path),
+            local_path,
+            "Local routing reuses the host-resolved absolute path"
+        );
+        assert_eq!(
+            auto_launch_command_for_routing(TransportRouting::Ssh, &local_path),
+            std::path::PathBuf::from("claude"),
+            "Remote SSH routing uses bare `claude` so remote PATH resolves"
+        );
+        assert_eq!(
+            auto_launch_command_for_routing(TransportRouting::DockerOverSsh, &local_path),
+            std::path::PathBuf::from("claude"),
+            "Remote Docker routing uses bare `claude` so remote PATH resolves"
+        );
+    }
 }

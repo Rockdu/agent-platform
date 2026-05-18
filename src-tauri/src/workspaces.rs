@@ -687,6 +687,19 @@ impl WorkspaceRegistry {
         validate_workspace_name(name)?;
         validate_remote_fields(&ssh, container.as_ref())?;
         let mut guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
+        // Reject if an existing Remote workspace already points at
+        // the same identity tuple (`docs/specs/transport.md` §6.1).
+        // Without this check the same SSH target can be registered
+        // multiple times and appear as separate workspaces in the
+        // rail / switcher. Reuses the existing CanonicalDuplicate
+        // variant since the user-facing meaning is the same:
+        // "this target is already registered."
+        if let Some(dup) = guard.find_remote_duplicate(&ssh, container.as_ref()) {
+            return Err(WorkspaceError::CanonicalDuplicate {
+                existing_workspace_id: dup.workspace_id,
+                existing_name: dup.name.clone(),
+            });
+        }
         let now = now_rfc3339();
         let mut profile = WorkspaceProfile::default_local();
         profile.auto_launch_claude = auto_launch_claude;
@@ -778,6 +791,39 @@ impl RegistryInner {
                 paths_refer_to_same_workspace(path, candidate)
             }
             WorkspaceLocation::Remote { .. } => false,
+        })
+    }
+
+    /// Locate an existing Remote workspace whose identity tuple
+    /// matches the candidate. The tuple follows
+    /// `docs/specs/transport.md` §6.1: `(user, host, normalized
+    /// port, canonical_remote_path, container_id, cwd_in_container)`.
+    /// `port = None` normalizes to `22`; `user = None` normalizes
+    /// to `None` (it does NOT default to the local username for
+    /// dedup purposes — two records with different `user` fields
+    /// are different identities even if SSH would resolve them to
+    /// the same login). A Remote-with-container and a
+    /// Remote-without-container at the same SSH location are NOT
+    /// duplicates (legitimately distinct workspaces — one is the
+    /// host filesystem, the other is the container).
+    fn find_remote_duplicate(
+        &self,
+        ssh: &SshLocation,
+        container: Option<&ContainerLocation>,
+    ) -> Option<&WorkspaceRecord> {
+        let normalized_port = ssh.port.unwrap_or(22);
+        self.records.values().find(|r| match &r.location {
+            WorkspaceLocation::Local { .. } => false,
+            WorkspaceLocation::Remote {
+                ssh: existing_ssh,
+                container: existing_container,
+            } => {
+                existing_ssh.user == ssh.user
+                    && existing_ssh.host == ssh.host
+                    && existing_ssh.port.unwrap_or(22) == normalized_port
+                    && existing_ssh.canonical_remote_path == ssh.canonical_remote_path
+                    && existing_container.as_ref() == container
+            }
         })
     }
 }
@@ -2061,6 +2107,117 @@ mod tests {
             }
             other => panic!("expected RemoteFieldInvalid(containerId); got {other:?}"),
         }
+    }
+
+    /// Registering the same Remote SSH identity tuple twice must
+    /// be rejected with `CanonicalDuplicate` and the registry on
+    /// disk must end with exactly one Remote record. Covers the
+    /// spec §6.1 duplicate detection for Remote workspaces.
+    #[test]
+    fn register_remote_workspace_rejects_duplicate_remote_identity_tuple() {
+        let (storage, _home, reg) = fresh_registry();
+        let ssh = SshLocation {
+            user: Some("alice".into()),
+            host: "h.example".into(),
+            port: Some(22),
+            canonical_remote_path: "/srv".into(),
+        };
+        let first = reg
+            .register_remote_workspace("first", ssh.clone(), None, true)
+            .expect("first registration");
+        let err = reg
+            .register_remote_workspace("second", ssh, None, true)
+            .expect_err("second registration must be rejected as duplicate");
+        match err {
+            WorkspaceError::CanonicalDuplicate {
+                existing_workspace_id,
+                existing_name,
+            } => {
+                assert_eq!(existing_workspace_id, first.workspace_id);
+                assert_eq!(existing_name, "first");
+            }
+            other => panic!("expected CanonicalDuplicate; got {other:?}"),
+        }
+        drop(reg);
+        let reloaded = WorkspaceRegistry::load(storage.path().to_path_buf(), None);
+        let remote_count = reloaded
+            .list()
+            .iter()
+            .filter(|r| matches!(r.location, WorkspaceLocation::Remote { .. }))
+            .count();
+        assert_eq!(
+            remote_count, 1,
+            "duplicate rejection must leave exactly one Remote record on disk"
+        );
+    }
+
+    /// `port = None` and `port = Some(22)` MUST normalize to the
+    /// same identity (SSH's default port). Mirrors the
+    /// `normalized_port` step in the spec's identity tuple.
+    #[test]
+    fn register_remote_workspace_treats_implicit_port_22_as_duplicate_of_explicit_22() {
+        let (_storage, _home, reg) = fresh_registry();
+        reg.register_remote_workspace(
+            "implicit-port",
+            SshLocation {
+                user: Some("alice".into()),
+                host: "h.example".into(),
+                port: None,
+                canonical_remote_path: "/srv".into(),
+            },
+            None,
+            true,
+        )
+        .expect("implicit-port registration");
+        let err = reg
+            .register_remote_workspace(
+                "explicit-port",
+                SshLocation {
+                    user: Some("alice".into()),
+                    host: "h.example".into(),
+                    port: Some(22),
+                    canonical_remote_path: "/srv".into(),
+                },
+                None,
+                true,
+            )
+            .expect_err("port=None vs port=Some(22) must collide");
+        assert!(matches!(err, WorkspaceError::CanonicalDuplicate { .. }));
+    }
+
+    /// Remote-with-container and Remote-without-container at the
+    /// same SSH location are NOT duplicates — the container record
+    /// names a distinct filesystem (the container's), the
+    /// host-side record names the host's. Both are legitimate
+    /// workspaces a user may want side by side.
+    #[test]
+    fn register_remote_workspace_allows_container_and_host_side_by_side() {
+        let (_storage, _home, reg) = fresh_registry();
+        let ssh = SshLocation {
+            user: Some("alice".into()),
+            host: "h.example".into(),
+            port: Some(22),
+            canonical_remote_path: "/srv".into(),
+        };
+        reg.register_remote_workspace("host-side", ssh.clone(), None, true)
+            .expect("host-side registration");
+        let with_container = reg
+            .register_remote_workspace(
+                "container-side",
+                ssh,
+                Some(ContainerLocation {
+                    container_id: "ctr-1".into(),
+                    cwd_in_container: None,
+                }),
+                true,
+            )
+            .expect("container-side must NOT collide with host-side");
+        assert!(matches!(
+            with_container.location,
+            WorkspaceLocation::Remote {
+                container: Some(_), ..
+            }
+        ));
     }
 
     /// Canonical-duplicate detection must skip `Remote` records so a
