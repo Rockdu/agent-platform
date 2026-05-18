@@ -32,6 +32,7 @@ import { TerminalMeshView } from "./TerminalMeshView";
 import { shutdownTerminal } from "./terminal-mesh";
 import type { DoneReason, WorkspaceLifecycleSnapshot } from "./terminal-mesh";
 import { resolveAutoLaunchTerminalToShutdown } from "./close-tab-shutdown";
+import { synthesizeStuckAutoLaunchError } from "./stuck-auto-launch";
 import {
   DEFAULT_LIFECYCLE_SNAPSHOT,
   useWorkspaceLifecycleStatuses,
@@ -1357,6 +1358,43 @@ function MultiTerminalContainer() {
   useEffect(() => {
     void refreshWorkspaces();
   }, [refreshWorkspaces]);
+
+  // Stuck-waiting watcher: when an auto-launched tab's snapshot
+  // transitions to Done without ever publishing a real terminal
+  // id (the back-end's `surface_auto_launch_async_failure` path
+  // emits a lifecycle envelope with `terminalId: null`), the
+  // pane would otherwise stay parked in `等待 claude 启动…`
+  // because the view's waiting branch only exits on a real id or
+  // a synchronous request-promise rejection. Synthesize an
+  // `AutoLaunchErrorDto.asyncSpawnFailed` entry so the existing
+  // banner path renders the error and clear `awaitingAutoLaunch`
+  // on the tab so the view re-runs through the attach branch.
+  useEffect(() => {
+    setTabs((prev) => {
+      let mutated = false;
+      const next = prev.map((t) => {
+        const synthesized = synthesizeStuckAutoLaunchError(
+          t,
+          snapshotByTabId[t.tabId],
+          terminalIdByTabId[t.tabId],
+        );
+        if (synthesized) {
+          mutated = true;
+          // Install the synthesized error (idempotent if already
+          // installed) so the view's banner renders even if the
+          // user did not previously see a synchronous rejection.
+          setAutoLaunchErrorByTabId((prevErr) =>
+            prevErr[t.tabId]
+              ? prevErr
+              : { ...prevErr, [t.tabId]: synthesized },
+          );
+          return { ...t, awaitingAutoLaunch: false };
+        }
+        return t;
+      });
+      return mutated ? next : prev;
+    });
+  }, [snapshotByTabId, terminalIdByTabId]);
 
   const adoptWorkspaceTab = useCallback(
     async (workspace: WorkspaceRecord) => {

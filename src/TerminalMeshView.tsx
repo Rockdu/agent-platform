@@ -439,6 +439,8 @@ export function TerminalMeshView({
             <code>{autoLaunchError.kind}</code>
             {autoLaunchError.kind === "claudeDiscoveryNotReady" &&
               ` · ${autoLaunchError.discoveryKind}: ${autoLaunchError.message}`}
+            {autoLaunchError.kind === "asyncSpawnFailed" &&
+              ` · ${autoLaunchError.transportKind} → ${autoLaunchError.doneReason}`}
           </p>
         </aside>
       )}

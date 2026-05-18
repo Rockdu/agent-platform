@@ -1188,9 +1188,22 @@ pub fn close_workspace(
     let id = parse_workspace_id(&workspace_id)?;
     // Removing a queued auto-launch entry frees the slot without
     // consuming it. In-flight launches are not cancelable at this
-    // layer; the user's close still succeeds and the eventual settle
-    // just drains nothing.
-    let _was_pending = scheduler.cancel(id);
+    // layer; the user's close still succeeds, but we leave a
+    // tombstone so the executor's post-spawn check can shut down
+    // the eventually-spawned terminal and avoid orphaning the
+    // child process when the tab is already gone.
+    let was_pending = scheduler.cancel(id);
+    if !was_pending {
+        // Either the workspace is already past `Launching` (the
+        // executor's spawn is in flight or just settled) or no
+        // launch was ever enqueued. The first case is the one we
+        // need to handle: drop a tombstone so the executor's
+        // post-spawn check reaps the terminal. The second case is
+        // a harmless no-op — no executor will ever consume the
+        // tombstone, and the entry stays in the set until the
+        // next close-during-launch for the same workspace.
+        terminal_registry.mark_workspace_closed_during_launch(id);
+    }
     // Pull the workspace's tab_id (if any) so we can also clear the
     // pending-launch placeholder. The placeholder only exists for
     // the queued-but-not-yet-spawned window; clearing eagerly avoids

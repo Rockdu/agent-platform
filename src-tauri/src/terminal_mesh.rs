@@ -222,6 +222,14 @@ pub struct TerminalMeshRegistry {
     /// terminal_id exists. `record()` drains the entry when the
     /// real PTY arrives.
     pending_snapshots_by_tab: Arc<StdMutex<HashMap<String, WorkspaceLifecycleSnapshot>>>,
+    /// Workspace ids whose tab was closed while the workspace's
+    /// auto-launch was already `Launching` (i.e. past the cancel
+    /// window). The executor consumes this set after its `Ok`
+    /// branch: if the just-spawned terminal belongs to a workspace
+    /// in this set, the executor shuts it down + forgets the
+    /// retained snapshot so the child process and snapshot don't
+    /// outlive the user's tab.
+    closed_during_launch: Arc<StdMutex<std::collections::HashSet<Uuid>>>,
 }
 
 impl Default for TerminalMeshRegistry {
@@ -238,7 +246,39 @@ impl TerminalMeshRegistry {
             snapshots: Arc::new(StdMutex::new(HashMap::new())),
             snapshot_tab_index: Arc::new(StdMutex::new(HashMap::new())),
             pending_snapshots_by_tab: Arc::new(StdMutex::new(HashMap::new())),
+            closed_during_launch: Arc::new(StdMutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Record that a workspace was closed while its auto-launch
+    /// was past the cancel window (i.e. `Launching`). Idempotent.
+    /// The executor's post-spawn check consumes this entry; if no
+    /// executor ever spawns for the id (e.g. the launch settled
+    /// before close fired but after the scheduler's state read),
+    /// the entry harmlessly stays in the set until the next time
+    /// the same workspace_id is closed during launch. The set is
+    /// keyed by workspace_id rather than tab_id because the
+    /// executor only sees workspace_id at the post-Ok decision
+    /// point.
+    pub fn mark_workspace_closed_during_launch(&self, workspace_id: Uuid) {
+        let mut guard = self
+            .closed_during_launch
+            .lock()
+            .expect("closed_during_launch poisoned");
+        guard.insert(workspace_id);
+    }
+
+    /// Consume the close-during-launch tombstone for
+    /// `workspace_id` if present. Returns `true` when the entry
+    /// was present (so the caller can shut down + forget the
+    /// just-spawned terminal); returns `false` when no close-during-
+    /// launch event was recorded for this workspace.
+    pub fn take_workspace_closed_during_launch(&self, workspace_id: Uuid) -> bool {
+        let mut guard = self
+            .closed_during_launch
+            .lock()
+            .expect("closed_during_launch poisoned");
+        guard.remove(&workspace_id)
     }
 
     /// Install a pending-launch placeholder snapshot keyed by
@@ -2634,6 +2674,35 @@ mod tests {
         assert!(
             !live.pending_launch,
             "no placeholder → live snapshot starts with pending_launch=false"
+        );
+    }
+
+    /// The close-during-launch tombstone is consumed exactly once
+    /// per workspace_id by `take_workspace_closed_during_launch`.
+    /// First `take` returns `true` (the executor performs the
+    /// reap); subsequent `take` returns `false` (no double-reap).
+    /// `mark` is idempotent so two close events on the same
+    /// workspace before any executor consumption collapse to a
+    /// single entry.
+    #[test]
+    fn close_during_launch_tombstone_consume_is_one_shot() {
+        let r = TerminalMeshRegistry::new();
+        let workspace_id = Uuid::new_v4();
+        assert!(
+            !r.take_workspace_closed_during_launch(workspace_id),
+            "no mark yet → take returns false"
+        );
+        r.mark_workspace_closed_during_launch(workspace_id);
+        // Idempotent mark: marking twice does not create a
+        // double-consume requirement on the executor.
+        r.mark_workspace_closed_during_launch(workspace_id);
+        assert!(
+            r.take_workspace_closed_during_launch(workspace_id),
+            "first take returns true so the executor can reap"
+        );
+        assert!(
+            !r.take_workspace_closed_during_launch(workspace_id),
+            "second take returns false; no double-reap"
         );
     }
 

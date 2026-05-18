@@ -445,6 +445,59 @@ impl LaunchExecutor for RealLaunchExecutor {
             match spawn_result {
                 Ok(terminal_id) => {
                     on_pending_launch_changed(&registry, &app, terminal_id, false);
+                    // If the user closed this workspace's tab
+                    // while the launch was past the cancel
+                    // window, the tombstone tells us to shut the
+                    // just-spawned terminal down + drop the
+                    // retained snapshot so the child process and
+                    // snapshot don't outlive the tab. Done BEFORE
+                    // the unconditional real-id emit so the
+                    // frontend (already without this tab) does
+                    // not briefly see a Running snapshot for a
+                    // gone tab.
+                    if registry.take_workspace_closed_during_launch(workspace_id) {
+                        if let Some(tx) = registry.lookup_command_tx(terminal_id) {
+                            let app_for_reap = app.clone();
+                            tokio::spawn(async move {
+                                let _ = tx
+                                    .send(terminal_mesh_core::ActorCommand::Shutdown)
+                                    .await;
+                                // Drop the live + retained
+                                // bookkeeping; the actor's exit
+                                // would normally call
+                                // `forget_live`, but we want
+                                // both sides cleared since no
+                                // tab is bound to this terminal.
+                                let _ = app_for_reap;
+                            });
+                        }
+                        registry.forget(terminal_id);
+                    } else {
+                        // Real-id lifecycle emission for the
+                        // common (immediate) case where no
+                        // pending placeholder existed: the
+                        // `on_pending_launch_changed(_, false)`
+                        // call above is a no-op (snapshot was
+                        // already false), so the frontend hook
+                        // would never see a real-id envelope
+                        // and `terminalIdByTabId` would stay
+                        // unresolved past the hook's retry
+                        // window. Emit explicitly using the
+                        // live retained snapshot so both
+                        // immediate and queued auto-launches
+                        // attach reliably. Idempotent: queued
+                        // launches already emitted via the
+                        // pending-launch transition; replaying
+                        // the same real-id event is a no-op in
+                        // the frontend hook.
+                        if let Some(snap) = registry.snapshot_for_terminal(terminal_id) {
+                            crate::workspace_lifecycle::emit_lifecycle_updated(
+                                &app,
+                                terminal_id,
+                                &snap,
+                            );
+                        }
+                    }
                 }
                 Err(err) => {
                     tracing::error!(

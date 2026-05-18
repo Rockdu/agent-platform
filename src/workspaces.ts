@@ -171,7 +171,16 @@ export type AutoLaunchErrorDto =
   | { kind: "autoLaunchDisabled"; workspaceId: string }
   | { kind: "remoteWorkspaceNotEligible"; workspaceId: string }
   | { kind: "workspaceNotFound"; workspaceId: string }
-  | { kind: "claudeDiscoveryNotReady"; discoveryKind: string; message: string };
+  | { kind: "claudeDiscoveryNotReady"; discoveryKind: string; message: string }
+  /// Frontend-synthesized variant (not produced by the
+  /// backend invoke). When a Remote auto-launch fails
+  /// asynchronously (e.g. SSH unreachable after the user closed
+  /// the dialog), the backend emits a lifecycle envelope with
+  /// `status=Done` + `done_reason` but no real terminal id. The
+  /// frontend detects the stuck-waiting condition and
+  /// synthesizes this DTO so `TerminalMeshView` can exit the
+  /// waiting branch and render the error banner.
+  | { kind: "asyncSpawnFailed"; transportKind: string; doneReason: string };
 
 export function isAutoLaunchErrorDto(value: unknown): value is AutoLaunchErrorDto {
   if (typeof value !== "object" || value === null) return false;
@@ -180,7 +189,8 @@ export function isAutoLaunchErrorDto(value: unknown): value is AutoLaunchErrorDt
     k === "autoLaunchDisabled" ||
     k === "remoteWorkspaceNotEligible" ||
     k === "workspaceNotFound" ||
-    k === "claudeDiscoveryNotReady"
+    k === "claudeDiscoveryNotReady" ||
+    k === "asyncSpawnFailed"
   );
 }
 
