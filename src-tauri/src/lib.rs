@@ -229,6 +229,20 @@ pub(crate) fn auto_launch_command_for_routing(
 /// support log captures the root cause; the user sees the
 /// transport-kind in the rail badge and the Done state in the
 /// pane.
+/// Consume any close-during-launch tombstone for `workspace_id`
+/// without spawning a reap (there is no terminal to reap on
+/// failure paths). Symmetric with the `take` call in the
+/// executor's `Ok` branch — without consuming on failure paths
+/// too, a tombstone set by `close_workspace` during a launch
+/// that subsequently failed would stay in the set and poison
+/// the next successful launch for the same workspace, which
+/// would consume the stale entry and immediately shut down its
+/// terminal. Idempotent: if no tombstone is present the take
+/// returns false and this is a no-op.
+fn discard_close_tombstone_for(registry: &TerminalMeshRegistry, workspace_id: uuid::Uuid) {
+    let _ = registry.take_workspace_closed_during_launch(workspace_id);
+}
+
 fn surface_auto_launch_async_failure(
     app: &tauri::AppHandle,
     registry: &TerminalMeshRegistry,
@@ -302,6 +316,7 @@ impl LaunchExecutor for RealLaunchExecutor {
                     &tab_id,
                     crate::workspace_lifecycle::TransportKind::Local,
                 );
+                discard_close_tombstone_for(&registry, workspace_id);
                 if let Some(sched) = scheduler {
                     sched.notify_launch_settled(workspace_id);
                 }
@@ -356,6 +371,7 @@ impl LaunchExecutor for RealLaunchExecutor {
                             &tab_id,
                             crate::workspace_lifecycle::TransportKind::Ssh,
                         );
+                        discard_close_tombstone_for(&registry, workspace_id);
                         if let Some(sched) = scheduler {
                             sched.notify_launch_settled(workspace_id);
                         }
@@ -393,6 +409,7 @@ impl LaunchExecutor for RealLaunchExecutor {
                                 &tab_id,
                                 crate::workspace_lifecycle::TransportKind::Ssh,
                             );
+                            discard_close_tombstone_for(&registry, workspace_id);
                             if let Some(sched) = scheduler {
                                 sched.notify_launch_settled(workspace_id);
                             }
@@ -413,6 +430,7 @@ impl LaunchExecutor for RealLaunchExecutor {
                             &tab_id,
                             crate::workspace_lifecycle::TransportKind::SshDocker,
                         );
+                        discard_close_tombstone_for(&registry, workspace_id);
                         if let Some(sched) = scheduler {
                             sched.notify_launch_settled(workspace_id);
                         }
@@ -450,6 +468,7 @@ impl LaunchExecutor for RealLaunchExecutor {
                                 &tab_id,
                                 crate::workspace_lifecycle::TransportKind::SshDocker,
                             );
+                            discard_close_tombstone_for(&registry, workspace_id);
                             if let Some(sched) = scheduler {
                                 sched.notify_launch_settled(workspace_id);
                             }
@@ -537,6 +556,7 @@ impl LaunchExecutor for RealLaunchExecutor {
                             crate::workspace_lifecycle::TransportKind::SshDocker,
                     };
                     surface_auto_launch_async_failure(&app, &registry, &tab_id, kind);
+                    discard_close_tombstone_for(&registry, workspace_id);
                 }
             }
             if let Some(sched) = scheduler {
@@ -911,5 +931,35 @@ mod tests {
             std::path::PathBuf::from("claude"),
             "Remote Docker routing uses bare `claude` so remote PATH resolves"
         );
+    }
+
+    /// The discard helper consumes the tombstone idempotently:
+    /// the first call after `mark` returns true through
+    /// `take_workspace_closed_during_launch` (and the discard
+    /// just throws away the bool); subsequent calls are no-ops.
+    /// This is the symmetry the executor relies on to ensure
+    /// every settle path (Ok + 6 failure branches) leaves the
+    /// tombstone set empty.
+    #[test]
+    fn discard_close_tombstone_for_consumes_when_present_and_is_idempotent() {
+        let r = TerminalMeshRegistry::new();
+        let workspace_id = uuid::Uuid::new_v4();
+        // No tombstone yet: discard is a no-op (the underlying
+        // `take` returns false; discard does not panic).
+        discard_close_tombstone_for(&r, workspace_id);
+        assert!(
+            !r.take_workspace_closed_during_launch(workspace_id),
+            "no-op discard must leave the set empty"
+        );
+        // Mark + discard: tombstone is consumed.
+        r.mark_workspace_closed_during_launch(workspace_id);
+        discard_close_tombstone_for(&r, workspace_id);
+        assert!(
+            !r.take_workspace_closed_during_launch(workspace_id),
+            "after discard the tombstone is gone"
+        );
+        // Idempotent: discarding again is still a no-op.
+        discard_close_tombstone_for(&r, workspace_id);
+        assert!(!r.take_workspace_closed_during_launch(workspace_id));
     }
 }

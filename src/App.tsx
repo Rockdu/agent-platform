@@ -1453,6 +1453,22 @@ function MultiTerminalContainer() {
               } else {
                 console.warn("auto-launch enqueue failed", err);
               }
+              // Synchronous enqueue rejection (e.g. local
+              // ClaudeDiscoveryNotReady, AutoLaunchDisabled,
+              // workspace-not-found) means no scheduler-owned
+              // terminal will ever attach for this tab. Clear
+              // the waiting flag so the view exits the
+              // waiting branch — the typed-error banner (or
+              // the empty placeholder for the catch-all)
+              // takes over. Without this, the tab keeps
+              // showing 等待 claude 启动… indefinitely.
+              setTabs((prev) =>
+                prev.map((t) =>
+                  t.tabId === tabId
+                    ? { ...t, awaitingAutoLaunch: false }
+                    : t,
+                ),
+              );
             },
           );
         }

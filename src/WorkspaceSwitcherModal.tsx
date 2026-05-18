@@ -16,6 +16,7 @@ import {
   type IdeHandoffErrorDto,
 } from "./ide-handoff";
 import { IdePreferencePane } from "./IdePreferencePane";
+import { parseStrictPort } from "./parse-strict-port";
 
 type SwitcherMode = "create" | "recent" | "settings";
 
@@ -179,16 +180,21 @@ export function WorkspaceSwitcherModal({
         }
         let port: number | null = null;
         if (source.port.trim() !== "") {
-          const parsed = Number.parseInt(source.port.trim(), 10);
-          if (!Number.isFinite(parsed) || parsed < 1 || parsed > 65535) {
+          // Reject partial decimals like "22abc" (parseInt
+          // accepts as 22) or "1.5" (parseInt accepts as 1).
+          // The strict helper only succeeds when the trimmed
+          // string is entirely digits and parses into the
+          // valid port range.
+          const result = parseStrictPort(source.port);
+          if (!result.ok) {
             setError({
               kind: "remoteFieldInvalid",
               field: "port",
-              reason: "端口需在 1..=65535 范围内",
+              reason: "端口需为 1..=65535 的整数（仅十进制数字）",
             });
             return;
           }
-          port = parsed;
+          port = result.port;
         }
         const userTrimmed = source.user.trim();
         const containerId = source.containerEnabled
