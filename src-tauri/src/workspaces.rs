@@ -1277,7 +1277,7 @@ pub fn open_workspace(
 }
 
 #[tauri::command]
-pub fn close_workspace(
+pub async fn close_workspace(
     workspace_id: String,
     registry: State<'_, WorkspaceRegistry>,
     scheduler: State<'_, crate::workspace_launch_scheduler::WorkspaceLaunchScheduler>,
