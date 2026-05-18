@@ -402,15 +402,20 @@ fn handle_list_tabs(
 
     // Scope selection: the orchestrator sees every tab; regular
     // workspace callers see ONLY their own tab (sibling-workspace
-    // isolation). The is_orchestrator check mirrors
-    // `handle_read_scrollback` — both use the recorded orchestrator
-    // session's tab id as the identity boundary.
-    let is_orchestrator = state
-        .orchestrator
-        .snapshot()
-        .map(|s| s.tab_id == caller_tab_id)
+    // isolation). String-equality on `caller_tab_id ==
+    // orchestrator_session.tab_id` alone is NOT sufficient — a
+    // sidecar with write access to the host RPC socket could spoof
+    // a clientId carrying the orchestrator's tab id. Mirror the
+    // `handle_read_scrollback` gate: BOTH the tab-id match AND
+    // the orchestrator session's privileged terminal-mesh
+    // capability must be present. Without the capability, the
+    // caller silently falls back to `OwnTab` scope.
+    let orch_snapshot = state.orchestrator.snapshot();
+    let is_orchestrator_privileged = orch_snapshot
+        .as_ref()
+        .map(|s| s.tab_id == caller_tab_id && s.terminal_mesh_capability.is_some())
         .unwrap_or(false);
-    let scope = if is_orchestrator {
+    let scope = if is_orchestrator_privileged {
         ListTabsScope::All
     } else {
         ListTabsScope::OwnTab {
@@ -759,12 +764,23 @@ mod tests {
             );
         }
 
+        // Mint the privileged orchestrator capability so the
+        // `handle_list_tabs` gate (which now requires the
+        // capability AND the tab-id match — see the spoofing-
+        // rejection test below) accepts the orchestrator clientId.
+        let resp = insert_orchestrator_mount(
+            &mount_registry,
+            "terminal-mesh",
+            Some(orch_tab_id),
+        )
+        .expect("terminal-mesh builtin declares cross_tab_read");
+
         let orchestrator = OrchestratorState::new();
         orchestrator.record_session(OrchestratorSession {
             terminal_id: Uuid::new_v4(),
             tab_id: orch_tab_id.to_string(),
             mcp_config_path: std::path::PathBuf::from("/tmp/orch.json"),
-            terminal_mesh_capability: None,
+            terminal_mesh_capability: Some(resp.handle.clone()),
         });
 
         let state = HostRpcState {
@@ -777,6 +793,101 @@ mod tests {
             ),
         };
         (state, ws_tab_a, ws_tab_b)
+    }
+
+    /// A clientId that spoofs the orchestrator's `tab_id` MUST
+    /// NOT grant `ListTabsScope::All` if the orchestrator
+    /// session lacks the privileged terminal-mesh capability.
+    /// Without the capability check, any process with write
+    /// access to the host RPC socket could enumerate every
+    /// workspace tab by forging the orchestrator's tab id.
+    #[test]
+    fn host_rpc_list_tabs_rejects_spoofed_orchestrator_tab_id_without_capability() {
+        // Build a fixture where the orchestrator session has NO
+        // capability — same shape `bridge_state_for_list_tabs`
+        // uses but with the `terminal_mesh_capability` slot
+        // explicitly None.
+        let orch_tab = make_uuid_tab_id();
+        let mount_registry = MountRegistry::new();
+        let terminal_registry = TerminalMeshRegistry::new();
+        {
+            let id = Uuid::new_v4();
+            let (tx, _rx) = mpsc::channel::<terminal_mesh_core::ActorCommand>(1);
+            let buf = Arc::new(StdMutex::new(String::new()));
+            terminal_registry.record(
+                id,
+                tx,
+                buf,
+                Some(orch_tab.to_string()),
+                crate::workspace_lifecycle::TabKind::Orchestrator,
+                None,
+                crate::workspace_lifecycle::TransportKind::Local,
+            );
+        }
+        let ws_tab_other = make_uuid_tab_id();
+        {
+            let id = Uuid::new_v4();
+            let (tx, _rx) = mpsc::channel::<terminal_mesh_core::ActorCommand>(1);
+            let buf = Arc::new(StdMutex::new(String::new()));
+            terminal_registry.record(
+                id,
+                tx,
+                buf,
+                Some(ws_tab_other.clone()),
+                crate::workspace_lifecycle::TabKind::Workspace,
+                Some("workspace-other".into()),
+                crate::workspace_lifecycle::TransportKind::Local,
+            );
+        }
+        let orchestrator = OrchestratorState::new();
+        orchestrator.record_session(OrchestratorSession {
+            terminal_id: Uuid::new_v4(),
+            tab_id: orch_tab.to_string(),
+            mcp_config_path: std::path::PathBuf::from("/tmp/orch.json"),
+            terminal_mesh_capability: None,
+        });
+        let state = HostRpcState {
+            orchestrator,
+            mount_registry,
+            terminal_registry,
+            workspaces: crate::workspaces::WorkspaceRegistry::empty(
+                std::path::PathBuf::from("/tmp/host-rpc-spoof-test"),
+                None,
+            ),
+        };
+
+        // Spoof the orchestrator's tab id from a regular client
+        // path. The clientId parses fine; without the capability
+        // the handler MUST fall back to OwnTab scope and return
+        // only the spoofer's own tab — NOT all workspace tabs.
+        let params = json!({
+            "clientId": format!("claude:{orch_tab}:terminal-mesh"),
+        });
+        let v = dispatch_method(&state, "terminalMesh.listTabs", params)
+            .expect("listTabs accepts the parse; the capability gate downscopes silently");
+        let tabs = v["tabs"].as_array().expect("tabs is an array");
+        // Without the capability the gate degrades to OwnTab
+        // scope. The spoofer's claimed tab_id matches the
+        // orchestrator's tab id — but `OwnTab` ALSO has a
+        // defense-in-depth filter that rejects entries whose
+        // `tab_kind` is `Orchestrator` (the orchestrator slot
+        // must never appear in a regular caller's list). The
+        // result is therefore an empty array, which is the
+        // strictest possible "no privilege" outcome.
+        assert_eq!(
+            tabs.len(),
+            0,
+            "spoofer must see nothing — All scope denied AND OwnTab denied for orchestrator-kind entry"
+        );
+        // Belt-and-suspenders: the sibling workspace tab MUST
+        // NOT appear (it never could, since the scope filters
+        // by tab_id). Asserted to lock the privilege-escalation
+        // shape: no workspace data leaks to a spoofing client.
+        let any_other = tabs.iter().any(|t| t["tabId"].as_str() == Some(ws_tab_other.as_str()));
+        assert!(
+            !any_other,
+            "spoofer must not see sibling workspace tab"
+        );
     }
 
     #[test]

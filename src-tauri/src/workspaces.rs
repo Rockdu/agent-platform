@@ -546,6 +546,21 @@ impl WorkspaceRegistry {
         guard.records.get(&workspace_id).cloned()
     }
 
+    /// Public projection of `RegistryInner::find_remote_duplicate`
+    /// for callers (e.g. the preflight `try_register_remote_*`
+    /// helper) that need to fast-reject duplicate identity tuples
+    /// BEFORE running a slow network probe. The registry's
+    /// `register_remote_workspace` method still enforces the
+    /// same check at insert time as defense in depth.
+    pub fn find_remote_duplicate(
+        &self,
+        ssh: &SshLocation,
+        container: Option<&ContainerLocation>,
+    ) -> Option<WorkspaceRecord> {
+        let guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
+        guard.find_remote_duplicate(ssh, container).cloned()
+    }
+
     /// Test-only helper used by sibling-crate tests (e.g. the
     /// host_rpc bridge tests) to seed a workspace record without
     /// touching disk or going through the validation-heavy create
@@ -1048,6 +1063,20 @@ pub fn try_register_remote_workspace_with_probe(
     validate_workspace_name(name).map_err(|e| WorkspaceErrorDto::from(&e))?;
     validate_remote_fields(&ssh, container.as_ref())
         .map_err(|e| WorkspaceErrorDto::from(&e))?;
+    // Fast-reject identity-tuple duplicates BEFORE running the
+    // network probe. Without this ordering, registering an
+    // already-known workspace whose endpoint is unreachable or
+    // slow would surface as a 5-10s `RemoteProbeFailed` instead
+    // of an immediate `CanonicalDuplicate` — and would waste a
+    // network round-trip for a record that cannot be added
+    // anyway. The downstream `register_remote_workspace` keeps
+    // the same check at insert time for defense in depth.
+    if let Some(dup) = registry.find_remote_duplicate(&ssh, container.as_ref()) {
+        return Err(WorkspaceErrorDto::CanonicalDuplicate {
+            existing_workspace_id: dup.workspace_id.to_string(),
+            existing_name: dup.name.clone(),
+        });
+    }
     let probe_location = WorkspaceLocation::Remote {
         ssh: ssh.clone(),
         container: container.clone(),
@@ -2432,5 +2461,78 @@ mod tests {
             .filter(|r| matches!(r.location, WorkspaceLocation::Remote { .. }))
             .count();
         assert_eq!(remote_count, 1, "successful probe must persist exactly one Remote record");
+    }
+
+    /// Stub transport whose `probe` PANICS if called. Lets the
+    /// dedup-before-probe test prove the duplicate check fires
+    /// BEFORE the network round-trip — if the helper called
+    /// probe even once, the test panics with the explanatory
+    /// message.
+    struct PanicOnProbeTransport;
+    impl terminal_mesh_core::transport::Transport for PanicOnProbeTransport {
+        fn spawn(
+            &self,
+            _request: terminal_mesh_core::transport::TransportSpawnRequest,
+        ) -> Result<
+            Box<dyn terminal_mesh_core::transport::TransportSession>,
+            terminal_mesh_core::transport::TransportError,
+        > {
+            panic!("spawn must not be called in the dedup-before-probe test");
+        }
+        fn probe(
+            &self,
+            _workspace: terminal_mesh_core::transport::WorkspaceLocation,
+        ) -> Result<(), terminal_mesh_core::transport::TransportError> {
+            panic!(
+                "probe must not be called for a duplicate Remote identity tuple — dedup gate failed"
+            );
+        }
+    }
+
+    /// Registering a Remote workspace whose identity tuple is
+    /// already known MUST return `CanonicalDuplicate` without
+    /// running the SSH probe. Otherwise users with the same
+    /// workspace already registered would wait for a slow
+    /// transport probe failure (5-10s SSH timeout) before
+    /// seeing the duplicate error — and would pay an
+    /// unnecessary network round-trip for a record that cannot
+    /// be added.
+    #[test]
+    fn try_register_remote_with_duplicate_returns_canonical_duplicate_without_probing() {
+        let (_storage, _home, reg) = fresh_registry();
+        let ssh = SshLocation {
+            user: Some("alice".into()),
+            host: "h.example".into(),
+            port: Some(22),
+            canonical_remote_path: "/srv".into(),
+        };
+        // Seed the existing duplicate.
+        let first = reg
+            .register_remote_workspace("first", ssh.clone(), None, true)
+            .expect("seed");
+        // Attempt the second registration with the same tuple,
+        // using the panic-on-probe stub. If the helper called
+        // probe (i.e. ordering bug), the panic surfaces here.
+        let stub = PanicOnProbeTransport;
+        let err = try_register_remote_workspace_with_probe(
+            "second",
+            ssh,
+            None,
+            true,
+            &reg,
+            &stub,
+            "ssh",
+        )
+        .expect_err("duplicate must be rejected before probe runs");
+        match err {
+            WorkspaceErrorDto::CanonicalDuplicate {
+                existing_workspace_id,
+                existing_name,
+            } => {
+                assert_eq!(existing_workspace_id, first.workspace_id.to_string());
+                assert_eq!(existing_name, "first");
+            }
+            other => panic!("expected CanonicalDuplicate; got {other:?}"),
+        }
     }
 }

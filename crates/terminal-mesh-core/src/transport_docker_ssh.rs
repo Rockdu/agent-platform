@@ -117,12 +117,23 @@ fn build_docker_wrapper_script(
     }
     match optional_exec {
         None => {
-            script.push_str("if [ \"$status\" -eq 0 ]; then if [ -n \"$SHELL\" ] && [ -x \"$SHELL\" ]; then \"$SHELL\" -l; status=$?; else /bin/sh -l; status=$?; fi; fi\n");
+            // `exec` the login shell so the wrapper PID
+            // (already written to the PID file) becomes the live
+            // foreground shell process — not a parent shell with
+            // a TERM trap. The cleanup sends SIGKILL to that PID
+            // directly, hard-killing the user-facing shell (and
+            // any foreground child like `claude`) without giving
+            // the trap a chance to intercept.
+            script.push_str("if [ \"$status\" -eq 0 ]; then if [ -n \"$SHELL\" ] && [ -x \"$SHELL\" ]; then exec \"$SHELL\" -l; else exec /bin/sh -l; fi; fi\n");
         }
         Some(cmd) => {
-            // Same shell-quote-and-exec pattern as the SSH wrapper.
+            // Same shell-quote-and-exec pattern as the SSH
+            // wrapper; the `exec` prefix replaces the wrapper
+            // shell with the requested program so the PID file
+            // references the live process and SIGKILL on cleanup
+            // hard-kills it without going through a trap.
             let program = shell_single_quote(&cmd.program.display().to_string());
-            let mut line = program;
+            let mut line = format!("exec {program}");
             for a in &cmd.args {
                 line.push(' ');
                 line.push_str(&shell_single_quote(a));
@@ -232,11 +243,17 @@ pub fn docker_phase_a_classifier(container_id: String) -> PhaseAClassifier {
 /// Compose the cleanup command sent over the same ControlMaster on
 /// `shutdown(Kill)`. The container is NEVER stopped — this just
 /// signals the wrapper process inside the existing container and
-/// removes the PID file.
+/// removes the PID file. Uses `kill -9` (SIGKILL): the wrapper
+/// `exec`s into the user-facing login shell (or the explicit
+/// program), so the PID references the live foreground process.
+/// SIGKILL is uncatchable, bypassing any trap the inner program
+/// may install — necessary to guarantee the no-orphan cleanup
+/// contract even when the foreground process holds CPU or
+/// installs its own signal handlers.
 pub fn compose_docker_cleanup_command(container_id: &str, session_id: &str) -> String {
     let pid_file = wrapper_pid_file_for(session_id);
     let inner = format!(
-        "kill \"$(cat {pid_quoted})\" 2>/dev/null || true; rm -f {pid_quoted}",
+        "kill -9 \"$(cat {pid_quoted})\" 2>/dev/null || true; rm -f {pid_quoted}",
         pid_quoted = shell_single_quote(&pid_file),
     );
     format!(
@@ -732,6 +749,56 @@ mod tests {
         assert!(cmd.contains("kill"));
         assert!(cmd.contains("/tmp/agentmesh-wrapper-sess-1.pid"));
         assert!(cmd.contains("rm -f"));
+    }
+
+    /// The cleanup MUST use SIGKILL (`kill -9`) so the wrapper-
+    /// `exec`'d foreground process cannot intercept the signal
+    /// via a user-installed trap. SIGTERM would let a trap run a
+    /// cleanup-pid-file rm and exit zero, but leave any spawned
+    /// children in the container alive — violating the no-orphan
+    /// cleanup contract.
+    #[test]
+    fn compose_docker_cleanup_command_uses_sigkill_not_sigterm() {
+        let cmd = compose_docker_cleanup_command("my-container", "sess-1");
+        assert!(
+            cmd.contains("kill -9"),
+            "cleanup must send SIGKILL (kill -9), not SIGTERM; got:\n{cmd}"
+        );
+    }
+
+    /// The wrapper's login-shell branch MUST use `exec` so the
+    /// wrapper shell is REPLACED by the user-facing login shell.
+    /// Without `exec`, the wrapper PID would reference the
+    /// parent shell with the TERM trap installed and the inner
+    /// shell would survive cleanup.
+    #[test]
+    fn docker_wrapper_login_shell_branch_uses_exec() {
+        let script = build_docker_wrapper_script("sess-x", None, None);
+        assert!(
+            script.contains("exec \"$SHELL\" -l"),
+            "login-shell branch must use exec; got:\n{script}"
+        );
+        assert!(
+            script.contains("exec /bin/sh -l"),
+            "fallback login-shell branch must also use exec; got:\n{script}"
+        );
+    }
+
+    /// Equivalent for the explicit-exec branch: the program is
+    /// invoked via `exec` so the PID file references the live
+    /// program (e.g. `claude`) and SIGKILL hard-kills it.
+    #[test]
+    fn docker_wrapper_explicit_exec_branch_uses_exec_prefix() {
+        use crate::transport::ShellCommand;
+        let cmd = ShellCommand {
+            program: std::path::PathBuf::from("/usr/bin/claude"),
+            args: vec!["--dangerously-skip-permissions".into()],
+        };
+        let script = build_docker_wrapper_script("sess-y", None, Some(&cmd));
+        assert!(
+            script.contains("exec '/usr/bin/claude'"),
+            "explicit-exec branch must prefix the program with `exec`; got:\n{script}"
+        );
     }
 
     /// Spec §5.4: NEVER `docker stop`, `docker run`, `docker start`,
