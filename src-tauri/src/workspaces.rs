@@ -883,12 +883,13 @@ pub fn validate_canonical_remote_path(path: &str) -> Result<(), WorkspaceError> 
     }
     // Non-root: split on `/`. The leading `/` produces an empty
     // first segment which we skip; every other segment must be
-    // non-empty AND must not be `.` or `..`.
+    // non-empty AND must not be `.` or `..`. Because `path != "/"`
+    // and `path.starts_with('/')`, at least one further segment
+    // exists, so the loop runs at least once.
     let mut iter = path.split('/');
     // First segment from the leading `/` is always empty by
     // construction; consume it.
     let _ = iter.next();
-    let mut prev_was_segment = false;
     for segment in iter {
         if segment.is_empty() {
             return Err(WorkspaceError::RemoteFieldInvalid {
@@ -902,16 +903,6 @@ pub fn validate_canonical_remote_path(path: &str) -> Result<(), WorkspaceError> 
                 reason: "canonical remote path must not contain `.` or `..` segments".into(),
             });
         }
-        prev_was_segment = true;
-    }
-    if !prev_was_segment {
-        // Defensive: a path like "/" hit the early return above,
-        // so we should never get here with no segments. Surface
-        // the same not-empty error to be safe.
-        return Err(WorkspaceError::RemoteFieldInvalid {
-            field: "canonicalRemotePath".into(),
-            reason: "canonical remote path must not be empty".into(),
-        });
     }
     Ok(())
 }

@@ -1470,7 +1470,10 @@ function MultiTerminalContainer() {
         setTabs((prev) => {
           if (prev.some((t) => t.workspaceId === refreshed.workspaceId)) {
             isNewTab = false;
-            tabsRef.current = prev;
+            // No mirror write needed — `tabsRef.current` already
+            // matches `prev` (every other setTabs updater syncs
+            // it inline; the useEffect fallback below also
+            // commits the same value).
             return prev;
           }
           const next: OpenTab[] = [
