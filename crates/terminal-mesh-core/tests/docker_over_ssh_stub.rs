@@ -510,3 +510,149 @@ fn docker_transport_runs_requested_command_when_provided() {
         "exec mode must not fall through to the login-shell branch; got:\n{argv}"
     );
 }
+
+/// Interactive Docker shell tabs reach the dispatcher with an
+/// empty `ShellCommand`. The wrapper must take the login-shell
+/// branch inside the `docker exec -it <container> /bin/sh -lc
+/// '...'` envelope. Mirror of
+/// `ssh_transport_runs_login_shell_when_command_is_empty` from
+/// the SSH stub suite, but pinned at the Docker envelope level.
+#[test]
+fn docker_transport_runs_login_shell_when_command_is_empty() {
+    let tmp = TempDir::new().unwrap();
+    let recorder = tmp.path().join("argv.log");
+    let t = docker_transport(
+        &tmp,
+        &recorder,
+        "printf '\\033]1338;am-shell-started\\a'\nprintf '\\033]1338;am-exit-status;0\\a'\nexit 0\n",
+    );
+    let req = TransportSpawnRequest {
+        workspace: WorkspaceLocation::Remote {
+            user: Some("alice".into()),
+            host: "h.example".into(),
+            port: Some(2222),
+            canonical_remote_path: "/srv".into(),
+            container: Some(ContainerLocation {
+                container_id: "my-container".into(),
+                cwd_in_container: None,
+            }),
+        },
+        command: ShellCommand {
+            program: std::path::PathBuf::new(),
+            args: vec![],
+        },
+        initial_size: terminal_mesh_core::transport::PtySize { cols: 80, rows: 24 },
+        env: BTreeMap::new(),
+        cwd: None,
+    };
+    let mut session = t.spawn(req).expect("spawn ok");
+    let status = session.wait().expect("wait");
+    assert!(
+        matches!(status, TransportExitStatus::CleanCompletion),
+        "expected CleanCompletion, got {status:?}"
+    );
+    session.cleanup().expect("cleanup");
+
+    let argv = read_recorder(&recorder);
+    assert!(
+        argv.contains("\"$SHELL\" -l"),
+        "docker wrapper must take the login-shell branch when command is empty; got:\n{argv}"
+    );
+    assert!(
+        argv.contains("docker exec -it"),
+        "wrapper must still be inside the docker exec envelope; got:\n{argv}"
+    );
+    assert!(
+        argv.contains("my-container"),
+        "wrapper must target the configured container; got:\n{argv}"
+    );
+    assert!(
+        !argv.contains("/bin/zsh") && !argv.contains("/bin/bash"),
+        "wrapper must NOT contain a caller-supplied local shell path; got:\n{argv}"
+    );
+}
+
+/// `probe` on a reachable Docker workspace must return `Ok(())`.
+/// The recorder stub mimics a clean lifecycle: shell-started +
+/// exit-status sentinels + exit 0.
+#[test]
+fn docker_transport_probe_succeeds_for_reachable_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let recorder = tmp.path().join("argv.log");
+    let t = docker_transport(
+        &tmp,
+        &recorder,
+        "printf '\\033]1338;am-shell-started\\a'\nprintf '\\033]1338;am-exit-status;0\\a'\nexit 0\n",
+    );
+    let workspace = WorkspaceLocation::Remote {
+        user: Some("alice".into()),
+        host: "h.example".into(),
+        port: Some(2222),
+        canonical_remote_path: "/srv".into(),
+        container: Some(ContainerLocation {
+            container_id: "my-container".into(),
+            cwd_in_container: None,
+        }),
+    };
+    t.probe(workspace).expect("probe must accept a reachable container");
+}
+
+/// `probe` MUST surface `DockerContainerMissing` when the
+/// docker exec stderr matches the `No such container` pattern
+/// the Docker-aware Phase-A classifier recognizes.
+#[test]
+fn docker_transport_probe_returns_typed_container_missing_error() {
+    let tmp = TempDir::new().unwrap();
+    let recorder = tmp.path().join("argv.log");
+    let t = docker_transport(
+        &tmp,
+        &recorder,
+        "printf 'Error response from daemon: No such container: missing-id\\n' >&2\nexit 1\n",
+    );
+    let workspace = WorkspaceLocation::Remote {
+        user: Some("alice".into()),
+        host: "h.example".into(),
+        port: Some(2222),
+        canonical_remote_path: "/srv".into(),
+        container: Some(ContainerLocation {
+            container_id: "missing-id".into(),
+            cwd_in_container: None,
+        }),
+    };
+    match t.probe(workspace) {
+        Ok(()) => panic!("probe must reject missing container"),
+        Err(TransportError::DockerContainerMissing { container }) => {
+            assert_eq!(container, "missing-id");
+        }
+        Err(other) => panic!("expected DockerContainerMissing; got {other:?}"),
+    }
+}
+
+/// `probe` MUST surface `DockerExecFailed` when the remote
+/// stderr matches `docker: command not found` (one of the
+/// patterns the Docker-aware classifier recognizes).
+#[test]
+fn docker_transport_probe_returns_typed_exec_failed_when_docker_missing() {
+    let tmp = TempDir::new().unwrap();
+    let recorder = tmp.path().join("argv.log");
+    let t = docker_transport(
+        &tmp,
+        &recorder,
+        "printf 'sh: 1: docker: command not found\\n' >&2\nexit 127\n",
+    );
+    let workspace = WorkspaceLocation::Remote {
+        user: Some("alice".into()),
+        host: "h.example".into(),
+        port: Some(2222),
+        canonical_remote_path: "/srv".into(),
+        container: Some(ContainerLocation {
+            container_id: "my-container".into(),
+            cwd_in_container: None,
+        }),
+    };
+    match t.probe(workspace) {
+        Ok(()) => panic!("probe must reject missing docker binary"),
+        Err(TransportError::DockerExecFailed { .. }) => {}
+        Err(other) => panic!("expected DockerExecFailed; got {other:?}"),
+    }
+}

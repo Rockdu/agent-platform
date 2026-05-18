@@ -68,7 +68,8 @@ export type WorkspaceErrorDto =
   | { kind: "notFound"; workspaceId: string }
   | { kind: "alreadyOpen"; existingTabId: string }
   | { kind: "io"; context: string; message: string }
-  | { kind: "remoteFieldInvalid"; field: string; reason: string };
+  | { kind: "remoteFieldInvalid"; field: string; reason: string }
+  | { kind: "remoteProbeFailed"; phase: string; reason: string };
 
 export function isWorkspaceErrorDto(value: unknown): value is WorkspaceErrorDto {
   if (typeof value !== "object" || value === null) return false;
@@ -81,7 +82,8 @@ export function isWorkspaceErrorDto(value: unknown): value is WorkspaceErrorDto 
     k === "notFound" ||
     k === "alreadyOpen" ||
     k === "io" ||
-    k === "remoteFieldInvalid"
+    k === "remoteFieldInvalid" ||
+    k === "remoteProbeFailed"
   );
 }
 

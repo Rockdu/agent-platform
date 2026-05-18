@@ -46,6 +46,8 @@ export function _probe_error_dto_discrimination(e: WorkspaceErrorDto): string {
       return `io:${e.context}:${e.message}`;
     case "remoteFieldInvalid":
       return `remoteFieldInvalid:${e.field}:${e.reason}`;
+    case "remoteProbeFailed":
+      return `remoteProbeFailed:${e.phase}:${e.reason}`;
   }
 }
 

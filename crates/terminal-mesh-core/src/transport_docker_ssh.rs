@@ -342,6 +342,18 @@ impl Transport for DockerOverSshTransport {
             cleanup_done: Mutex::new(false),
         }))
     }
+
+    /// Reachability probe: dispatch the same docker-over-SSH spawn
+    /// path with an explicit `/bin/sh -lc ':'` no-op command, wait
+    /// for the remote `docker exec` to exit cleanly, and return
+    /// `Ok(())` on completion. The Docker-aware Phase-A classifier
+    /// (`No such container` → `DockerContainerMissing`,
+    /// `docker: command not found` → `DockerExecFailed`, etc.)
+    /// already wraps `spawn`, so probe errors surface as the
+    /// matching typed `TransportError` variants.
+    fn probe(&self, workspace: WorkspaceLocation) -> Result<(), TransportError> {
+        crate::transport::probe_via_spawn(self, workspace)
+    }
 }
 
 pub struct DockerOverSshTransportSession {

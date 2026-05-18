@@ -711,5 +711,7 @@ function renderErrorMessage(error: WorkspaceErrorDto): string {
       return `IO 错误 (${error.context}): ${error.message}`;
     case "remoteFieldInvalid":
       return `远程字段 ${error.field} 无效: ${error.reason}`;
+    case "remoteProbeFailed":
+      return `远程连接预检失败 (${error.phase}): ${error.reason}`;
   }
 }

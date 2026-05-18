@@ -203,6 +203,21 @@ pub trait Transport: Send + Sync {
         &self,
         request: TransportSpawnRequest,
     ) -> Result<Box<dyn TransportSession>, TransportError>;
+
+    /// Lightweight reachability check used by the workspace
+    /// registration flow to validate auth / connect / remote path /
+    /// container reachability BEFORE persisting a record. Returns
+    /// `Ok(())` when the target is reachable; returns the same
+    /// typed `TransportError` variants the spawn path would
+    /// produce so the registration command can reuse the existing
+    /// typed mapping. The default implementation returns
+    /// `Protocol` so test stubs that do not implement reachability
+    /// checks fail loudly rather than silently passing.
+    fn probe(&self, _workspace: WorkspaceLocation) -> Result<(), TransportError> {
+        Err(TransportError::Protocol {
+            message: "transport does not implement probe".into(),
+        })
+    }
 }
 
 pub trait TransportSession: Send {
@@ -228,6 +243,44 @@ pub trait TransportSession: Send {
 
 pub trait TransportShutdownHandle: Send + Sync {
     fn shutdown(&self, mode: ShutdownMode) -> Result<(), TransportError>;
+}
+
+/// Shared reachability check used by `SshTransport::probe` and
+/// `DockerOverSshTransport::probe`. Dispatches the transport's
+/// own `spawn` with an explicit `/bin/sh -lc ':'` no-op command,
+/// waits for the remote side to exit cleanly, and returns
+/// `Ok(())` on `CleanCompletion`. Pre-shell-phase failures
+/// (typed `TransportError` from the spawn call) propagate
+/// through unchanged so the caller can map them to user-facing
+/// DTOs; post-shell exits with non-zero status surface as a
+/// generic `Protocol` error since the probe command is a no-op
+/// and any non-zero would indicate the remote shell is broken.
+pub(crate) fn probe_via_spawn(
+    transport: &dyn Transport,
+    workspace: WorkspaceLocation,
+) -> Result<(), TransportError> {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    let request = TransportSpawnRequest {
+        workspace,
+        command: ShellCommand {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-lc".into(), ":".into()],
+        },
+        initial_size: PtySize { cols: 80, rows: 24 },
+        env: BTreeMap::new(),
+        cwd: None,
+    };
+    let mut session = transport.spawn(request)?;
+    let wait_result = session.wait();
+    let _ = session.cleanup();
+    match wait_result? {
+        TransportExitStatus::CleanCompletion => Ok(()),
+        other => Err(TransportError::Protocol {
+            message: format!("remote probe did not exit cleanly: {other:?}"),
+        }),
+    }
 }
 
 pub trait TransportResizeHandle: Send + Sync {
@@ -320,6 +373,31 @@ impl Transport for LocalTransport {
             writer: Some(writer),
             disconnect_reason: None,
         }))
+    }
+
+    /// Local-side probe: confirm the workspace directory exists.
+    /// Remote workspaces are a routing bug (the registration flow
+    /// must route them to SSH / Docker-over-SSH) and surface as
+    /// `Protocol`, mirroring `spawn`'s defensive rejection.
+    fn probe(&self, workspace: WorkspaceLocation) -> Result<(), TransportError> {
+        match workspace {
+            WorkspaceLocation::Local { path: Some(p) } => {
+                if p.exists() {
+                    Ok(())
+                } else {
+                    Err(TransportError::Io {
+                        message: format!(
+                            "local workspace directory does not exist: {}",
+                            p.display()
+                        ),
+                    })
+                }
+            }
+            WorkspaceLocation::Local { path: None } => Ok(()),
+            WorkspaceLocation::Remote { .. } => Err(TransportError::Protocol {
+                message: "LocalTransport cannot probe a Remote workspace".into(),
+            }),
+        }
     }
 }
 

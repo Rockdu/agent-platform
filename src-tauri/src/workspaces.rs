@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
 const WORKSPACES_FILENAME: &str = "workspaces.json";
@@ -195,6 +195,14 @@ pub enum WorkspaceErrorDto {
     AlreadyOpen { existing_tab_id: String },
     Io { context: String, message: String },
     RemoteFieldInvalid { field: String, reason: String },
+    /// Preflight transport probe failed before the Remote workspace
+    /// record was persisted. `phase` distinguishes `ssh` (auth /
+    /// connect / host-key / remote-path-invalid) from `docker`
+    /// (docker-exec / container-missing / non-TTY); `reason` is the
+    /// typed transport error's display message. The registry on
+    /// disk is byte-identical to the pre-call state, so a retry
+    /// with corrected fields is safe.
+    RemoteProbeFailed { phase: String, reason: String },
 }
 
 impl From<&WorkspaceError> for WorkspaceErrorDto {
@@ -976,9 +984,44 @@ pub fn register_workspace(
         .map_err(|e| WorkspaceErrorDto::from(&e))
 }
 
+/// Testable seam: run the preflight probe against `transport` and
+/// — only on `Ok(())` — persist the record into `registry`. The
+/// Tauri command builds the transport from app data and forwards
+/// to this helper. Stub-transport tests bypass the Tauri layer
+/// entirely and assert that a `probe` failure leaves the registry
+/// on disk byte-identical to the pre-call state.
+pub fn try_register_remote_workspace_with_probe(
+    name: &str,
+    ssh: SshLocation,
+    container: Option<ContainerLocation>,
+    auto_launch_claude: bool,
+    registry: &WorkspaceRegistry,
+    transport: &dyn terminal_mesh_core::transport::Transport,
+    phase_label: &str,
+) -> Result<WorkspaceRecord, WorkspaceErrorDto> {
+    validate_workspace_name(name).map_err(|e| WorkspaceErrorDto::from(&e))?;
+    validate_remote_fields(&ssh, container.as_ref())
+        .map_err(|e| WorkspaceErrorDto::from(&e))?;
+    let probe_location = WorkspaceLocation::Remote {
+        ssh: ssh.clone(),
+        container: container.clone(),
+    };
+    let core_location = probe_location.to_core_workspace_location();
+    transport
+        .probe(core_location)
+        .map_err(|e| WorkspaceErrorDto::RemoteProbeFailed {
+            phase: phase_label.into(),
+            reason: e.to_string(),
+        })?;
+    registry
+        .register_remote_workspace(name, ssh, container, auto_launch_claude)
+        .map_err(|e| WorkspaceErrorDto::from(&e))
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub fn register_remote_workspace(
+pub async fn register_remote_workspace(
+    app: AppHandle,
     name: String,
     host: String,
     user: Option<String>,
@@ -999,9 +1042,82 @@ pub fn register_remote_workspace(
         container_id,
         cwd_in_container,
     });
-    registry
-        .register_remote_workspace(&name, ssh, container, auto_launch_claude)
-        .map_err(|e| WorkspaceErrorDto::from(&e))
+    // Construct the transport implied by the form fields. The
+    // preflight probe runs on a blocking thread pool because the
+    // SSH spawn path is sync underneath; the registry insertion
+    // stays on the current async context.
+    let probe_location = WorkspaceLocation::Remote {
+        ssh: ssh.clone(),
+        container: container.clone(),
+    };
+    let app_data_root = app
+        .try_state::<crate::orchestrator::OrchestratorBootstrap>()
+        .map(|b| b.app_data_root.clone())
+        .ok_or_else(|| WorkspaceErrorDto::Io {
+            context: "register_remote_workspace".into(),
+            message: "OrchestratorBootstrap app_data_root unavailable".into(),
+        })?;
+    let routing = crate::workspace_launch_scheduler::select_transport_kind_for(
+        &probe_location,
+    );
+    let (transport, phase_label): (
+        std::sync::Arc<dyn terminal_mesh_core::transport::Transport>,
+        &'static str,
+    ) = {
+        use crate::workspace_launch_scheduler::TransportRouting;
+        match routing {
+            TransportRouting::Ssh => (
+                std::sync::Arc::new(
+                    terminal_mesh_core::SshTransport::from_app_data(
+                        std::path::PathBuf::from("/usr/bin/ssh"),
+                        &app_data_root,
+                    )
+                    .map_err(|e| WorkspaceErrorDto::Io {
+                        context: "SshTransport::from_app_data".into(),
+                        message: e.to_string(),
+                    })?,
+                ),
+                "ssh",
+            ),
+            TransportRouting::DockerOverSsh => (
+                std::sync::Arc::new(
+                    terminal_mesh_core::DockerOverSshTransport::from_app_data(
+                        std::path::PathBuf::from("/usr/bin/ssh"),
+                        &app_data_root,
+                    )
+                    .map_err(|e| WorkspaceErrorDto::Io {
+                        context: "DockerOverSshTransport::from_app_data".into(),
+                        message: e.to_string(),
+                    })?,
+                ),
+                "docker",
+            ),
+            TransportRouting::Local => {
+                return Err(WorkspaceErrorDto::Io {
+                    context: "register_remote_workspace".into(),
+                    message: "Remote workspace registration routed to Local transport".into(),
+                });
+            }
+        }
+    };
+
+    let registry_for_blocking: WorkspaceRegistry = (*registry).clone();
+    tokio::task::spawn_blocking(move || {
+        try_register_remote_workspace_with_probe(
+            &name,
+            ssh,
+            container,
+            auto_launch_claude,
+            &registry_for_blocking,
+            &*transport,
+            phase_label,
+        )
+    })
+    .await
+    .map_err(|join_err| WorkspaceErrorDto::Io {
+        context: "register_remote_workspace::probe".into(),
+        message: format!("probe join error: {join_err}"),
+    })?
 }
 
 #[tauri::command]
@@ -1986,5 +2102,153 @@ mod tests {
             local_rec.location,
             WorkspaceLocation::Local { .. }
         ));
+    }
+
+    /// Stub transport whose `probe` always returns the supplied
+    /// typed error. Lets the registry preflight test prove the
+    /// "Err → no record persisted" contract without touching a
+    /// real SSH endpoint.
+    struct StubProbeTransport {
+        probe_outcome: std::sync::Mutex<
+            Option<Result<(), terminal_mesh_core::transport::TransportError>>,
+        >,
+    }
+
+    impl StubProbeTransport {
+        fn rejecting(err: terminal_mesh_core::transport::TransportError) -> Self {
+            Self {
+                probe_outcome: std::sync::Mutex::new(Some(Err(err))),
+            }
+        }
+        fn accepting() -> Self {
+            Self {
+                probe_outcome: std::sync::Mutex::new(Some(Ok(()))),
+            }
+        }
+    }
+
+    impl terminal_mesh_core::transport::Transport for StubProbeTransport {
+        fn spawn(
+            &self,
+            _request: terminal_mesh_core::transport::TransportSpawnRequest,
+        ) -> Result<
+            Box<dyn terminal_mesh_core::transport::TransportSession>,
+            terminal_mesh_core::transport::TransportError,
+        > {
+            Err(terminal_mesh_core::transport::TransportError::Protocol {
+                message: "stub spawn not used in this test".into(),
+            })
+        }
+        fn probe(
+            &self,
+            _workspace: terminal_mesh_core::transport::WorkspaceLocation,
+        ) -> Result<(), terminal_mesh_core::transport::TransportError> {
+            self.probe_outcome
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| {
+                    Err(terminal_mesh_core::transport::TransportError::Protocol {
+                        message: "stub probe consumed twice".into(),
+                    })
+                })
+        }
+    }
+
+    /// A failed probe MUST leave the registry on disk byte-
+    /// identical to the pre-call state. Uses
+    /// `try_register_remote_workspace_with_probe` directly with a
+    /// stub transport so the contract is provable without a live
+    /// SSH endpoint, and reloads the registry from disk to assert
+    /// zero Remote records were persisted.
+    #[test]
+    fn try_register_remote_with_failed_probe_does_not_persist_record() {
+        let (storage, _home, reg) = fresh_registry();
+        let storage_path = storage.path().to_path_buf();
+
+        // Snapshot: storage must start empty (no `workspaces.json`).
+        assert!(
+            !storage_path.join(WORKSPACES_FILENAME).exists(),
+            "fresh registry must not have a workspaces.json on disk"
+        );
+
+        let stub = StubProbeTransport::rejecting(
+            terminal_mesh_core::transport::TransportError::SshAuth {
+                user: "alice".into(),
+                host: "h.example".into(),
+                port: 22,
+            },
+        );
+        let ssh = SshLocation {
+            user: Some("alice".into()),
+            host: "h.example".into(),
+            port: Some(22),
+            canonical_remote_path: "/srv".into(),
+        };
+        let err = try_register_remote_workspace_with_probe(
+            "rejected-remote",
+            ssh,
+            None,
+            true,
+            &reg,
+            &stub,
+            "ssh",
+        )
+        .expect_err("probe rejection must surface as DTO");
+        match err {
+            WorkspaceErrorDto::RemoteProbeFailed { phase, reason } => {
+                assert_eq!(phase, "ssh");
+                assert!(reason.contains("ssh auth"), "got {reason}");
+                assert!(reason.contains("alice@h.example"), "got {reason}");
+            }
+            other => panic!("expected RemoteProbeFailed; got {other:?}"),
+        }
+
+        // Reload the registry from disk and assert zero Remote
+        // records are present. The negative contract: a failed
+        // Remote creation must NOT leave a broken workspace record
+        // behind for the user to discover on next app launch.
+        let reloaded = WorkspaceRegistry::load(storage_path.clone(), None);
+        let remote_count = reloaded
+            .list()
+            .iter()
+            .filter(|r| matches!(r.location, WorkspaceLocation::Remote { .. }))
+            .count();
+        assert_eq!(remote_count, 0, "no Remote record may be persisted on probe failure");
+    }
+
+    /// Conversely: a successful probe MUST persist the record so
+    /// the same helper covers the happy path too.
+    #[test]
+    fn try_register_remote_with_successful_probe_persists_record() {
+        let (storage, _home, reg) = fresh_registry();
+        let stub = StubProbeTransport::accepting();
+        let ssh = SshLocation {
+            user: Some("alice".into()),
+            host: "h.example".into(),
+            port: Some(22),
+            canonical_remote_path: "/srv".into(),
+        };
+        let rec = try_register_remote_workspace_with_probe(
+            "accepted-remote",
+            ssh,
+            None,
+            true,
+            &reg,
+            &stub,
+            "ssh",
+        )
+        .expect("happy path");
+        assert_eq!(rec.name, "accepted-remote");
+        assert!(matches!(rec.location, WorkspaceLocation::Remote { .. }));
+
+        // Reload from disk and assert the record is present.
+        let reloaded = WorkspaceRegistry::load(storage.path().to_path_buf(), None);
+        let remote_count = reloaded
+            .list()
+            .iter()
+            .filter(|r| matches!(r.location, WorkspaceLocation::Remote { .. }))
+            .count();
+        assert_eq!(remote_count, 1, "successful probe must persist exactly one Remote record");
     }
 }

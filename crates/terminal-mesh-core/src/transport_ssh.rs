@@ -627,6 +627,17 @@ impl Transport for SshTransport {
             default_phase_a_classifier(),
         )
     }
+
+    /// Reachability probe: dispatch the same SSH spawn path with an
+    /// explicit `/bin/sh -lc ':'` no-op command, wait for the
+    /// remote side to exit cleanly, and return `Ok(())` on
+    /// completion. Auth / connect / host-key / exit-77 remote-path
+    /// errors propagate as the same typed `TransportError` variants
+    /// the spawn path produces, so the registration command can
+    /// reuse the existing error-to-DTO mapping.
+    fn probe(&self, workspace: WorkspaceLocation) -> Result<(), TransportError> {
+        crate::transport::probe_via_spawn(self, workspace)
+    }
 }
 
 /// Default `PhaseAClassifier` that simply delegates to

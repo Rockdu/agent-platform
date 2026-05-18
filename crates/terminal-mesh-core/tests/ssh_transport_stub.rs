@@ -468,3 +468,106 @@ fn ssh_transport_shutdown_terminates_long_running_session() {
     );
     session.cleanup().expect("cleanup");
 }
+
+/// `probe` MUST return `Ok(())` for a reachable Remote SSH
+/// workspace. Exercises the shared `probe_via_spawn` path: the
+/// stub-ssh wrapper emits the shell-started + exit-status
+/// sentinels and exits 0, so the probe observes
+/// `CleanCompletion`.
+#[test]
+fn ssh_transport_probe_succeeds_for_reachable_workspace() {
+    let tmp = TempDir::new().unwrap();
+    let t = transport(
+        &tmp,
+        "printf '\\033]1338;am-shell-started\\a'\nprintf '\\033]1338;am-exit-status;0\\a'\nexit 0\n",
+    );
+    let workspace = WorkspaceLocation::Remote {
+        user: Some("alice".into()),
+        host: "h.example".into(),
+        port: Some(2222),
+        canonical_remote_path: "/srv".into(),
+        container: None,
+    };
+    t.probe(workspace).expect("probe must accept a reachable workspace");
+}
+
+/// `probe` MUST surface `SshAuth` for permission-denied stderr
+/// followed by exit 255. The error is produced by the spawn
+/// path's Phase-A classifier, which `probe_via_spawn` propagates
+/// unchanged.
+#[test]
+fn ssh_transport_probe_returns_typed_auth_error() {
+    let tmp = TempDir::new().unwrap();
+    let t = transport(
+        &tmp,
+        "printf 'alice@h.example: Permission denied (publickey).\\n' >&2\nexit 255\n",
+    );
+    let workspace = WorkspaceLocation::Remote {
+        user: Some("alice".into()),
+        host: "h.example".into(),
+        port: Some(2222),
+        canonical_remote_path: "/srv".into(),
+        container: None,
+    };
+    match t.probe(workspace) {
+        Ok(()) => panic!("probe must reject auth failure"),
+        Err(TransportError::SshAuth { user, host, port }) => {
+            assert_eq!(user, "alice");
+            assert_eq!(host, "h.example");
+            assert_eq!(port, 2222);
+        }
+        Err(other) => panic!("expected SshAuth; got {other:?}"),
+    }
+}
+
+/// `probe` MUST surface `SshConnect` for connection-refused
+/// stderr + exit 255.
+#[test]
+fn ssh_transport_probe_returns_typed_connect_error() {
+    let tmp = TempDir::new().unwrap();
+    let t = transport(
+        &tmp,
+        "printf 'ssh: connect to host h.example port 2222: Connection refused\\n' >&2\nexit 255\n",
+    );
+    let workspace = WorkspaceLocation::Remote {
+        user: Some("alice".into()),
+        host: "h.example".into(),
+        port: Some(2222),
+        canonical_remote_path: "/srv".into(),
+        container: None,
+    };
+    match t.probe(workspace) {
+        Ok(()) => panic!("probe must reject connect refused"),
+        Err(TransportError::SshConnect { host, port, .. }) => {
+            assert_eq!(host, "h.example");
+            assert_eq!(port, 2222);
+        }
+        Err(other) => panic!("expected SshConnect; got {other:?}"),
+    }
+}
+
+/// `probe` MUST surface `RemotePathInvalid` when the remote
+/// wrapper exits 77 (the spec's "remote cwd does not exist"
+/// sentinel). The Phase-A classifier maps exit 77 to the typed
+/// error; the probe propagates it.
+#[test]
+fn ssh_transport_probe_returns_typed_remote_path_invalid_for_exit_77() {
+    let tmp = TempDir::new().unwrap();
+    let t = transport(&tmp, "exit 77\n");
+    let workspace = WorkspaceLocation::Remote {
+        user: Some("alice".into()),
+        host: "h.example".into(),
+        port: Some(2222),
+        canonical_remote_path: "/no/such/path".into(),
+        container: None,
+    };
+    match t.probe(workspace) {
+        Ok(()) => panic!("probe must reject exit 77"),
+        Err(TransportError::RemotePathInvalid { path, host, port, .. }) => {
+            assert_eq!(path, "/no/such/path");
+            assert_eq!(host, "h.example");
+            assert_eq!(port, 2222);
+        }
+        Err(other) => panic!("expected RemotePathInvalid; got {other:?}"),
+    }
+}
