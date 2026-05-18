@@ -35,6 +35,7 @@ import { resolveAutoLaunchTerminalToShutdown } from "./close-tab-shutdown";
 import { synthesizeStuckAutoLaunchError } from "./stuck-auto-launch";
 import { removeTabKeyedEntry } from "./remove-tab-keyed-entry";
 import { isStaleAutoLaunchRejection } from "./stale-auto-launch-rejection";
+import { canOfferResumeFromDone } from "./can-offer-resume";
 import {
   DEFAULT_LIFECYCLE_SNAPSHOT,
   useWorkspaceLifecycleStatuses,
@@ -1280,6 +1281,11 @@ function RailSections(props: RailSectionsProps) {
 
   const renderRow = (tab: OpenTab, opts: { affordance: boolean }) => {
     const snap = snapshotByTabId[tab.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
+    // Only `TaskComplete` Done states keep the actor + PTY alive.
+    // The other Done reasons (`CleanCompletion`, `NonZeroExit`,
+    // `Disconnected`) all correspond to actor exit — a click on
+    // the resume target would route stdin to a NotFound terminal.
+    const resumeOffered = opts.affordance && canOfferResumeFromDone(snap);
     return (
       <WorkspaceRailRow
         key={tab.tabId}
@@ -1288,7 +1294,7 @@ function RailSections(props: RailSectionsProps) {
         isActive={activeId === tab.tabId}
         onSelect={onSelect}
         onClose={onClose}
-        doneAffordance={opts.affordance ? () => onResume(tab.tabId) : undefined}
+        doneAffordance={resumeOffered ? () => onResume(tab.tabId) : undefined}
       />
     );
   };
@@ -1453,8 +1459,17 @@ function MultiTerminalContainer() {
         // DockerOverSshTransport on the backend (see
         // `select_transport_kind_for` + `RealLaunchExecutor`).
         const willAutoLaunch = refreshed.profile.autoLaunchClaude;
+        // Track whether `setTabs` actually inserted a new tab.
+        // Adopting an already-open workspace must NOT re-fire the
+        // auto-launch enqueue — after the original launch has
+        // settled, the scheduler accepts a second enqueue and
+        // spawns a duplicate terminal; the registry then rebinds
+        // the tab to the new terminal, orphaning the original
+        // externally-owned PTY.
+        let isNewTab = true;
         setTabs((prev) => {
           if (prev.some((t) => t.workspaceId === refreshed.workspaceId)) {
+            isNewTab = false;
             tabsRef.current = prev;
             return prev;
           }
@@ -1495,7 +1510,11 @@ function MultiTerminalContainer() {
         // arrives via the lifecycle subscription. Disabled-auto-
         // launch paths are typed-rejected on the backend, so
         // swallow those without surfacing a user-facing error.
-        if (refreshed.profile.autoLaunchClaude) {
+        // `isNewTab` guards against a duplicate enqueue when the
+        // user clicks an already-open workspace — without it,
+        // the scheduler would spawn a second terminal and the
+        // registry would orphan the original.
+        if (refreshed.profile.autoLaunchClaude && isNewTab) {
           void requestWorkspaceAutoLaunch(refreshed.workspaceId, tabId).catch(
             (err) => {
               // Stale-incarnation guard: the workspace may have
