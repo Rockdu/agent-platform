@@ -463,6 +463,7 @@ mod tests {
                 Some(tab_id),
                 crate::workspace_lifecycle::TabKind::Workspace,
                 None,
+                crate::workspace_lifecycle::TransportKind::Local,
             );
         }
 
@@ -655,6 +656,7 @@ mod tests {
                 Some(extra_tab_id.clone()),
                 crate::workspace_lifecycle::TabKind::Workspace,
                 None,
+                crate::workspace_lifecycle::TransportKind::Local,
             );
 
         // Orchestrator reads the new workspace tab end-to-end.
@@ -690,6 +692,7 @@ mod tests {
                 None,
                 crate::workspace_lifecycle::TabKind::Workspace,
                 None,
+                crate::workspace_lifecycle::TransportKind::Local,
             );
 
         // The orchestrator tries to address it by the OLD (terminal_id)
@@ -731,6 +734,7 @@ mod tests {
                 Some(orch_tab_id.to_string()),
                 crate::workspace_lifecycle::TabKind::Orchestrator,
                 None,
+                crate::workspace_lifecycle::TransportKind::Local,
             );
         }
         // Two workspace tabs — clientId parsing requires the tab id
@@ -751,6 +755,7 @@ mod tests {
                 Some(tab_id),
                 crate::workspace_lifecycle::TabKind::Workspace,
                 Some(ws_id.into()),
+                crate::workspace_lifecycle::TransportKind::Local,
             );
         }
 
@@ -845,6 +850,7 @@ mod tests {
             Some(tab_id.clone()),
             crate::workspace_lifecycle::TabKind::Workspace,
             Some(real_ws_id.to_string()),
+            crate::workspace_lifecycle::TransportKind::Local,
         );
 
         let params = json!({

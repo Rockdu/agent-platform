@@ -290,6 +290,7 @@ impl LaunchExecutor for RealLaunchExecutor {
                             terminal_mesh::spawn_into_registry_with_transport(
                                 spec,
                                 transport,
+                                crate::workspace_lifecycle::TransportKind::Ssh,
                                 &app,
                                 &registry,
                                 Some(tab_id.clone()),
@@ -334,6 +335,7 @@ impl LaunchExecutor for RealLaunchExecutor {
                             terminal_mesh::spawn_into_registry_with_transport(
                                 spec,
                                 transport,
+                                crate::workspace_lifecycle::TransportKind::SshDocker,
                                 &app,
                                 &registry,
                                 Some(tab_id.clone()),

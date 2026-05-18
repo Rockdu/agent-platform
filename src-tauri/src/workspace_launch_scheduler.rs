@@ -328,9 +328,14 @@ pub fn request_workspace_auto_launch(
     // executor's spawn path drains the placeholder via
     // `record() -> take_pending_snapshot_for_tab`.
     if scheduler.state(workspace_uuid) == SchedulerState::Pending {
-        let mut placeholder = WorkspaceLifecycleSnapshot::fresh_local_with_workspace_id(
+        let placeholder_kind = record
+            .as_ref()
+            .map(|r| crate::terminal_mesh::transport_kind_for_location(&r.location))
+            .unwrap_or(crate::workspace_lifecycle::TransportKind::Local);
+        let mut placeholder = WorkspaceLifecycleSnapshot::fresh_for_workspace_with_kind(
             TabKind::Workspace,
             Some(workspace_uuid.to_string()),
+            placeholder_kind,
         );
         placeholder.pending_launch = true;
         terminal_registry.set_pending_for_tab(tab_id.clone(), placeholder.clone());

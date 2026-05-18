@@ -284,6 +284,7 @@ impl TerminalMeshRegistry {
         tab_id: Option<String>,
         tab_kind: TabKind,
         workspace_id: Option<String>,
+        transport_kind: TransportKind,
     ) {
         // Live state.
         {
@@ -327,9 +328,10 @@ impl TerminalMeshRegistry {
                 id,
                 RetainedRecord {
                     snapshot: Arc::new(StdMutex::new(
-                        WorkspaceLifecycleSnapshot::fresh_local_with_workspace_id(
+                        WorkspaceLifecycleSnapshot::fresh_for_workspace_with_kind(
                             tab_kind,
                             workspace_id,
+                            transport_kind,
                         ),
                     )),
                     tab_id,
@@ -758,9 +760,27 @@ fn spawn_workspace_via_routing(
                 ),
                 TransportRouting::Local => unreachable!("Local handled above"),
             };
+            // Interactive shell tabs reach this dispatcher with a
+            // local-host shell path (e.g. /bin/zsh) baked into the
+            // TerminalSpec by the caller's `resolve_default_shell`.
+            // For Remote transports that path is meaningless: the
+            // wrapper script's "exec the supplied program" branch
+            // would try to invoke a local binary on the remote host.
+            // Normalize to the empty-program sentinel so the SSH /
+            // Docker wrapper falls through to its remote `$SHELL -l`
+            // branch instead. The auto-launch path stays on
+            // `spawn_into_registry_with_transport` directly and
+            // therefore preserves its explicit command / argv.
+            let spec = normalize_remote_shell_command_for_interactive_tab(spec);
+            let kind = match routing {
+                TransportRouting::Ssh => TransportKind::Ssh,
+                TransportRouting::DockerOverSsh => TransportKind::SshDocker,
+                TransportRouting::Local => unreachable!("Local handled above"),
+            };
             spawn_into_registry_with_transport(
                 spec,
                 transport,
+                kind,
                 app,
                 registry,
                 tab_id,
@@ -769,6 +789,37 @@ fn spawn_workspace_via_routing(
             )
             .map_err(|e| TerminalMeshErrorDto::from(&e))
         }
+    }
+}
+
+/// Map a registry-side `WorkspaceLocation` to the matching
+/// `TransportKind` so lifecycle snapshots and placeholder
+/// envelopes report Remote tabs with their real transport
+/// instead of defaulting to Local. Mirrors the routing decision
+/// `select_transport_kind_for` makes for the spawn side.
+pub(crate) fn transport_kind_for_location(
+    location: &crate::workspaces::WorkspaceLocation,
+) -> TransportKind {
+    use crate::workspaces::WorkspaceLocation;
+    match location {
+        WorkspaceLocation::Local { .. } => TransportKind::Local,
+        WorkspaceLocation::Remote {
+            container: Some(_), ..
+        } => TransportKind::SshDocker,
+        WorkspaceLocation::Remote { container: None, .. } => TransportKind::Ssh,
+    }
+}
+
+/// Clear `TerminalSpec.command` (and any args) so the SSH / Docker
+/// wrapper sees the empty-program sentinel and runs the remote
+/// login shell. Used for interactive Remote shell tabs that
+/// reach the dispatcher via `terminal_spawn` (whose caller seeded
+/// a local-host shell path that doesn't survive the round trip).
+fn normalize_remote_shell_command_for_interactive_tab(spec: TerminalSpec) -> TerminalSpec {
+    TerminalSpec {
+        command: PathBuf::new(),
+        args: Vec::new(),
+        ..spec
     }
 }
 
@@ -793,6 +844,7 @@ pub(crate) fn spawn_into_registry(
     spawn_into_registry_with_transport(
         spec,
         Arc::new(terminal_mesh_core::transport::LocalTransport::new()),
+        TransportKind::Local,
         app,
         registry,
         tab_id,
@@ -811,6 +863,7 @@ pub(crate) fn spawn_into_registry(
 pub(crate) fn spawn_into_registry_with_transport(
     spec: TerminalSpec,
     transport: Arc<dyn terminal_mesh_core::transport::Transport>,
+    transport_kind: TransportKind,
     app: &AppHandle,
     registry: &TerminalMeshRegistry,
     tab_id: Option<String>,
@@ -832,6 +885,7 @@ pub(crate) fn spawn_into_registry_with_transport(
         tab_id,
         tab_kind,
         workspace_id,
+        transport_kind,
     );
 
     let app_for_events = app.clone();
@@ -1363,13 +1417,248 @@ mod tests {
         );
     }
 
+    /// Interactive Remote shell tabs must reach the wrapper's
+    /// remote-`$SHELL -l` branch instead of trying to exec the
+    /// caller-supplied local-host shell path. The normalizer
+    /// achieves that by clearing `command` + `args` so the
+    /// SSH / Docker spawn site sees the empty-program sentinel.
+    #[test]
+    fn normalize_remote_shell_command_clears_local_program_and_args() {
+        let original = TerminalSpec {
+            terminal_id: Uuid::new_v4(),
+            command: PathBuf::from("/bin/zsh"),
+            args: vec!["-i".into(), "-l".into()],
+            cwd: Some(PathBuf::from("/tmp")),
+            env: vec![("HOME".into(), "/home/x".into())],
+            cols: 80,
+            rows: 24,
+            workspace_location: None,
+        };
+        let normalized = normalize_remote_shell_command_for_interactive_tab(original.clone());
+        assert!(
+            normalized.command.as_os_str().is_empty(),
+            "program must be cleared so SSH wrapper takes optional_exec=None branch"
+        );
+        assert!(
+            normalized.args.is_empty(),
+            "args must be cleared so leftover shell flags do not leak into the wrapper"
+        );
+        assert_eq!(normalized.cwd, original.cwd, "cwd is preserved");
+        assert_eq!(normalized.env, original.env, "env is preserved");
+        assert_eq!(normalized.cols, original.cols);
+        assert_eq!(normalized.rows, original.rows);
+        assert_eq!(normalized.terminal_id, original.terminal_id);
+    }
+
+    /// `transport_kind_for_location` MUST map each
+    /// `WorkspaceLocation` variant to the matching transport
+    /// kind. The mapping mirrors `select_transport_kind_for` and
+    /// is the seam the spawn / placeholder paths use to seed
+    /// `WorkspaceLifecycleSnapshot.transport_kind` correctly.
+    #[test]
+    fn transport_kind_for_location_classifies_local_remote_docker() {
+        use crate::workspaces::{ContainerLocation, SshLocation, WorkspaceLocation};
+        let local = WorkspaceLocation::Local {
+            path: std::path::PathBuf::from("/tmp/x"),
+        };
+        assert_eq!(transport_kind_for_location(&local), TransportKind::Local);
+
+        let ssh = WorkspaceLocation::Remote {
+            ssh: SshLocation {
+                user: None,
+                host: "h".into(),
+                port: None,
+                canonical_remote_path: "/srv".into(),
+            },
+            container: None,
+        };
+        assert_eq!(transport_kind_for_location(&ssh), TransportKind::Ssh);
+
+        let docker = WorkspaceLocation::Remote {
+            ssh: SshLocation {
+                user: None,
+                host: "h".into(),
+                port: None,
+                canonical_remote_path: "/srv".into(),
+            },
+            container: Some(ContainerLocation {
+                container_id: "c".into(),
+                cwd_in_container: None,
+            }),
+        };
+        assert_eq!(
+            transport_kind_for_location(&docker),
+            TransportKind::SshDocker
+        );
+    }
+
+    /// The placeholder/snapshot kind classifier MUST agree with
+    /// the spawn-side routing classifier
+    /// (`select_transport_kind_for`). If they ever diverge a
+    /// Remote workspace could dispatch through SshTransport at
+    /// spawn time and yet be labeled `Local` (or vice versa) in
+    /// the rail / placeholder. Cover the symmetry directly.
+    #[test]
+    fn transport_kind_for_location_matches_select_transport_kind_for() {
+        use crate::workspace_launch_scheduler::{
+            select_transport_kind_for, TransportRouting,
+        };
+        use crate::workspaces::{ContainerLocation, SshLocation, WorkspaceLocation};
+
+        let local = WorkspaceLocation::Local {
+            path: std::path::PathBuf::from("/tmp/x"),
+        };
+        let ssh = WorkspaceLocation::Remote {
+            ssh: SshLocation {
+                user: None,
+                host: "h".into(),
+                port: None,
+                canonical_remote_path: "/srv".into(),
+            },
+            container: None,
+        };
+        let docker = WorkspaceLocation::Remote {
+            ssh: SshLocation {
+                user: None,
+                host: "h".into(),
+                port: None,
+                canonical_remote_path: "/srv".into(),
+            },
+            container: Some(ContainerLocation {
+                container_id: "c".into(),
+                cwd_in_container: None,
+            }),
+        };
+        let pairs = [
+            (
+                transport_kind_for_location(&local),
+                select_transport_kind_for(&local),
+            ),
+            (
+                transport_kind_for_location(&ssh),
+                select_transport_kind_for(&ssh),
+            ),
+            (
+                transport_kind_for_location(&docker),
+                select_transport_kind_for(&docker),
+            ),
+        ];
+        for (snap_kind, routing) in pairs {
+            let expected = match routing {
+                TransportRouting::Local => TransportKind::Local,
+                TransportRouting::Ssh => TransportKind::Ssh,
+                TransportRouting::DockerOverSsh => TransportKind::SshDocker,
+            };
+            assert_eq!(
+                snap_kind, expected,
+                "snapshot kind classifier diverged from routing kind for routing={routing:?}",
+            );
+        }
+    }
+
+    /// `record` MUST seed the retained snapshot with the
+    /// caller-supplied `transport_kind` instead of always
+    /// hard-coding `Local`. Cover the three kinds end-to-end via
+    /// `snapshot_for_terminal`, the same projection that
+    /// `workspace_lifecycle_snapshot` and `list_tabs` use.
+    #[test]
+    fn record_seeds_snapshot_with_supplied_transport_kind() {
+        for kind in [
+            TransportKind::Local,
+            TransportKind::Ssh,
+            TransportKind::SshDocker,
+        ] {
+            let r = TerminalMeshRegistry::new();
+            let id = Uuid::new_v4();
+            let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+            let buf = StdArc::new(StdMutex::new(String::new()));
+            r.record(id, tx, buf, None, TabKind::Workspace, None, kind);
+            let snap = r.snapshot_for_terminal(id).expect("snapshot present");
+            assert_eq!(
+                snap.transport_kind, kind,
+                "transport_kind in retained snapshot must match the one record() received"
+            );
+        }
+    }
+
+    /// The list_tabs projection MUST report the real transport
+    /// kind for Remote tabs. Regression for the case where every
+    /// tab was historically projected as Local because the
+    /// snapshot constructor hard-coded `TransportKind::Local`.
+    #[test]
+    fn list_tabs_projects_remote_workspace_with_ssh_transport_kind() {
+        let r = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let buf = StdArc::new(StdMutex::new(String::new()));
+        let tab_id = "tab-ssh-projection";
+        let ws_id = "workspace-uuid-ssh";
+        r.record(
+            id,
+            tx,
+            buf,
+            Some(tab_id.into()),
+            TabKind::Workspace,
+            Some(ws_id.into()),
+            TransportKind::Ssh,
+        );
+        let entries = r.list_tabs(ListTabsScope::All);
+        let entry = entries
+            .iter()
+            .find(|e| e.tab_id.as_deref() == Some(tab_id))
+            .expect("ssh tab present in projection");
+        assert_eq!(
+            entry.transport_kind,
+            TransportKind::Ssh,
+            "Remote-SSH tabs must project as Ssh, not Local"
+        );
+    }
+
+    /// The explicit-command auto-launch path MUST keep its
+    /// `command` / `args` intact when it goes through
+    /// `spawn_into_registry_with_transport` directly (without
+    /// passing through `spawn_workspace_via_routing`). The
+    /// normalizer is the only place we clear the command in the
+    /// interactive flow, so as long as auto-launch bypasses it,
+    /// the explicit program survives. Cover the contract by
+    /// asserting the normalizer is a stand-alone helper: applying
+    /// it to an auto-launch-style spec would clear it (which is
+    /// why callers must not invoke it on that path), and the
+    /// shape is unambiguously distinguishable from interactive
+    /// (non-empty program before / empty after).
+    #[test]
+    fn normalize_remote_shell_command_would_clear_auto_launch_command_so_callers_must_bypass() {
+        let auto_launch = TerminalSpec {
+            terminal_id: Uuid::new_v4(),
+            command: PathBuf::from("/usr/bin/claude"),
+            args: vec!["--dangerously-skip-permissions".into()],
+            cwd: None,
+            env: vec![],
+            cols: 80,
+            rows: 24,
+            workspace_location: None,
+        };
+        let normalized =
+            normalize_remote_shell_command_for_interactive_tab(auto_launch.clone());
+        assert!(
+            normalized.command.as_os_str().is_empty(),
+            "the helper unconditionally clears; production callers MUST NOT invoke it \
+             on the auto-launch path (RealLaunchExecutor goes straight to \
+             spawn_into_registry_with_transport which bypasses this normalizer)"
+        );
+        assert!(
+            !auto_launch.command.as_os_str().is_empty(),
+            "control assertion: the original auto-launch spec carries an explicit program"
+        );
+    }
+
     #[test]
     fn registry_round_trip() {
         let r = TerminalMeshRegistry::new();
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(String::new()));
-        r.record(id, tx.clone(), buf.clone(), None, TabKind::Workspace, None);
+        r.record(id, tx.clone(), buf.clone(), None, TabKind::Workspace, None, TransportKind::Local);
         assert!(r.lookup_command_tx(id).is_some());
         assert!(r.lookup_scrollback(id).is_some());
         assert_eq!(r.active_count(), 1);
@@ -1388,7 +1677,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        r.record(id, tx, buf, None, TabKind::Workspace, None);
+        r.record(id, tx, buf, None, TabKind::Workspace, None, TransportKind::Local);
         let snap = r.snapshot_for_terminal(id).expect("snapshot present");
         let after = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1415,7 +1704,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(String::new()));
-        r.record(id, tx, buf, None, TabKind::Orchestrator, None);
+        r.record(id, tx, buf, None, TabKind::Orchestrator, None, TransportKind::Local);
         let snap = r.snapshot_for_terminal(id).expect("snapshot present");
         assert!(matches!(snap.tab_kind, TabKind::Orchestrator));
     }
@@ -1433,6 +1722,7 @@ mod tests {
             Some("tab-snapshot".into()),
             TabKind::Workspace,
             None,
+            TransportKind::Local,
         );
         assert!(r.snapshot_for_tab("tab-snapshot").is_some());
         assert!(r.snapshot_for_tab("does-not-exist").is_none());
@@ -1445,7 +1735,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(String::new()));
-        r.record(id, tx, buf, None, TabKind::Workspace, None);
+        r.record(id, tx, buf, None, TabKind::Workspace, None, TransportKind::Local);
 
         let after_update = r
             .update_snapshot(id, |snap| {
@@ -1492,6 +1782,7 @@ mod tests {
             Some(tab_id.to_string()),
             kind,
             workspace_id.map(str::to_string),
+            TransportKind::Local,
         );
         id
     }
@@ -1571,6 +1862,7 @@ mod tests {
             Some("tab-ws-bound".into()),
             TabKind::Workspace,
             Some("workspace-uuid-42".into()),
+            TransportKind::Local,
         );
         let snap = r.snapshot_for_terminal(id).expect("snapshot present");
         assert_eq!(snap.workspace_id.as_deref(), Some("workspace-uuid-42"));
@@ -1582,7 +1874,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(String::new()));
-        r.record(id, tx, buf, None, TabKind::Orchestrator, None);
+        r.record(id, tx, buf, None, TabKind::Orchestrator, None, TransportKind::Local);
         let snap = r.snapshot_for_terminal(id).expect("snapshot present");
         assert!(snap.workspace_id.is_none());
     }
@@ -1593,7 +1885,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(String::new()));
-        r.record(id, tx, buf, Some("tab-entry".into()), TabKind::Workspace, None);
+        r.record(id, tx, buf, Some("tab-entry".into()), TabKind::Workspace, None, TransportKind::Local);
 
         let entry = r
             .lifecycle_entry_for_tab("tab-entry")
@@ -1647,7 +1939,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(String::new()));
-        r.record(id, tx, buf, Some("tab-natural".into()), TabKind::Workspace, None);
+        r.record(id, tx, buf, Some("tab-natural".into()), TabKind::Workspace, None, TransportKind::Local);
 
         r.forget_live(id);
 
@@ -1678,7 +1970,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(String::new()));
-        r.record(id, tx, buf, Some("tab-full".into()), TabKind::Workspace, None);
+        r.record(id, tx, buf, Some("tab-full".into()), TabKind::Workspace, None, TransportKind::Local);
 
         r.forget(id);
 
@@ -1705,7 +1997,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(String::new()));
-        r.record(id, tx, buf, Some("tab-resurrect".into()), TabKind::Workspace, None);
+        r.record(id, tx, buf, Some("tab-resurrect".into()), TabKind::Workspace, None, TransportKind::Local);
 
         // Mark Done while the session is still live, mirroring what
         // the notification-driven update path does.
@@ -1737,7 +2029,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(String::new()));
         assert!(!r.contains(id), "unknown id must report not-contained");
-        r.record(id, tx, buf, None, TabKind::Workspace, None);
+        r.record(id, tx, buf, None, TabKind::Workspace, None, TransportKind::Local);
         assert!(r.contains(id), "after record, contains true");
         r.forget(id);
         assert!(!r.contains(id), "after forget, contains false");
@@ -1841,7 +2133,7 @@ mod tests {
                 ..
             } = handle;
             let scrollback = StdArc::new(StdMutex::new(String::new()));
-            registry.record(id, command_tx.clone(), scrollback, None, TabKind::Workspace, None);
+            registry.record(id, command_tx.clone(), scrollback, None, TabKind::Workspace, None, TransportKind::Local);
             keepalive_receivers.push(events_rx);
             keepalive_statuses.push(status_rx);
             command_txs.push((id, command_tx));
@@ -1881,7 +2173,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(body.to_string()));
-        registry.record(id, tx, buf, None, TabKind::Workspace, None);
+        registry.record(id, tx, buf, None, TabKind::Workspace, None, TransportKind::Local);
         (registry, id)
     }
 
@@ -1895,7 +2187,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let buf = StdArc::new(StdMutex::new(body.to_string()));
-        registry.record(id, tx, buf, Some(tab_id.to_string()), TabKind::Workspace, None);
+        registry.record(id, tx, buf, Some(tab_id.to_string()), TabKind::Workspace, None, TransportKind::Local);
         (registry, id)
     }
 
@@ -2286,6 +2578,7 @@ mod tests {
             Some(tab_id.clone()),
             TabKind::Workspace,
             None,
+            TransportKind::Local,
         );
 
         // Placeholder drained; live snapshot exists with default

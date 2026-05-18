@@ -693,6 +693,7 @@ mod tests {
             None,
             crate::workspace_lifecycle::TabKind::Orchestrator,
             None,
+            crate::workspace_lifecycle::TransportKind::Local,
         );
 
         let discovery = DiscoveryCache::empty();

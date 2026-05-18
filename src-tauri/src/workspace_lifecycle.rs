@@ -94,17 +94,33 @@ impl WorkspaceLifecycleSnapshot {
     }
 
     /// Variant that populates `workspace_id` from the persisted
-    /// workspace record. Used by the spawn path so the `list_tabs`
-    /// MCP tool projection can return real workspace ids; orchestrator
-    /// and transient terminals pass `None`.
+    /// workspace record but hard-codes `transport_kind: Local`.
+    /// Kept for test fixtures and any caller that genuinely needs a
+    /// Local snapshot; production spawn paths use
+    /// `fresh_for_workspace_with_kind` so Remote tabs are not
+    /// mislabeled as Local in the rail and `list_tabs` projection.
+    #[allow(dead_code)]
     pub fn fresh_local_with_workspace_id(
         tab_kind: TabKind,
         workspace_id: Option<String>,
     ) -> Self {
+        Self::fresh_for_workspace_with_kind(tab_kind, workspace_id, TransportKind::Local)
+    }
+
+    /// Snapshot constructor that takes the resolved transport kind
+    /// so SSH and Docker-over-SSH tabs surface with the right
+    /// transport in the rail icon, status panel, and MCP
+    /// `list_tabs` projection. Status is always `Running` and
+    /// `last_activity_at_unix_ms` is seeded to now.
+    pub fn fresh_for_workspace_with_kind(
+        tab_kind: TabKind,
+        workspace_id: Option<String>,
+        transport_kind: TransportKind,
+    ) -> Self {
         Self {
             workspace_id,
             tab_kind,
-            transport_kind: TransportKind::Local,
+            transport_kind,
             status: TabStatus::Running,
             done_reason: None,
             last_activity_at_unix_ms: now_unix_ms(),
@@ -562,7 +578,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        registry.record(id, tx, scrollback, None, TabKind::Workspace, None);
+        registry.record(id, tx, scrollback, None, TabKind::Workspace, None, TransportKind::Local);
 
         // Drive to Done first.
         registry
@@ -588,7 +604,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        registry.record(id, tx, scrollback, None, TabKind::Workspace, None);
+        registry.record(id, tx, scrollback, None, TabKind::Workspace, None, TransportKind::Local);
         let baseline = registry.snapshot_for_terminal(id).expect("recorded");
 
         let result = update_snapshot_for_user_stdin(&registry, id);
@@ -619,7 +635,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        registry.record(id, tx, scrollback, None, TabKind::Orchestrator, None);
+        registry.record(id, tx, scrollback, None, TabKind::Orchestrator, None, TransportKind::Local);
         let before = registry.snapshot_for_terminal(id).expect("recorded");
 
         let result = update_snapshot_for_attention(
@@ -649,7 +665,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        registry.record(id, tx, scrollback, None, TabKind::Workspace, None);
+        registry.record(id, tx, scrollback, None, TabKind::Workspace, None, TransportKind::Local);
 
         let updated = update_snapshot_for_attention(
             &registry,
@@ -713,7 +729,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        registry.record(id, tx, scrollback, None, TabKind::Workspace, None);
+        registry.record(id, tx, scrollback, None, TabKind::Workspace, None, TransportKind::Local);
         let baseline = registry.snapshot_for_terminal(id).expect("recorded");
         assert!(!baseline.pending_launch);
 
@@ -734,7 +750,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        registry.record(id, tx, scrollback, None, TabKind::Workspace, None);
+        registry.record(id, tx, scrollback, None, TabKind::Workspace, None, TransportKind::Local);
 
         // Snapshot starts with pending_launch = false; calling with false is
         // a no-op and must NOT emit a redundant lifecycle://updated.
@@ -752,7 +768,7 @@ mod tests {
         let id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        registry.record(id, tx, scrollback, None, TabKind::Workspace, None);
+        registry.record(id, tx, scrollback, None, TabKind::Workspace, None, TransportKind::Local);
 
         update_snapshot_for_pending_launch(&registry, id, true).expect("set");
         let cleared = update_snapshot_for_pending_launch(&registry, id, false)

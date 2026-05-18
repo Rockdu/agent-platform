@@ -315,6 +315,73 @@ exit 0
     session.cleanup().expect("cleanup");
 }
 
+/// Interactive Remote shell tabs reach the dispatcher with an
+/// empty `ShellCommand` (program path empty, args empty). The
+/// SSH wrapper must take the login-shell branch and emit the
+/// `"$SHELL" -l` invocation rather than trying to exec a
+/// caller-supplied program. The stub-ssh echoes its argv so the
+/// test can grep the composed wrapper script for the login-shell
+/// branch, and assert the explicit-exec branch is absent.
+#[test]
+fn ssh_transport_runs_login_shell_when_command_is_empty() {
+    let tmp = TempDir::new().unwrap();
+    let stub_body = r#"printf '\033]1338;am-shell-started\a'
+for a in "$@"; do
+  printf '%s\n' "ARG:$a"
+done
+printf '\033]1338;am-exit-status;0\a'
+exit 0
+"#;
+    let t = transport(&tmp, stub_body);
+    let req = TransportSpawnRequest {
+        workspace: WorkspaceLocation::Remote {
+            user: Some("alice".into()),
+            host: "h.example".into(),
+            port: Some(2222),
+            canonical_remote_path: "/srv".into(),
+            container: None,
+        },
+        command: ShellCommand {
+            // Empty program is the "no remote command requested"
+            // sentinel that triggers the wrapper's login-shell
+            // branch instead of the explicit-exec branch.
+            program: PathBuf::new(),
+            args: vec![],
+        },
+        initial_size: terminal_mesh_core::transport::PtySize { cols: 80, rows: 24 },
+        env: BTreeMap::new(),
+        cwd: None,
+    };
+    let mut session = t.spawn(req).expect("spawn ok");
+    let mut reader = session.output_stream().expect("output_stream");
+    let mut accum: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut buf = [0u8; 4096];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => accum.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+    }
+    let stdout = String::from_utf8_lossy(&accum);
+    // The composed wrapper sits in the last argv slot (the
+    // remote command). Look for the login-shell branch literal.
+    assert!(
+        stdout.contains("\"$SHELL\" -l"),
+        "wrapper must take the login-shell branch when command is empty; saw:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("/bin/zsh") && !stdout.contains("/bin/bash"),
+        "wrapper must NOT contain a caller-supplied local shell path; saw:\n{stdout}"
+    );
+    let _ = session.wait();
+    session.cleanup().expect("cleanup");
+}
+
 /// When the spawn request carries a non-empty `ShellCommand`,
 /// the SSH wrapper must invoke it inside the remote shell. The
 /// stub-ssh receives the composed remote command in its argv;
