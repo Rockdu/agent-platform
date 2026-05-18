@@ -301,7 +301,23 @@ export default function App() {
             }
           />
         )}
-        {active.kind === "plugin" && (
+        {/* MultiTerminalContainer must ALWAYS be mounted (not
+            conditional) so its `tabs` state survives switching to
+            the orchestrator tab and back. Hide via CSS; unmounting
+            resets all workspace tabs. Each non-terminal plugin tab
+            is still conditionally rendered (they carry no persisted
+            state that needs to survive tab switches). */}
+        <div
+          style={{
+            display:
+              active.kind === "plugin" && active.pluginId === "static-terminal"
+                ? "contents"
+                : "none",
+          }}
+        >
+          <MultiTerminalContainer />
+        </div>
+        {active.kind === "plugin" && active.pluginId !== "static-terminal" && (
           <PluginBody
             pluginId={active.pluginId}
             registryEntry={lookupPlugin(active.pluginId)}
