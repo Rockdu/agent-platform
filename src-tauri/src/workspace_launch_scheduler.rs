@@ -226,6 +226,22 @@ pub fn try_build_pending_launch(
     let record = workspace.ok_or_else(|| AutoLaunchErrorDto::WorkspaceNotFound {
         workspace_id: workspace_id_str.to_string(),
     })?;
+    // The frontend fires `requestWorkspaceAutoLaunch` fire-and-
+    // forget; the user can adopt-then-close a workspace before
+    // this command reaches the backend. By the time we resolve
+    // the record, `close_workspace` may have already cleared
+    // `open_tab_id` (or a different tab may have adopted the
+    // workspace since). Without this check the enqueue would
+    // fire for a closed tab and the executor would spawn an
+    // orphan claude process. Treat both "no open tab" and
+    // "different tab adopted" as `WorkspaceNotFound` — the
+    // user-visible meaning is "the tab you asked about is no
+    // longer here."
+    if record.open_tab_id.as_deref() != Some(tab_id.as_str()) {
+        return Err(AutoLaunchErrorDto::WorkspaceNotFound {
+            workspace_id: workspace_id_str.to_string(),
+        });
+    }
     if !record.profile.auto_launch_claude {
         return Err(AutoLaunchErrorDto::AutoLaunchDisabled {
             workspace_id: workspace_id_str.to_string(),
@@ -588,7 +604,7 @@ mod tests {
             profile: WorkspaceProfile::default_local(),
             created_at: "2026-01-01T00:00:00Z".into(),
             last_used_at: "2026-01-01T00:00:00Z".into(),
-            open_tab_id: None,
+            open_tab_id: Some("tab-r".into()),
             conversation_rounds_count: 0,
         };
         let launch = try_build_pending_launch(
@@ -667,7 +683,7 @@ mod tests {
             },
             created_at: "2026-01-01T00:00:00Z".into(),
             last_used_at: "2026-01-01T00:00:00Z".into(),
-            open_tab_id: None,
+            open_tab_id: Some("tab-x".into()),
             conversation_rounds_count: 0,
         };
         let err = try_build_pending_launch(
@@ -776,7 +792,7 @@ mod tests {
             profile: WorkspaceProfile::default_local(),
             created_at: "2026-01-01T00:00:00Z".into(),
             last_used_at: "2026-01-01T00:00:00Z".into(),
-            open_tab_id: None,
+            open_tab_id: Some("tab-h".into()),
             conversation_rounds_count: 0,
         };
         let launch = try_build_pending_launch(
@@ -796,5 +812,77 @@ mod tests {
         }
         assert_eq!(launch.claude_argv, vec!["--dangerously-skip-permissions"]);
         assert_eq!(launch.enqueued_at_unix_ms, 12345);
+    }
+
+    /// The frontend fires `requestWorkspaceAutoLaunch`
+    /// fire-and-forget; a user can adopt-then-close before the
+    /// backend handles the command. By the time we resolve the
+    /// record, `open_tab_id` may be cleared. The enqueue must
+    /// not fire for a closed tab — surface `WorkspaceNotFound`
+    /// so the executor never spawns an orphan claude.
+    #[test]
+    fn try_build_pending_launch_rejects_when_workspace_is_closed() {
+        use crate::workspaces::{WorkspaceLocation, WorkspaceProfile, WorkspaceRecord};
+        let id = Uuid::new_v4();
+        let record = WorkspaceRecord {
+            workspace_id: id,
+            name: "closed".into(),
+            location: WorkspaceLocation::Local {
+                path: PathBuf::from("/tmp/closed"),
+            },
+            profile: WorkspaceProfile::default_local(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_used_at: "2026-01-01T00:00:00Z".into(),
+            open_tab_id: None,
+            conversation_rounds_count: 0,
+        };
+        let err = try_build_pending_launch(
+            &id.to_string(),
+            "tab-closed".into(),
+            Some(&record),
+            0,
+        )
+        .expect_err("closed workspace must reject the auto-launch");
+        match err {
+            AutoLaunchErrorDto::WorkspaceNotFound { workspace_id } => {
+                assert_eq!(workspace_id, id.to_string());
+            }
+            other => panic!("expected WorkspaceNotFound; got {other:?}"),
+        }
+    }
+
+    /// Same workspace, different tab: the workspace is open but
+    /// bound to a different tab id than the caller's. Treat as
+    /// `WorkspaceNotFound` so the stale request from the closed
+    /// tab does not enqueue against the currently-open tab.
+    #[test]
+    fn try_build_pending_launch_rejects_when_tab_id_does_not_match_open_tab_id() {
+        use crate::workspaces::{WorkspaceLocation, WorkspaceProfile, WorkspaceRecord};
+        let id = Uuid::new_v4();
+        let record = WorkspaceRecord {
+            workspace_id: id,
+            name: "different-tab".into(),
+            location: WorkspaceLocation::Local {
+                path: PathBuf::from("/tmp/dt"),
+            },
+            profile: WorkspaceProfile::default_local(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_used_at: "2026-01-01T00:00:00Z".into(),
+            open_tab_id: Some("tab-current".into()),
+            conversation_rounds_count: 0,
+        };
+        let err = try_build_pending_launch(
+            &id.to_string(),
+            "tab-stale".into(),
+            Some(&record),
+            0,
+        )
+        .expect_err("stale tab_id must reject the auto-launch");
+        match err {
+            AutoLaunchErrorDto::WorkspaceNotFound { workspace_id } => {
+                assert_eq!(workspace_id, id.to_string());
+            }
+            other => panic!("expected WorkspaceNotFound; got {other:?}"),
+        }
     }
 }

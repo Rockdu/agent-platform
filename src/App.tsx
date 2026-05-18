@@ -33,6 +33,7 @@ import { shutdownTerminal } from "./terminal-mesh";
 import type { DoneReason, WorkspaceLifecycleSnapshot } from "./terminal-mesh";
 import { resolveAutoLaunchTerminalToShutdown } from "./close-tab-shutdown";
 import { synthesizeStuckAutoLaunchError } from "./stuck-auto-launch";
+import { removeTabKeyedEntry } from "./remove-tab-keyed-entry";
 import {
   DEFAULT_LIFECYCLE_SNAPSHOT,
   useWorkspaceLifecycleStatuses,
@@ -1408,6 +1409,12 @@ function MultiTerminalContainer() {
       try {
         const refreshed = await openWorkspace(workspace.workspaceId, tabId);
         setError(null);
+        // Defense in depth: clear any stale per-tab state from a
+        // prior life of this workspace's tab id. `closeTab`
+        // already clears these, but an abnormal close path (e.g.
+        // app crash) could leave entries behind.
+        setAutoLaunchErrorByTabId((prev) => removeTabKeyedEntry(prev, tabId));
+        setFocusNonceByTabId((prev) => removeTabKeyedEntry(prev, tabId));
         // Any workspace with the auto-launch flag set qualifies —
         // Remote workspaces route through SshTransport /
         // DockerOverSshTransport on the backend (see
@@ -1524,6 +1531,14 @@ function MultiTerminalContainer() {
         }
         return remaining;
       });
+      // Clear per-tab maps keyed by tabId. The tabId is the bare
+      // workspace UUID, so reopening the same workspace would
+      // otherwise inherit stale state (the prior auto-launch
+      // failure banner, the prior focus nonce). Defense in
+      // depth — `adoptWorkspaceTab` also clears these before
+      // installing a new tab.
+      setAutoLaunchErrorByTabId((prev) => removeTabKeyedEntry(prev, tabId));
+      setFocusNonceByTabId((prev) => removeTabKeyedEntry(prev, tabId));
       void refreshWorkspaces();
     },
     [tabs, active, refreshWorkspaces, terminalIdByTabId],
