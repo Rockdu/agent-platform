@@ -541,7 +541,10 @@ function CreatePane(props: {
           </p>
         </div>
       )}
-      <label className="workspace-switcher-modal__field workspace-switcher-modal__auto-launch">
+      <label
+        className="workspace-switcher-modal__field workspace-switcher-modal__auto-launch"
+        title={AUTO_LAUNCH_BOUNDARY_TOOLTIP}
+      >
         <input
           type="checkbox"
           checked={autoLaunchClaude}
@@ -583,6 +586,39 @@ function renderRemoteLocation(w: WorkspaceRecord): string {
   return container
     ? `${base} (container ${container.containerId})`
     : base;
+}
+
+/// Boundary tooltip surfaced on the auto-launch checkbox in the
+/// create form. Mirrors the
+/// `docs/specs/confirm-on-write.md` section so the user sees the
+/// trust-boundary tradeoff at decision time, not only by reading
+/// the spec. Exported for the compile-check probe.
+export const AUTO_LAUNCH_BOUNDARY_TOOLTIP: string =
+  "--dangerously-skip-permissions 会跳过 claude 自身的写入/命令确认提示；本应用的 confirm-on-write 只拦截插件代为执行的写入（如 MCP 邮件/Zotero、orchestrator 终端 stdin），不会拦截 claude 在工作区内的 shell 命令或文件编辑。";
+
+/// Pure formatter for the `.claude` conversation rounds cell in
+/// the workspace switcher recent list. Local rows show the count
+/// (or `"无"` when zero); Remote rows show an explicit
+/// unavailability label because the `.claude/` directory lives on
+/// the remote machine and the host cannot scan it. Exported for
+/// the compile-check probe.
+export function formatClaudeRoundsCell(w: WorkspaceRecord): string {
+  if (w.location.kind === "remote") {
+    return "claude 对话: 远程不可用";
+  }
+  return `claude 对话: ${
+    w.conversationRoundsCount > 0 ? `${w.conversationRoundsCount} 轮` : "无"
+  }`;
+}
+
+/// Companion tooltip text for the rounds cell. Local cells get an
+/// undefined tooltip; Remote cells explain why scanning is not
+/// available locally. Exported for the compile-check probe.
+export function claudeRoundsCellTooltip(w: WorkspaceRecord): string | undefined {
+  if (w.location.kind === "remote") {
+    return "远程工作区的 .claude/ 在远端机器，本机无法扫描";
+  }
+  return undefined;
 }
 
 function RecentPane(props: {
@@ -630,11 +666,8 @@ function RecentPane(props: {
               <div className="workspace-switcher-modal__row-meta">
                 <span>最近使用: {w.lastUsedAt}</span>
                 <span>创建: {w.createdAt}</span>
-                <span>
-                  claude 对话:{" "}
-                  {w.conversationRoundsCount > 0
-                    ? `${w.conversationRoundsCount} 轮`
-                    : "无"}
+                <span title={claudeRoundsCellTooltip(w)}>
+                  {formatClaudeRoundsCell(w)}
                 </span>
               </div>
             </button>

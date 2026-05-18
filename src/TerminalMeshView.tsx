@@ -19,7 +19,7 @@ import {
   type IdeHandoffErrorDto,
 } from "./ide-handoff";
 import { IdePreferencePane } from "./IdePreferencePane";
-import type { AutoLaunchErrorDto } from "./workspaces";
+import type { AutoLaunchErrorDto, WorkspaceLocation } from "./workspaces";
 
 const INITIAL_SCROLLBACK_BYTES = 64 * 1024;
 
@@ -81,6 +81,14 @@ export interface TerminalMeshViewProps {
   /// owns the spawn and the live terminal_id will be plumbed in via
   /// `existingTerminalId` once the scheduler records it.
   awaitingAutoLaunch?: boolean;
+  /// Registry-side workspace location. When present and
+  /// `kind === "remote"`, local-only affordances (Cursor / Finder /
+  /// `.claude` round scan) render as visibly disabled controls
+  /// with explanatory tooltips instead of being hidden behind the
+  /// `cwd` truthy gate. When absent (transient terminal with no
+  /// bound workspace), the action strip falls back to the legacy
+  /// `cwd`-truthy behavior.
+  workspaceLocation?: WorkspaceLocation;
 }
 
 export function TerminalMeshView({
@@ -93,7 +101,14 @@ export function TerminalMeshView({
   focusNonce,
   autoLaunchError,
   awaitingAutoLaunch,
+  workspaceLocation,
 }: TerminalMeshViewProps) {
+  const isRemote = workspaceLocation?.kind === "remote";
+  // Workspace tabs always get the action strip + settings toggle so
+  // the user can see and reach the Remote-disabled affordances;
+  // transient terminals (no bound workspace) keep the legacy
+  // `cwd`-truthy gate.
+  const showWorkspaceActions = workspaceId != null || cwd != null;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -107,24 +122,27 @@ export function TerminalMeshView({
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const onOpenIde = useCallback(async () => {
-    if (!cwd) return;
+    // Defense in depth: the UI also disables this button for
+    // Remote tabs, but a handler bypass (e.g. keyboard shortcut)
+    // must not try to open a non-existent local path in Cursor.
+    if (isRemote || !cwd) return;
     setIdeError(null);
     try {
       await openWorkspaceInIde(cwd);
     } catch (err) {
       if (isIdeHandoffErrorDto(err)) setIdeError(err);
     }
-  }, [cwd]);
+  }, [cwd, isRemote]);
 
   const onRevealFinder = useCallback(async () => {
-    if (!cwd) return;
+    if (isRemote || !cwd) return;
     setIdeError(null);
     try {
       await revealWorkspaceInFinder(cwd);
     } catch (err) {
       if (isIdeHandoffErrorDto(err)) setIdeError(err);
     }
-  }, [cwd]);
+  }, [cwd, isRemote]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -350,12 +368,18 @@ export function TerminalMeshView({
         <span className="terminal-mesh-view__status-label">
           {renderStatusLabel(status)}
         </span>
-        {cwd && (
+        {showWorkspaceActions && (
           <div className="terminal-mesh-view__status-actions">
             <button
               type="button"
               className="terminal-mesh-view__status-action"
               onClick={() => void onOpenIde()}
+              disabled={isRemote}
+              title={
+                isRemote
+                  ? "远程工作区暂不支持本机 Cursor 打开"
+                  : undefined
+              }
             >
               Cursor 中打开
             </button>
@@ -363,6 +387,12 @@ export function TerminalMeshView({
               type="button"
               className="terminal-mesh-view__status-action"
               onClick={() => void onRevealFinder()}
+              disabled={isRemote}
+              title={
+                isRemote
+                  ? "远程工作区没有本机 Finder 位置"
+                  : undefined
+              }
             >
               Finder 中显示
             </button>
@@ -420,10 +450,11 @@ export function TerminalMeshView({
             : "正在启动终端…"}
         </p>
       )}
-      {settingsOpen && cwd && (
+      {settingsOpen && showWorkspaceActions && (
         <WorkspaceSettingsPanel
-          workspacePath={cwd}
+          workspacePath={cwd ?? ""}
           workspaceName={workspaceName}
+          workspaceLocation={workspaceLocation}
           ideError={ideError}
           onOpenIde={onOpenIde}
           onRevealFinder={onRevealFinder}
@@ -438,6 +469,12 @@ export function TerminalMeshView({
 function WorkspaceSettingsPanel(props: {
   workspacePath: string;
   workspaceName?: string;
+  /// Registry-side workspace location. When `kind === "remote"`,
+  /// Cursor / Finder buttons render disabled with the same
+  /// explanatory tooltips the status strip uses, and the path row
+  /// renders the remote canonical path instead of an empty local
+  /// `workspacePath`.
+  workspaceLocation?: WorkspaceLocation;
   /// Most recent typed IDE handoff error from the surrounding view.
   /// The panel overlays the strip-level `.terminal-mesh-view__ide-
   /// error` line, so we render the same error inside the overlay so
@@ -451,16 +488,30 @@ function WorkspaceSettingsPanel(props: {
   const {
     workspacePath,
     workspaceName,
+    workspaceLocation,
     ideError,
     onOpenIde,
     onRevealFinder,
     onClose,
     onIdeError,
   } = props;
+  const isRemote = workspaceLocation?.kind === "remote";
+  const remoteDisplayPath =
+    workspaceLocation?.kind === "remote"
+      ? `${workspaceLocation.ssh.user ? `${workspaceLocation.ssh.user}@` : ""}${workspaceLocation.ssh.host}${
+          workspaceLocation.ssh.port ? `:${workspaceLocation.ssh.port}` : ""
+        }:${workspaceLocation.ssh.canonicalRemotePath}${
+          workspaceLocation.container
+            ? ` (container ${workspaceLocation.container.containerId})`
+            : ""
+        }`
+      : null;
+  const displayedPath = remoteDisplayPath ?? workspacePath;
   const headerLabel =
     workspaceName ??
-    workspacePath.split("/").filter(Boolean).pop() ??
-    workspacePath;
+    (remoteDisplayPath ??
+      workspacePath.split("/").filter(Boolean).pop() ??
+      workspacePath);
   return (
     <section
       className="terminal-mesh-view__settings-panel"
@@ -480,16 +531,34 @@ function WorkspaceSettingsPanel(props: {
       </header>
       <div className="terminal-mesh-view__settings-body">
         <dl className="terminal-mesh-view__settings-meta">
-          <dt>路径</dt>
+          <dt>{isRemote ? "远程路径" : "路径"}</dt>
           <dd>
-            <code>{workspacePath}</code>
+            <code>{displayedPath}</code>
           </dd>
         </dl>
         <div className="terminal-mesh-view__settings-actions">
-          <button type="button" onClick={() => void onOpenIde()}>
+          <button
+            type="button"
+            onClick={() => void onOpenIde()}
+            disabled={isRemote}
+            title={
+              isRemote
+                ? "远程工作区暂不支持本机 Cursor 打开"
+                : undefined
+            }
+          >
             Cursor 中打开
           </button>
-          <button type="button" onClick={() => void onRevealFinder()}>
+          <button
+            type="button"
+            onClick={() => void onRevealFinder()}
+            disabled={isRemote}
+            title={
+              isRemote
+                ? "远程工作区没有本机 Finder 位置"
+                : undefined
+            }
+          >
             Finder 中显示
           </button>
         </div>
@@ -504,7 +573,16 @@ function WorkspaceSettingsPanel(props: {
         )}
         <hr className="terminal-mesh-view__settings-divider" />
         <h4 className="terminal-mesh-view__settings-subhead">IDE 偏好</h4>
-        <IdePreferencePane onError={onIdeError} />
+        {isRemote ? (
+          <p
+            className="terminal-mesh-view__settings-remote-hint"
+            title="远程工作区的代码托管在远端机器；IDE 偏好（用于 Cursor/VS Code）只对本地工作区生效"
+          >
+            远程工作区不适用本机 IDE 偏好。
+          </p>
+        ) : (
+          <IdePreferencePane onError={onIdeError} />
+        )}
       </div>
     </section>
   );

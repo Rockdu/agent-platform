@@ -1510,6 +1510,7 @@ function MultiTerminalContainer() {
               active={activeId === t.tabId}
               cwd={t.workspacePath}
               workspaceName={t.workspaceName}
+              workspaceLocation={t.workspaceLocation}
               tabId={t.tabId}
               workspaceId={t.workspaceId}
               focusNonce={focusNonceByTabId[t.tabId]}

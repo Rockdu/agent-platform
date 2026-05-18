@@ -174,6 +174,21 @@ Documentation MUST NOT overclaim force-quit cleanup. It may describe best-effort
 
 Documentation MUST NOT imply that confirm-on-write intercepts raw filesystem writes in the workspace. AC-7.5 is satisfied only if this limitation is explicit and visible in both required locations.
 
+## Auto-Launch with `--dangerously-skip-permissions` Boundary
+
+Workspaces in this app have a per-workspace `WorkspaceProfile.claude_argv` field; the product default for new workspaces is `["--dangerously-skip-permissions"]`. The create-form auto-launch checkbox controls whether the workspace's first PTY is auto-spawned with this argv via the launch scheduler. When that argv is in effect, the trust boundary changes in a way that interacts with confirm-on-write:
+
+- **`--dangerously-skip-permissions` bypasses Claude Code's own permission prompts.** Claude Code normally asks the user to confirm tool calls that touch the filesystem or run shell commands. With this flag, those prompts are suppressed; the user has opted into letting Claude Code act without per-call confirmation.
+
+- **App confirm-on-write only gates plugin-mediated writes.** The arbiter described in this document intercepts `RequestApproval` from MCP sidecars (Gmail/Zotero/notes/etc.) and orchestrator-mediated terminal stdin (the `terminal_mesh.write_stdin` bridge call). It does NOT intercept:
+  - Raw shell commands `claude` runs through its built-in Bash tool.
+  - File edits `claude` performs via its built-in Edit / Write tools inside the workspace directory.
+  - Network calls `claude` makes via WebFetch or any host-mediated tool that does not declare itself as a plugin write.
+
+- **Implication for users who want a stricter posture.** Enabling auto-launch with `--dangerously-skip-permissions` widens the trust boundary INSIDE the workspace: Claude Code can edit any file under the workspace root, run any shell command, and the app will not interrupt. Users who need per-call confirmation for file edits or shell commands should either (a) uncheck the auto-launch checkbox during workspace creation and launch `claude` interactively without the flag, or (b) remove `--dangerously-skip-permissions` from the workspace's `claude_argv` and re-launch. The confirm-on-write arbiter is unchanged in both cases; it still gates plugin-mediated writes regardless of the flag.
+
+This boundary MUST be surfaced in the create form: the auto-launch checkbox carries a tooltip stating the same boundary in concise Chinese so the user sees it at decision time, not only by reading this document.
+
 ## Error Cases
 
 Arbiter unreachable:
