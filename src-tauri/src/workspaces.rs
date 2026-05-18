@@ -847,6 +847,75 @@ impl RegistryInner {
 /// surface for the Remote workspace registration. Fields rejected here surface as
 /// `WorkspaceError::RemoteFieldInvalid` with a `field` discriminator
 /// the frontend uses to highlight the offending input.
+/// Validate that a remote workspace's `canonical_remote_path` is
+/// a strictly canonical POSIX absolute path. Duplicate detection
+/// (`find_remote_duplicate`) compares this string verbatim as the
+/// workspace's identity, so the surface MUST be canonical — any
+/// non-canonical alias would let the same remote directory be
+/// registered multiple times under different textual paths.
+///
+/// Rules (string-level; no remote filesystem access):
+/// - Must not be empty / whitespace-only.
+/// - Must be absolute (start with `/`).
+/// - Must not contain `.` or `..` as a path segment.
+/// - Must not contain empty segments (`//`) or a trailing `/` on
+///   a non-root path. The root path `/` is accepted as-is.
+///
+/// Active canonicalization against the remote shell (e.g.,
+/// `cd "$p" && pwd -P`) is a future enhancement — string
+/// validation closes the duplicate-detection gap without an extra
+/// network round-trip.
+pub fn validate_canonical_remote_path(path: &str) -> Result<(), WorkspaceError> {
+    if path.trim().is_empty() {
+        return Err(WorkspaceError::RemoteFieldInvalid {
+            field: "canonicalRemotePath".into(),
+            reason: "canonical remote path must not be empty".into(),
+        });
+    }
+    if !path.starts_with('/') {
+        return Err(WorkspaceError::RemoteFieldInvalid {
+            field: "canonicalRemotePath".into(),
+            reason: "canonical remote path must be an absolute POSIX path (start with `/`)".into(),
+        });
+    }
+    if path == "/" {
+        return Ok(());
+    }
+    // Non-root: split on `/`. The leading `/` produces an empty
+    // first segment which we skip; every other segment must be
+    // non-empty AND must not be `.` or `..`.
+    let mut iter = path.split('/');
+    // First segment from the leading `/` is always empty by
+    // construction; consume it.
+    let _ = iter.next();
+    let mut prev_was_segment = false;
+    for segment in iter {
+        if segment.is_empty() {
+            return Err(WorkspaceError::RemoteFieldInvalid {
+                field: "canonicalRemotePath".into(),
+                reason: "canonical remote path must not contain `//` or a trailing `/` on a non-root path".into(),
+            });
+        }
+        if segment == "." || segment == ".." {
+            return Err(WorkspaceError::RemoteFieldInvalid {
+                field: "canonicalRemotePath".into(),
+                reason: "canonical remote path must not contain `.` or `..` segments".into(),
+            });
+        }
+        prev_was_segment = true;
+    }
+    if !prev_was_segment {
+        // Defensive: a path like "/" hit the early return above,
+        // so we should never get here with no segments. Surface
+        // the same not-empty error to be safe.
+        return Err(WorkspaceError::RemoteFieldInvalid {
+            field: "canonicalRemotePath".into(),
+            reason: "canonical remote path must not be empty".into(),
+        });
+    }
+    Ok(())
+}
+
 pub fn validate_remote_fields(
     ssh: &SshLocation,
     container: Option<&ContainerLocation>,
@@ -857,12 +926,7 @@ pub fn validate_remote_fields(
             reason: "host must not be empty".into(),
         });
     }
-    if ssh.canonical_remote_path.trim().is_empty() {
-        return Err(WorkspaceError::RemoteFieldInvalid {
-            field: "canonicalRemotePath".into(),
-            reason: "canonical remote path must not be empty".into(),
-        });
-    }
+    validate_canonical_remote_path(&ssh.canonical_remote_path)?;
     if let Some(port) = ssh.port
         && port == 0
     {
@@ -1431,6 +1495,84 @@ mod tests {
             validate_workspace_name(&long),
             Err(WorkspaceError::InvalidName { .. })
         ));
+    }
+
+    fn assert_canon_remote_path_invalid(path: &str, hint: &str) {
+        match validate_canonical_remote_path(path) {
+            Err(WorkspaceError::RemoteFieldInvalid { field, reason }) => {
+                assert_eq!(field, "canonicalRemotePath", "field tag for `{path}`");
+                assert!(
+                    reason.contains(hint),
+                    "reason `{reason}` for `{path}` should mention `{hint}`"
+                );
+            }
+            other => panic!("expected RemoteFieldInvalid for `{path}`; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_canonical_remote_path_accepts_simple_absolute_paths() {
+        validate_canonical_remote_path("/").expect("root accepted");
+        validate_canonical_remote_path("/home/user/repo").expect("nested absolute");
+        validate_canonical_remote_path("/srv/work").expect("simple absolute");
+        validate_canonical_remote_path("/tmp").expect("short absolute");
+        validate_canonical_remote_path("/a")
+            .expect("single-char-segment accepted");
+        validate_canonical_remote_path("/with spaces/ok")
+            .expect("spaces inside segments are not canonicalization concerns");
+    }
+
+    #[test]
+    fn validate_canonical_remote_path_rejects_empty_or_whitespace() {
+        assert_canon_remote_path_invalid("", "empty");
+        assert_canon_remote_path_invalid("   ", "empty");
+    }
+
+    #[test]
+    fn validate_canonical_remote_path_rejects_relative_paths() {
+        assert_canon_remote_path_invalid("repo", "absolute");
+        assert_canon_remote_path_invalid("./repo", "absolute");
+        assert_canon_remote_path_invalid("../parent", "absolute");
+        assert_canon_remote_path_invalid("~/home", "absolute");
+        assert_canon_remote_path_invalid("home/user", "absolute");
+    }
+
+    #[test]
+    fn validate_canonical_remote_path_rejects_dot_segments() {
+        assert_canon_remote_path_invalid("/foo/./bar", "`.` or `..`");
+        assert_canon_remote_path_invalid("/foo/../bar", "`.` or `..`");
+        assert_canon_remote_path_invalid("/./bar", "`.` or `..`");
+        assert_canon_remote_path_invalid("/foo/..", "`.` or `..`");
+        assert_canon_remote_path_invalid("/foo/.", "`.` or `..`");
+    }
+
+    #[test]
+    fn validate_canonical_remote_path_rejects_empty_segments_and_trailing_slash() {
+        assert_canon_remote_path_invalid("//foo", "`//`");
+        assert_canon_remote_path_invalid("/foo//bar", "`//`");
+        assert_canon_remote_path_invalid("/foo/bar//", "`//`");
+        assert_canon_remote_path_invalid("/foo/", "`//`");
+        assert_canon_remote_path_invalid("/foo/bar/", "`//`");
+    }
+
+    /// `validate_remote_fields` delegates to the canonical-path
+    /// validator so a relative path on the SSH location is
+    /// rejected pre-persist with the same typed error.
+    #[test]
+    fn validate_remote_fields_rejects_relative_canonical_remote_path() {
+        let ssh = SshLocation {
+            user: None,
+            host: "example.com".into(),
+            port: None,
+            canonical_remote_path: "repo".into(),
+        };
+        let err = validate_remote_fields(&ssh, None).unwrap_err();
+        match err {
+            WorkspaceError::RemoteFieldInvalid { field, .. } => {
+                assert_eq!(field, "canonicalRemotePath");
+            }
+            other => panic!("expected RemoteFieldInvalid; got {other:?}"),
+        }
     }
 
     #[test]
