@@ -178,9 +178,15 @@ pub fn ssh_control_path_for(control_dir: &Path, location: &SshLocation) -> PathB
 /// remote side. The script optionally `cd`s into `canonical_remote_path`
 /// (failing with exit code 77 if the cd fails, which the host
 /// classifier maps to `RemotePathInvalid`), then emits the
-/// shell-started sentinel, execs the user's login shell, and emits
-/// the exit-status sentinel on return.
-pub fn build_sentinel_wrapper_script(canonical_remote_path: Option<&str>) -> String {
+/// shell-started sentinel, executes either the user's login shell
+/// (default for interactive tabs) or the supplied `optional_exec`
+/// command (used by auto-launch so `claude --dangerously-skip-
+/// permissions` runs as the remote command), and emits the
+/// exit-status sentinel on return.
+pub fn build_sentinel_wrapper_script(
+    canonical_remote_path: Option<&str>,
+    optional_exec: Option<&crate::transport::ShellCommand>,
+) -> String {
     let mut script = String::new();
     if let Some(cwd) = canonical_remote_path {
         // Single-quote-escape the path so embedded `'` survives the
@@ -196,7 +202,26 @@ pub fn build_sentinel_wrapper_script(canonical_remote_path: Option<&str>) -> Str
         osc = SSH_OSC_NUMBER,
         started = SSH_OSC_SHELL_STARTED,
     ));
-    script.push_str("if [ -n \"$SHELL\" ] && [ -x \"$SHELL\" ]; then \"$SHELL\" -l; status=$?; else /bin/sh -l; status=$?; fi\n");
+    match optional_exec {
+        None => {
+            // Default: interactive login shell.
+            script.push_str("if [ -n \"$SHELL\" ] && [ -x \"$SHELL\" ]; then \"$SHELL\" -l; status=$?; else /bin/sh -l; status=$?; fi\n");
+        }
+        Some(cmd) => {
+            // Run a specific command instead of the login shell.
+            // Each argv element is single-quoted via the POSIX
+            // `'\''` idiom so embedded apostrophes survive intact.
+            let program = shell_single_quote(&cmd.program.display().to_string());
+            let mut line = program;
+            for a in &cmd.args {
+                line.push(' ');
+                line.push_str(&shell_single_quote(a));
+            }
+            script.push_str(&line);
+            script.push('\n');
+            script.push_str("status=$?\n");
+        }
+    }
     script.push_str(&format!(
         "printf '\\033]{osc};{prefix}%s\\a' \"$status\"\nexit \"$status\"\n",
         osc = SSH_OSC_NUMBER,
@@ -579,7 +604,20 @@ impl Transport for SshTransport {
                 message: "SshTransport requires WorkspaceLocation::Remote".into(),
             }
         })?;
-        let wrapper = build_sentinel_wrapper_script(Some(&location.canonical_remote_path));
+        // An empty `command.program` is the sentinel for "no remote
+        // command requested; run an interactive login shell." Any
+        // non-empty program means the auto-launch executor (or any
+        // future caller) wants the remote side to exec that program
+        // in place of the login shell.
+        let optional_exec = if request.command.program.as_os_str().is_empty() {
+            None
+        } else {
+            Some(&request.command)
+        };
+        let wrapper = build_sentinel_wrapper_script(
+            Some(&location.canonical_remote_path),
+            optional_exec,
+        );
         spawn_ssh_with_wrapper_script(
             &self.ssh_program,
             &self.control_dir,
@@ -1204,7 +1242,7 @@ mod tests {
 
     #[test]
     fn build_sentinel_wrapper_script_emits_shell_started_and_exit_sentinels() {
-        let script = build_sentinel_wrapper_script(Some("/srv/work"));
+        let script = build_sentinel_wrapper_script(Some("/srv/work"), None);
         assert!(script.contains("am-shell-started"));
         assert!(script.contains("am-exit-status;"));
         assert!(script.contains("1338"));
@@ -1214,15 +1252,68 @@ mod tests {
 
     #[test]
     fn build_sentinel_wrapper_script_omits_cwd_when_none() {
-        let script = build_sentinel_wrapper_script(None);
+        let script = build_sentinel_wrapper_script(None, None);
         assert!(!script.contains("AM_REMOTE_CWD"));
         assert!(script.contains("am-shell-started"));
     }
 
     #[test]
     fn build_sentinel_wrapper_script_shell_escapes_apostrophe() {
-        let script = build_sentinel_wrapper_script(Some("/srv/it's mine"));
+        let script = build_sentinel_wrapper_script(Some("/srv/it's mine"), None);
         assert!(script.contains("'/srv/it'\\''s mine'"));
+    }
+
+    /// When `optional_exec` is supplied, the wrapper must replace
+    /// the login-shell branch with a quoted invocation of the
+    /// requested program + args. The OSC sentinels stay intact.
+    #[test]
+    fn build_sentinel_wrapper_script_with_exec_replaces_login_shell() {
+        use crate::transport::ShellCommand;
+        let cmd = ShellCommand {
+            program: std::path::PathBuf::from("/usr/bin/claude"),
+            args: vec!["--dangerously-skip-permissions".into()],
+        };
+        let script = build_sentinel_wrapper_script(Some("/srv"), Some(&cmd));
+        assert!(
+            !script.contains("\"$SHELL\" -l"),
+            "exec mode must not fall through to the login shell branch; got {script}"
+        );
+        assert!(
+            script.contains("'/usr/bin/claude' '--dangerously-skip-permissions'"),
+            "wrapper must emit the quoted program + args; got {script}"
+        );
+        assert!(script.contains("am-shell-started"));
+        assert!(script.contains("am-exit-status;"));
+    }
+
+    /// Round-trip the composed `sh -lc` remote command through
+    /// `/bin/sh -c` to mirror OpenSSH parsing; assert the requested
+    /// program's exit code surfaces via the exit-status sentinel.
+    /// Runs a harmless `/bin/sh -c "exit 7"` so the test stays
+    /// self-contained.
+    #[cfg(unix)]
+    #[test]
+    fn compose_remote_command_round_trips_with_custom_exec() {
+        use crate::transport::ShellCommand;
+        let cmd = ShellCommand {
+            program: std::path::PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "exit 7".into()],
+        };
+        // Omit the cd block so the script runs anywhere.
+        let wrapper = build_sentinel_wrapper_script(None, Some(&cmd));
+        let composed = compose_remote_command(&wrapper);
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&composed)
+            .output()
+            .expect("sh -c");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("am-exit-status;7"),
+            "wrapper exit-status sentinel must carry the requested command's exit code; got stdout={stdout:?}"
+        );
+        // The wrapper itself returns the same code via `exit`.
+        assert_eq!(output.status.code(), Some(7));
     }
 
     #[test]

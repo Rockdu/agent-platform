@@ -617,11 +617,27 @@ fn append_scrollback(buf: &Arc<StdMutex<String>>, chunk: &[u8]) {
     }
 }
 
+/// Pure resolver: look the workspace_id up in the registry and
+/// return its `WorkspaceLocation` if present. Returns `None` for
+/// missing / unparseable ids or transient terminals. Factored out
+/// so the routing decision in the spawn command is unit-testable
+/// without a Tauri harness.
+fn resolve_workspace_location_for_spawn(
+    workspace_id: Option<&str>,
+    workspaces: &crate::workspaces::WorkspaceRegistry,
+) -> Option<crate::workspaces::WorkspaceLocation> {
+    workspace_id
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .and_then(|uuid| workspaces.find_by_id(uuid))
+        .map(|rec| rec.location)
+}
+
 #[tauri::command]
 pub async fn terminal_spawn(
     req: TerminalSpawnRequest,
     app: AppHandle,
     registry: State<'_, TerminalMeshRegistry>,
+    workspaces: State<'_, crate::workspaces::WorkspaceRegistry>,
 ) -> Result<TerminalSpawnResponse, TerminalMeshErrorDto> {
     let cols = if req.cols == 0 { DEFAULT_COLS } else { req.cols };
     let rows = if req.rows == 0 { DEFAULT_ROWS } else { req.rows };
@@ -632,6 +648,17 @@ pub async fn terminal_spawn(
         .filter(|p| p.exists());
     let command = resolve_default_shell(&req.env);
 
+    // Resolve the workspace's location so Remote workspaces route
+    // through SSH / Docker-over-SSH transports. Local workspaces
+    // and transient terminals (no workspace_id) stay on the default
+    // LocalTransport path.
+    let resolved_location =
+        resolve_workspace_location_for_spawn(req.workspace_id.as_deref(), &workspaces);
+
+    let workspace_location_for_spec = resolved_location
+        .as_ref()
+        .map(|loc| loc.to_core_workspace_location());
+
     let spec = TerminalSpec {
         terminal_id: Uuid::new_v4(),
         command,
@@ -640,21 +667,109 @@ pub async fn terminal_spawn(
         env: req.env,
         cols,
         rows,
-        workspace_location: None,
+        workspace_location: workspace_location_for_spec,
     };
 
-    let terminal_id = spawn_into_registry(
-        spec,
-        &app,
-        &registry,
-        req.tab_id,
-        TabKind::Workspace,
-        req.workspace_id,
-    )
-    .map_err(|e| TerminalMeshErrorDto::from(&e))?;
+    let terminal_id = match resolved_location.as_ref() {
+        Some(loc) => {
+            let routing =
+                crate::workspace_launch_scheduler::select_transport_kind_for(loc);
+            spawn_workspace_via_routing(
+                spec,
+                routing,
+                &app,
+                &registry,
+                req.tab_id,
+                TabKind::Workspace,
+                req.workspace_id,
+            )?
+        }
+        None => spawn_into_registry(
+            spec,
+            &app,
+            &registry,
+            req.tab_id,
+            TabKind::Workspace,
+            req.workspace_id,
+        )
+        .map_err(|e| TerminalMeshErrorDto::from(&e))?,
+    };
     Ok(TerminalSpawnResponse {
         terminal_id: terminal_id.to_string(),
     })
+}
+
+/// Pure-helper-flavored dispatch: take a precomputed
+/// `TransportRouting` decision and pick the matching transport,
+/// constructing `SshTransport` / `DockerOverSshTransport` lazily
+/// against the app-data ControlMaster dir. Returns
+/// `TerminalMeshErrorDto::Io` on transport construction failures so
+/// the frontend can surface them through the existing terminal
+/// error path.
+#[allow(clippy::too_many_arguments)]
+fn spawn_workspace_via_routing(
+    spec: TerminalSpec,
+    routing: crate::workspace_launch_scheduler::TransportRouting,
+    app: &AppHandle,
+    registry: &TerminalMeshRegistry,
+    tab_id: Option<String>,
+    tab_kind: TabKind,
+    workspace_id: Option<String>,
+) -> Result<Uuid, TerminalMeshErrorDto> {
+    use crate::workspace_launch_scheduler::TransportRouting;
+    match routing {
+        TransportRouting::Local => spawn_into_registry(
+            spec,
+            app,
+            registry,
+            tab_id,
+            tab_kind,
+            workspace_id,
+        )
+        .map_err(|e| TerminalMeshErrorDto::from(&e)),
+        TransportRouting::Ssh | TransportRouting::DockerOverSsh => {
+            let app_data = app
+                .try_state::<crate::orchestrator::OrchestratorBootstrap>()
+                .map(|b| b.app_data_root.clone())
+                .ok_or_else(|| TerminalMeshErrorDto::Io {
+                    context: "select_transport".into(),
+                    message: "OrchestratorBootstrap app_data_root unavailable".into(),
+                })?;
+            let transport: Arc<dyn terminal_mesh_core::transport::Transport> = match routing {
+                TransportRouting::Ssh => Arc::new(
+                    terminal_mesh_core::SshTransport::from_app_data(
+                        PathBuf::from("/usr/bin/ssh"),
+                        &app_data,
+                    )
+                    .map_err(|e| TerminalMeshErrorDto::Io {
+                        context: "SshTransport::from_app_data".into(),
+                        message: e.to_string(),
+                    })?,
+                ),
+                TransportRouting::DockerOverSsh => Arc::new(
+                    terminal_mesh_core::DockerOverSshTransport::from_app_data(
+                        PathBuf::from("/usr/bin/ssh"),
+                        &app_data,
+                    )
+                    .map_err(|e| TerminalMeshErrorDto::Io {
+                        context: "DockerOverSshTransport::from_app_data".into(),
+                        message: e.to_string(),
+                    })?,
+                ),
+                TransportRouting::Local => unreachable!("Local handled above"),
+            };
+            spawn_into_registry_with_transport(
+                spec,
+                transport,
+                app,
+                registry,
+                tab_id,
+                tab_kind,
+                workspace_id,
+            )
+            .map_err(|e| TerminalMeshErrorDto::from(&e))
+        }
+    }
 }
 
 /// Spawn a `TerminalActor` for `spec`, register it under its
@@ -1150,6 +1265,103 @@ pub fn workspace_lifecycle_snapshot(
 mod tests {
     use super::*;
     use std::sync::Arc as StdArc;
+
+    /// Cover the helper that `terminal_spawn` uses to decide
+    /// transport routing: a Local workspace round-trips to
+    /// `TransportRouting::Local`; a Remote workspace without a
+    /// container routes through `Ssh`; a Remote workspace with a
+    /// container routes through `DockerOverSsh`; an unknown
+    /// workspace_id and a `None` request both produce no location
+    /// (callers fall back to the default LocalTransport path).
+    #[test]
+    fn select_transport_for_request_uses_workspace_location_for_remote_workspaces() {
+        use crate::workspace_launch_scheduler::{
+            select_transport_kind_for, TransportRouting,
+        };
+        use crate::workspaces::{
+            ContainerLocation, SshLocation, WorkspaceRegistry,
+        };
+
+        let storage = tempfile::TempDir::new().unwrap();
+        let local_path_dir = tempfile::TempDir::new().unwrap();
+        let registry = WorkspaceRegistry::empty(
+            storage.path().to_path_buf(),
+            None,
+        );
+
+        let local_rec = registry
+            .register_workspace(local_path_dir.path(), false)
+            .expect("register Local");
+        let ssh_rec = registry
+            .register_remote_workspace(
+                "remote-ssh",
+                SshLocation {
+                    user: Some("alice".into()),
+                    host: "host.invalid".into(),
+                    port: Some(22),
+                    canonical_remote_path: "/srv".into(),
+                },
+                None,
+                false,
+            )
+            .expect("register Remote SSH");
+        let docker_rec = registry
+            .register_remote_workspace(
+                "remote-docker",
+                SshLocation {
+                    user: Some("alice".into()),
+                    host: "host.invalid".into(),
+                    port: Some(22),
+                    canonical_remote_path: "/srv".into(),
+                },
+                Some(ContainerLocation {
+                    container_id: "abc".into(),
+                    cwd_in_container: Some("/work".into()),
+                }),
+                false,
+            )
+            .expect("register Remote Docker");
+
+        let local_id = local_rec.workspace_id.to_string();
+        let ssh_id = ssh_rec.workspace_id.to_string();
+        let docker_id = docker_rec.workspace_id.to_string();
+
+        let local_loc = resolve_workspace_location_for_spawn(Some(&local_id), &registry)
+            .expect("local resolved");
+        assert_eq!(
+            select_transport_kind_for(&local_loc),
+            TransportRouting::Local
+        );
+        let ssh_loc = resolve_workspace_location_for_spawn(Some(&ssh_id), &registry)
+            .expect("ssh resolved");
+        assert_eq!(
+            select_transport_kind_for(&ssh_loc),
+            TransportRouting::Ssh
+        );
+        let docker_loc =
+            resolve_workspace_location_for_spawn(Some(&docker_id), &registry)
+                .expect("docker resolved");
+        assert_eq!(
+            select_transport_kind_for(&docker_loc),
+            TransportRouting::DockerOverSsh
+        );
+        assert!(
+            resolve_workspace_location_for_spawn(
+                Some(&Uuid::new_v4().to_string()),
+                &registry
+            )
+            .is_none(),
+            "missing id resolves to None so the caller falls back to LocalTransport"
+        );
+        assert!(
+            resolve_workspace_location_for_spawn(None, &registry).is_none(),
+            "None workspace_id is the transient terminal sentinel"
+        );
+        assert!(
+            resolve_workspace_location_for_spawn(Some("not-a-uuid"), &registry).is_none(),
+            "unparseable id is treated like a transient terminal"
+        );
+    }
 
     #[test]
     fn registry_round_trip() {

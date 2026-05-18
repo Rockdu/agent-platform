@@ -184,7 +184,11 @@ export function TerminalMeshView({
             await spawnTerminal({
               cols: term.cols,
               rows: term.rows,
-              cwd,
+              // Remote tabs carry `cwd = ""` (the OpenTab sentinel
+              // for "no local path"); the backend routes them via
+              // `workspace_location.canonical_remote_path` instead.
+              // Drop the empty string so the wire shape is honest.
+              cwd: cwd && cwd.length > 0 ? cwd : undefined,
               tabId,
               workspaceId,
             })

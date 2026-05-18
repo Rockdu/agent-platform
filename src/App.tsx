@@ -52,6 +52,7 @@ import {
   requestWorkspaceAutoLaunch,
   type AutoLaunchErrorDto,
   type WorkspaceErrorDto,
+  type WorkspaceLocation,
   type WorkspaceRecord,
 } from "./workspaces";
 import { WorkspaceSwitcherModal } from "./WorkspaceSwitcherModal";
@@ -1049,7 +1050,16 @@ interface OpenTab {
   tabId: string;
   workspaceId: string;
   workspaceName: string;
+  /// Local filesystem path for Local workspaces; empty string for
+  /// Remote workspaces (kept as a stable string so Finder/Cursor
+  /// callers stay typed; they MUST check `workspaceLocation.kind`
+  /// before treating it as a usable path).
   workspacePath: string;
+  /// Full registry-side location so downstream rendering and the
+  /// host spawn path can route to the right Transport. Local tabs
+  /// retain the old `workspacePath` semantics; Remote tabs carry
+  /// the SSH + optional Container shape.
+  workspaceLocation: WorkspaceLocation;
   /// `true` when this tab's claude PTY is being scheduled via
   /// `WorkspaceLaunchScheduler`. The tab's `TerminalMeshView` MUST
   /// NOT call `spawnTerminal` while this is true and no live
@@ -1343,9 +1353,11 @@ function MultiTerminalContainer() {
       try {
         const refreshed = await openWorkspace(workspace.workspaceId, tabId);
         setError(null);
-        const willAutoLaunch =
-          refreshed.profile.autoLaunchClaude &&
-          refreshed.location.kind === "local";
+        // Any workspace with the auto-launch flag set qualifies —
+        // Remote workspaces route through SshTransport /
+        // DockerOverSshTransport on the backend (see
+        // `select_transport_kind_for` + `RealLaunchExecutor`).
+        const willAutoLaunch = refreshed.profile.autoLaunchClaude;
         setTabs((prev) => {
           if (prev.some((t) => t.workspaceId === refreshed.workspaceId)) {
             return prev;
@@ -1357,23 +1369,19 @@ function MultiTerminalContainer() {
               workspaceId: refreshed.workspaceId,
               workspaceName: refreshed.name,
               workspacePath: localPath(refreshed) ?? "",
+              workspaceLocation: refreshed.location,
               awaitingAutoLaunch: willAutoLaunch,
             },
           ];
         });
         setActive(tabId);
         void refreshWorkspaces();
-        // Auto-launch claude when the profile asks for it AND the
-        // workspace is Local. Fire-and-forget: the backend
-        // scheduler returns immediately after enqueueing; the
-        // eventual terminal_id arrives via the lifecycle
-        // subscription. Remote / disabled-auto-launch paths are
-        // typed-rejected on the backend, so swallow those without
-        // surfacing a user-facing error.
-        if (
-          refreshed.profile.autoLaunchClaude &&
-          refreshed.location.kind === "local"
-        ) {
+        // Fire-and-forget: the backend scheduler returns
+        // immediately after enqueueing; the eventual terminal_id
+        // arrives via the lifecycle subscription. Disabled-auto-
+        // launch paths are typed-rejected on the backend, so
+        // swallow those without surfacing a user-facing error.
+        if (refreshed.profile.autoLaunchClaude) {
           void requestWorkspaceAutoLaunch(refreshed.workspaceId, tabId).catch(
             (err) => {
               if (isAutoLaunchErrorDto(err)) {

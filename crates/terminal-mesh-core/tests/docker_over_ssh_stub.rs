@@ -444,3 +444,69 @@ fn docker_remote_without_container_rejected_with_protocol_error() {
         "expected Protocol; got {err:?}"
     );
 }
+
+/// When the spawn request carries a non-empty `ShellCommand`, the
+/// docker wrapper must invoke it inside the container (after the
+/// shell-started sentinel) instead of falling through to a login
+/// shell. Verifies the same exec-replacement that
+/// `ssh_transport_runs_requested_command_when_provided` covers for
+/// the SSH path, but inside the `docker exec -it <container> ...`
+/// envelope.
+#[test]
+fn docker_transport_runs_requested_command_when_provided() {
+    let tmp = TempDir::new().unwrap();
+    let recorder = tmp.path().join("argv.log");
+    let t = docker_transport(
+        &tmp,
+        &recorder,
+        "printf '\\033]1338;am-shell-started\\a'\nprintf '\\033]1338;am-exit-status;0\\a'\nexit 0\n",
+    );
+    let req = TransportSpawnRequest {
+        workspace: WorkspaceLocation::Remote {
+            user: Some("alice".into()),
+            host: "h.example".into(),
+            port: Some(2222),
+            canonical_remote_path: "/srv".into(),
+            container: Some(ContainerLocation {
+                container_id: "my-container".into(),
+                cwd_in_container: None,
+            }),
+        },
+        command: ShellCommand {
+            program: PathBuf::from("/usr/bin/claude"),
+            args: vec!["--dangerously-skip-permissions".into()],
+        },
+        initial_size: terminal_mesh_core::transport::PtySize { cols: 80, rows: 24 },
+        env: BTreeMap::new(),
+        cwd: None,
+    };
+    let mut session = t.spawn(req).expect("spawn ok");
+    let status = session.wait().expect("wait");
+    assert!(
+        matches!(status, TransportExitStatus::CleanCompletion),
+        "expected CleanCompletion, got {status:?}"
+    );
+    session.cleanup().expect("cleanup");
+
+    let argv = read_recorder(&recorder);
+    assert!(
+        argv.contains("/usr/bin/claude"),
+        "spawn argv must invoke the requested program inside the container; got:\n{argv}"
+    );
+    assert!(
+        argv.contains("--dangerously-skip-permissions"),
+        "spawn argv must carry the requested argv element; got:\n{argv}"
+    );
+    assert!(
+        argv.contains("docker exec -it"),
+        "spawn argv must still wrap the command in docker exec; got:\n{argv}"
+    );
+    assert!(
+        argv.contains("my-container"),
+        "spawn argv must target the configured container; got:\n{argv}"
+    );
+    assert!(
+        !argv.contains("$SHELL"),
+        "exec mode must not fall through to the login-shell branch; got:\n{argv}"
+    );
+}

@@ -92,6 +92,7 @@ fn wrapper_pid_file_for(session_id: &str) -> String {
 fn build_docker_wrapper_script(
     session_id: &str,
     canonical_remote_path: Option<&str>,
+    optional_exec: Option<&crate::transport::ShellCommand>,
 ) -> String {
     let pid_file = wrapper_pid_file_for(session_id);
     let mut script = String::new();
@@ -114,7 +115,23 @@ fn build_docker_wrapper_script(
             "AM_REMOTE_CWD={escaped}\nif ! cd \"$AM_REMOTE_CWD\" 2>/dev/null; then status=$?; fi\n",
         ));
     }
-    script.push_str("if [ \"$status\" -eq 0 ]; then if [ -n \"$SHELL\" ] && [ -x \"$SHELL\" ]; then \"$SHELL\" -l; status=$?; else /bin/sh -l; status=$?; fi; fi\n");
+    match optional_exec {
+        None => {
+            script.push_str("if [ \"$status\" -eq 0 ]; then if [ -n \"$SHELL\" ] && [ -x \"$SHELL\" ]; then \"$SHELL\" -l; status=$?; else /bin/sh -l; status=$?; fi; fi\n");
+        }
+        Some(cmd) => {
+            // Same shell-quote-and-exec pattern as the SSH wrapper.
+            let program = shell_single_quote(&cmd.program.display().to_string());
+            let mut line = program;
+            for a in &cmd.args {
+                line.push(' ');
+                line.push_str(&shell_single_quote(a));
+            }
+            script.push_str(&format!(
+                "if [ \"$status\" -eq 0 ]; then {line}\nstatus=$?\nfi\n",
+            ));
+        }
+    }
     script.push_str(&format!(
         "printf '\\033]{osc};{prefix}%s\\a' \"$status\"\nexit \"$status\"\n",
         osc = SSH_OSC_NUMBER,
@@ -127,15 +144,18 @@ fn build_docker_wrapper_script(
 /// slot: `docker exec -it <container> /bin/sh -lc '<inner>'`. The
 /// inner wrapper writes the wrapper PID, traps for cleanup, emits
 /// the OSC 1338 sentinels, optionally `cd` to the container cwd,
-/// and execs the login shell. Container id is shell-quoted; the
-/// inner script is single-quoted via the POSIX `'\''` idiom so
-/// apostrophes inside the wrapper round-trip safely.
+/// and executes either the user's login shell (default) or
+/// `optional_exec` (used by auto-launch). Container id is
+/// shell-quoted; the inner script is single-quoted via the POSIX
+/// `'\''` idiom so apostrophes inside the wrapper round-trip
+/// safely.
 pub fn compose_docker_remote_command(
     container_id: &str,
     session_id: &str,
     canonical_remote_path: Option<&str>,
+    optional_exec: Option<&crate::transport::ShellCommand>,
 ) -> String {
-    let inner = build_docker_wrapper_script(session_id, canonical_remote_path);
+    let inner = build_docker_wrapper_script(session_id, canonical_remote_path, optional_exec);
     format!(
         "docker exec -it {container} /bin/sh -lc {inner_quoted}",
         container = shell_single_quote(container_id),
@@ -290,10 +310,19 @@ impl Transport for DockerOverSshTransport {
             .cwd_in_container
             .as_deref()
             .or(Some(ssh_location.canonical_remote_path.as_str()));
+        // Mirror SshTransport's optional-exec sentinel: an empty
+        // `command.program` means "interactive login shell"; anything
+        // else means "exec this program/args inside the container."
+        let optional_exec = if request.command.program.as_os_str().is_empty() {
+            None
+        } else {
+            Some(&request.command)
+        };
         let docker_cmd = compose_docker_remote_command(
             &docker.container_id,
             &session_id,
             cwd_for_wrapper,
+            optional_exec,
         );
         let inner_session = spawn_ssh_with_wrapper_script(
             &self.ssh_program,
@@ -594,7 +623,7 @@ mod tests {
 
     #[test]
     fn compose_docker_remote_command_starts_with_docker_exec() {
-        let cmd = compose_docker_remote_command("my-container", "sess-1", Some("/srv"));
+        let cmd = compose_docker_remote_command("my-container", "sess-1", Some("/srv"), None);
         assert!(
             cmd.starts_with("docker exec -it 'my-container' /bin/sh -lc '"),
             "cmd should start with docker exec -it; got {cmd}"
@@ -604,7 +633,7 @@ mod tests {
 
     #[test]
     fn compose_docker_remote_command_contains_session_pid_file() {
-        let cmd = compose_docker_remote_command("c", "abc-123", None);
+        let cmd = compose_docker_remote_command("c", "abc-123", None, None);
         assert!(
             cmd.contains("/tmp/agentmesh-wrapper-abc-123.pid"),
             "PID file path must include session id; got {cmd}"
@@ -613,8 +642,8 @@ mod tests {
 
     #[test]
     fn compose_docker_remote_command_uses_session_id_to_avoid_collision() {
-        let a = compose_docker_remote_command("c", "session-A", None);
-        let b = compose_docker_remote_command("c", "session-B", None);
+        let a = compose_docker_remote_command("c", "session-A", None, None);
+        let b = compose_docker_remote_command("c", "session-B", None, None);
         assert_ne!(a, b, "different session ids must yield different commands");
         assert!(a.contains("session-A"));
         assert!(b.contains("session-B"));
@@ -622,14 +651,49 @@ mod tests {
 
     #[test]
     fn compose_docker_remote_command_contains_both_osc_sentinels() {
-        let cmd = compose_docker_remote_command("c", "s", Some("/srv"));
+        let cmd = compose_docker_remote_command("c", "s", Some("/srv"), None);
         assert!(cmd.contains("am-shell-started"));
         assert!(cmd.contains("am-exit-status;"));
     }
 
+    /// When `optional_exec` is supplied, the docker wrapper must
+    /// replace the login-shell branch with a quoted invocation of
+    /// the requested program + args (inside the docker exec).
+    #[test]
+    fn compose_docker_remote_command_with_exec_runs_command_in_container() {
+        use crate::transport::ShellCommand;
+        let cmd = ShellCommand {
+            program: std::path::PathBuf::from("/usr/bin/claude"),
+            args: vec!["--dangerously-skip-permissions".into()],
+        };
+        let composed = compose_docker_remote_command("ctr", "s1", Some("/srv"), Some(&cmd));
+        // The composed command is the OUTER `docker exec -it ctr
+        // /bin/sh -lc '<inner>'`. The INNER body is single-quoted
+        // for shell-safety, which `'\''` -escapes the apostrophes
+        // around `/usr/bin/claude`. Assert the structural pieces
+        // are present.
+        assert!(
+            composed.contains("/usr/bin/claude"),
+            "composed must reference the claude program; got {composed}"
+        );
+        assert!(
+            composed.contains("--dangerously-skip-permissions"),
+            "composed must reference the requested argv; got {composed}"
+        );
+        // The login-shell fallback `\"$SHELL\" -l` must NOT appear
+        // when an exec was supplied. The composed string survives
+        // two layers of POSIX single-quoting, so the literal
+        // `"$SHELL"` is escaped to `\"$SHELL\"` (one backslash, two
+        // double-quotes); match on the bare token to be flexible.
+        assert!(
+            !composed.contains("$SHELL"),
+            "exec mode must not fall through to login shell; got {composed}"
+        );
+    }
+
     #[test]
     fn compose_docker_remote_command_escapes_apostrophe_in_remote_cwd() {
-        let cmd = compose_docker_remote_command("c", "s", Some("/srv/it's mine"));
+        let cmd = compose_docker_remote_command("c", "s", Some("/srv/it's mine"), None);
         // The path embeds inside two layers of single-quoting (outer
         // docker `sh -lc '...'` + inner POSIX escape). Round-trip via
         // /bin/sh -c proves the wrapper still parses correctly.
@@ -656,7 +720,7 @@ mod tests {
     /// must not contain any of these forbidden subcommands.
     #[test]
     fn neither_spawn_nor_cleanup_emits_forbidden_docker_subcommands() {
-        let spawn_cmd = compose_docker_remote_command("c", "s", Some("/srv"));
+        let spawn_cmd = compose_docker_remote_command("c", "s", Some("/srv"), None);
         let cleanup_cmd = compose_docker_cleanup_command("c", "s");
         for forbidden in [
             "docker stop",
@@ -710,7 +774,7 @@ mod tests {
     /// correct directory inside the container.
     #[test]
     fn docker_wrapper_uses_cwd_in_container_when_present() {
-        let cmd = compose_docker_remote_command("c", "s", Some("/app/work"));
+        let cmd = compose_docker_remote_command("c", "s", Some("/app/work"), None);
         assert!(
             cmd.contains("/app/work"),
             "compose must use the supplied container cwd; got {cmd}"
@@ -728,7 +792,7 @@ mod tests {
         // becomes the SSH path. Helper-level smoke that the helper
         // accepts None and the spawn site is the one that supplies
         // the fallback.
-        let cmd = compose_docker_remote_command("c", "s", None);
+        let cmd = compose_docker_remote_command("c", "s", None, None);
         assert!(
             !cmd.contains("AM_REMOTE_CWD"),
             "compose with None cwd must omit the cd block; got {cmd}"
