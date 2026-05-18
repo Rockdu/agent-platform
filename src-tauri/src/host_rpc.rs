@@ -100,6 +100,18 @@ struct ReadScrollbackResult {
 #[serde(rename_all = "camelCase")]
 struct ListTabsParams {
     client_id: String,
+    /// Caller-presented privileged capability. The orchestrator's
+    /// sidecar passes its stashed `terminal_mesh_capability`
+    /// here; regular workspace callers omit this field (they fall
+    /// through to `OwnTab` scope, which doesn't require any
+    /// capability). The presented value MUST byte-match the
+    /// stored `OrchestratorSession.terminal_mesh_capability` to
+    /// be granted `ListTabsScope::All`. Existence on the stored
+    /// side alone is forgeable via `clientId` spoofing — only
+    /// possession of the actual capability token proves the
+    /// caller is the orchestrator.
+    #[serde(default)]
+    terminal_mesh_capability: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -402,18 +414,24 @@ fn handle_list_tabs(
 
     // Scope selection: the orchestrator sees every tab; regular
     // workspace callers see ONLY their own tab (sibling-workspace
-    // isolation). String-equality on `caller_tab_id ==
-    // orchestrator_session.tab_id` alone is NOT sufficient — a
-    // sidecar with write access to the host RPC socket could spoof
-    // a clientId carrying the orchestrator's tab id. Mirror the
-    // `handle_read_scrollback` gate: BOTH the tab-id match AND
-    // the orchestrator session's privileged terminal-mesh
-    // capability must be present. Without the capability, the
-    // caller silently falls back to `OwnTab` scope.
+    // isolation). The capability must be CALLER-PRESENTED and
+    // MATCH the stored value — checking only existence on the
+    // stored side is forgeable because any process with write
+    // access to the host-RPC socket can supply
+    // `clientId=claude:<orch_tab_id>:terminal-mesh` (UUIDs leak
+    // via logs / events). Only possession of the actual
+    // capability token proves the caller is the orchestrator.
+    // Missing or mismatched → fall back to `OwnTab` scope; the
+    // `OwnTab` projection itself filters out Orchestrator-kind
+    // entries as defense in depth.
     let orch_snapshot = state.orchestrator.snapshot();
     let is_orchestrator_privileged = orch_snapshot
         .as_ref()
-        .map(|s| s.tab_id == caller_tab_id && s.terminal_mesh_capability.is_some())
+        .zip(params.terminal_mesh_capability.as_deref())
+        .map(|(s, presented)| {
+            s.tab_id == caller_tab_id
+                && s.terminal_mesh_capability.as_deref() == Some(presented)
+        })
         .unwrap_or(false);
     let scope = if is_orchestrator_privileged {
         ListTabsScope::All
@@ -722,8 +740,10 @@ mod tests {
     /// snapshot store needs the orchestrator tab to be marked
     /// `Orchestrator` so the filter actually has something to skip.
     /// Returns the state plus the two workspace tab ids so tests can
-    /// construct valid `claude:<uuid>:terminal-mesh` clientIds.
-    fn bridge_state_for_list_tabs(orch_tab_id: &str) -> (HostRpcState, String, String) {
+    /// construct valid `claude:<uuid>:terminal-mesh` clientIds, and
+    /// the minted orchestrator capability handle so the privileged-
+    /// path test can present it in `terminalMeshCapability`.
+    fn bridge_state_for_list_tabs(orch_tab_id: &str) -> (HostRpcState, String, String, String) {
         let mount_registry = MountRegistry::new();
         let terminal_registry = TerminalMeshRegistry::new();
 
@@ -792,7 +812,7 @@ mod tests {
                 None,
             ),
         };
-        (state, ws_tab_a, ws_tab_b)
+        (state, ws_tab_a, ws_tab_b, resp.handle)
     }
 
     /// A clientId that spoofs the orchestrator's `tab_id` MUST
@@ -893,7 +913,7 @@ mod tests {
     #[test]
     fn host_rpc_list_tabs_rejects_unknown_client_id() {
         let orch_tab = make_uuid_tab_id();
-        let (state, _, _) = bridge_state_for_list_tabs(&orch_tab);
+        let (state, _, _, _) = bridge_state_for_list_tabs(&orch_tab);
         let params = json!({ "clientId": "this is not a valid client id" });
         let err = dispatch_method(&state, "terminalMesh.listTabs", params).unwrap_err();
         assert_eq!(err.code, ERR_INVALID_CLIENT_ID);
@@ -902,7 +922,7 @@ mod tests {
     #[test]
     fn host_rpc_list_tabs_rejects_host_ui_client_id() {
         let orch_tab = make_uuid_tab_id();
-        let (state, _, _) = bridge_state_for_list_tabs(&orch_tab);
+        let (state, _, _, _) = bridge_state_for_list_tabs(&orch_tab);
         let params = json!({ "clientId": "host_ui:terminal-mesh" });
         let err = dispatch_method(&state, "terminalMesh.listTabs", params).unwrap_err();
         assert_eq!(err.code, ERR_INVALID_REQUEST);
@@ -911,9 +931,12 @@ mod tests {
     #[test]
     fn host_rpc_list_tabs_orchestrator_client_id_includes_orchestrator() {
         let orch_tab = make_uuid_tab_id();
-        let (state, _, _) = bridge_state_for_list_tabs(&orch_tab);
+        let (state, _, _, orch_capability) = bridge_state_for_list_tabs(&orch_tab);
+        // The orchestrator must PRESENT its capability handle to
+        // be granted `All` scope — clientId alone is forgeable.
         let params = json!({
             "clientId": format!("claude:{orch_tab}:terminal-mesh"),
+            "terminalMeshCapability": orch_capability,
         });
         let v = dispatch_method(&state, "terminalMesh.listTabs", params)
             .expect("orchestrator client may list every tab");
@@ -926,6 +949,58 @@ mod tests {
         assert!(kinds.contains(&"Orchestrator"));
     }
 
+    /// The orchestrator's clientId WITHOUT the presented
+    /// capability MUST NOT be granted `All` scope. Checking only
+    /// existence on the stored side is forgeable: any process
+    /// that learns / guesses the orchestrator tab id and writes
+    /// to the host RPC socket would otherwise get every workspace
+    /// tab's name / status / id. The presented capability is the
+    /// unforgeable proof that the caller actually holds the
+    /// orchestrator's mint.
+    #[test]
+    fn host_rpc_list_tabs_rejects_orchestrator_tab_id_without_presented_capability() {
+        let orch_tab = make_uuid_tab_id();
+        let (state, _, _, _orch_capability) = bridge_state_for_list_tabs(&orch_tab);
+        // Spoof the orchestrator's tab id — but DON'T present the
+        // capability. The stored session has the capability set
+        // (the normal orchestrator state); the gate must require
+        // the caller to PRESENT the same token and must downscope
+        // to OwnTab when nothing was presented.
+        let params = json!({
+            "clientId": format!("claude:{orch_tab}:terminal-mesh"),
+            // No `terminalMeshCapability` field.
+        });
+        let v = dispatch_method(&state, "terminalMesh.listTabs", params)
+            .expect("listTabs accepts the parse; the capability gate downscopes silently");
+        let tabs = v["tabs"].as_array().expect("tabs is an array");
+        assert_eq!(
+            tabs.len(),
+            0,
+            "spoofer without presented capability must see nothing — OwnTab filters Orchestrator-kind entries"
+        );
+    }
+
+    /// Presenting a non-matching capability token MUST also
+    /// downscope to `OwnTab`. Byte-equality with the stored token
+    /// is the contract.
+    #[test]
+    fn host_rpc_list_tabs_rejects_orchestrator_tab_id_with_wrong_presented_capability() {
+        let orch_tab = make_uuid_tab_id();
+        let (state, _, _, _orch_capability) = bridge_state_for_list_tabs(&orch_tab);
+        let params = json!({
+            "clientId": format!("claude:{orch_tab}:terminal-mesh"),
+            "terminalMeshCapability": "this-is-not-the-real-capability-token",
+        });
+        let v = dispatch_method(&state, "terminalMesh.listTabs", params)
+            .expect("listTabs accepts the parse; the capability gate downscopes silently");
+        let tabs = v["tabs"].as_array().expect("tabs is an array");
+        assert_eq!(
+            tabs.len(),
+            0,
+            "spoofer presenting a wrong capability must see nothing"
+        );
+    }
+
     #[test]
     fn host_rpc_list_tabs_populates_workspace_name_from_registry() {
         // Seed the workspace registry with a known name + record a
@@ -933,7 +1008,7 @@ mod tests {
         // carries the friendly name in workspaceName.
         use crate::workspaces::{WorkspaceLocation, WorkspaceProfile, WorkspaceRecord};
         let orch_tab = make_uuid_tab_id();
-        let (state, _ws_tab_a, _ws_tab_b) = bridge_state_for_list_tabs(&orch_tab);
+        let (state, _ws_tab_a, _ws_tab_b, _orch_capability) = bridge_state_for_list_tabs(&orch_tab);
 
         let real_ws_id = Uuid::new_v4();
         state.workspaces.insert_record_for_tests(WorkspaceRecord {
@@ -978,7 +1053,7 @@ mod tests {
     #[test]
     fn host_rpc_list_tabs_workspace_client_id_returns_only_own_tab() {
         let orch_tab = make_uuid_tab_id();
-        let (state, ws_tab_a, _ws_tab_b) = bridge_state_for_list_tabs(&orch_tab);
+        let (state, ws_tab_a, _ws_tab_b, _orch_capability) = bridge_state_for_list_tabs(&orch_tab);
         // Regular workspace client must see ONLY its own tab. Sibling
         // workspace tabs and the orchestrator slot are both filtered.
         let params = json!({

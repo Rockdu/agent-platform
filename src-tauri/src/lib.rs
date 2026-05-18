@@ -229,20 +229,6 @@ pub(crate) fn auto_launch_command_for_routing(
 /// support log captures the root cause; the user sees the
 /// transport-kind in the rail badge and the Done state in the
 /// pane.
-/// Consume any close-during-launch tombstone for `workspace_id`
-/// without spawning a reap (there is no terminal to reap on
-/// failure paths). Symmetric with the `take` call in the
-/// executor's `Ok` branch — without consuming on failure paths
-/// too, a tombstone set by `close_workspace` during a launch
-/// that subsequently failed would stay in the set and poison
-/// the next successful launch for the same workspace, which
-/// would consume the stale entry and immediately shut down its
-/// terminal. Idempotent: if no tombstone is present the take
-/// returns false and this is a no-op.
-fn discard_close_tombstone_for(registry: &TerminalMeshRegistry, workspace_id: uuid::Uuid) {
-    let _ = registry.take_workspace_closed_during_launch(workspace_id);
-}
-
 /// Build the Done lifecycle envelope for an async auto-launch
 /// failure AND install it into the pending placeholder map so
 /// late subscribers can recover the state via the bootstrap
@@ -270,21 +256,51 @@ fn install_done_envelope_for_tab(
     envelope
 }
 
+/// Decide whether to install the Done placeholder for an async
+/// auto-launch failure, consuming the close-during-launch tombstone
+/// in the process. Returns `Some(envelope)` if the placeholder was
+/// installed (caller should emit), `None` if it was skipped because
+/// the tab was closed during launch (caller must NOT emit).
+///
+/// Workspace tabs reuse the workspace UUID as `tab_id`, so
+/// installing a Done placeholder for a closed-during-launch tab
+/// would persist into the next reopen of the same workspace: the
+/// bootstrap `snapshot_for_tab(tab_id)` fetch would return the
+/// stale Done, the React tab would synthesize an auto-launch
+/// error, clear `awaitingAutoLaunch`, and then ignore the new
+/// launch's real terminal id. Take the tombstone FIRST; if set,
+/// skip the install (idempotent — the user-close path already
+/// removed any prior placeholder, and a closed tab has no
+/// subscriber to drain).
+fn try_install_async_failure_placeholder(
+    registry: &TerminalMeshRegistry,
+    tab_id: &str,
+    workspace_id: uuid::Uuid,
+    transport_kind: crate::workspace_lifecycle::TransportKind,
+) -> Option<crate::workspace_lifecycle::WorkspaceLifecycleSnapshot> {
+    if registry.take_workspace_closed_during_launch(workspace_id) {
+        tracing::debug!(
+            %workspace_id,
+            %tab_id,
+            "skipping async-failure placeholder install: tab was closed during launch"
+        );
+        return None;
+    }
+    Some(install_done_envelope_for_tab(registry, tab_id, transport_kind))
+}
+
 fn surface_auto_launch_async_failure(
     app: &tauri::AppHandle,
     registry: &TerminalMeshRegistry,
     tab_id: &str,
+    workspace_id: uuid::Uuid,
     transport_kind: crate::workspace_lifecycle::TransportKind,
 ) {
-    // Install the Done envelope into the pending placeholder map
-    // so a late subscriber's `snapshot_for_tab(tab_id)` bootstrap
-    // fetch returns the Done state instead of None. Without this,
-    // a subscribe-after-event race would leave the React tab in
-    // `awaitingAutoLaunch: true` forever because the
-    // stuck-waiting watcher only flips the flag when it sees a
-    // Done snapshot — and there would be no snapshot to see.
-    let envelope = install_done_envelope_for_tab(registry, tab_id, transport_kind);
-    crate::workspace_lifecycle::emit_lifecycle_updated_for_placeholder(app, tab_id, &envelope);
+    if let Some(envelope) =
+        try_install_async_failure_placeholder(registry, tab_id, workspace_id, transport_kind)
+    {
+        crate::workspace_lifecycle::emit_lifecycle_updated_for_placeholder(app, tab_id, &envelope);
+    }
 }
 
 impl LaunchExecutor for RealLaunchExecutor {
@@ -336,9 +352,9 @@ impl LaunchExecutor for RealLaunchExecutor {
                     &app,
                     &registry,
                     &tab_id,
+                    workspace_id,
                     crate::workspace_lifecycle::TransportKind::Local,
                 );
-                discard_close_tombstone_for(&registry, workspace_id);
                 if let Some(sched) = scheduler {
                     sched.notify_launch_settled(workspace_id);
                 }
@@ -391,9 +407,9 @@ impl LaunchExecutor for RealLaunchExecutor {
                             &app,
                             &registry,
                             &tab_id,
+                            workspace_id,
                             crate::workspace_lifecycle::TransportKind::Ssh,
                         );
-                        discard_close_tombstone_for(&registry, workspace_id);
                         if let Some(sched) = scheduler {
                             sched.notify_launch_settled(workspace_id);
                         }
@@ -429,9 +445,9 @@ impl LaunchExecutor for RealLaunchExecutor {
                                 &app,
                                 &registry,
                                 &tab_id,
+                                workspace_id,
                                 crate::workspace_lifecycle::TransportKind::Ssh,
                             );
-                            discard_close_tombstone_for(&registry, workspace_id);
                             if let Some(sched) = scheduler {
                                 sched.notify_launch_settled(workspace_id);
                             }
@@ -450,9 +466,9 @@ impl LaunchExecutor for RealLaunchExecutor {
                             &app,
                             &registry,
                             &tab_id,
+                            workspace_id,
                             crate::workspace_lifecycle::TransportKind::SshDocker,
                         );
-                        discard_close_tombstone_for(&registry, workspace_id);
                         if let Some(sched) = scheduler {
                             sched.notify_launch_settled(workspace_id);
                         }
@@ -488,9 +504,9 @@ impl LaunchExecutor for RealLaunchExecutor {
                                 &app,
                                 &registry,
                                 &tab_id,
+                                workspace_id,
                                 crate::workspace_lifecycle::TransportKind::SshDocker,
                             );
-                            discard_close_tombstone_for(&registry, workspace_id);
                             if let Some(sched) = scheduler {
                                 sched.notify_launch_settled(workspace_id);
                             }
@@ -577,8 +593,7 @@ impl LaunchExecutor for RealLaunchExecutor {
                         workspace_launch_scheduler::TransportRouting::DockerOverSsh =>
                             crate::workspace_lifecycle::TransportKind::SshDocker,
                     };
-                    surface_auto_launch_async_failure(&app, &registry, &tab_id, kind);
-                    discard_close_tombstone_for(&registry, workspace_id);
+                    surface_auto_launch_async_failure(&app, &registry, &tab_id, workspace_id, kind);
                 }
             }
             if let Some(sched) = scheduler {
@@ -955,36 +970,6 @@ mod tests {
         );
     }
 
-    /// The discard helper consumes the tombstone idempotently:
-    /// the first call after `mark` returns true through
-    /// `take_workspace_closed_during_launch` (and the discard
-    /// just throws away the bool); subsequent calls are no-ops.
-    /// This is the symmetry the executor relies on to ensure
-    /// every settle path (Ok + 6 failure branches) leaves the
-    /// tombstone set empty.
-    #[test]
-    fn discard_close_tombstone_for_consumes_when_present_and_is_idempotent() {
-        let r = TerminalMeshRegistry::new();
-        let workspace_id = uuid::Uuid::new_v4();
-        // No tombstone yet: discard is a no-op (the underlying
-        // `take` returns false; discard does not panic).
-        discard_close_tombstone_for(&r, workspace_id);
-        assert!(
-            !r.take_workspace_closed_during_launch(workspace_id),
-            "no-op discard must leave the set empty"
-        );
-        // Mark + discard: tombstone is consumed.
-        r.mark_workspace_closed_during_launch(workspace_id);
-        discard_close_tombstone_for(&r, workspace_id);
-        assert!(
-            !r.take_workspace_closed_during_launch(workspace_id),
-            "after discard the tombstone is gone"
-        );
-        // Idempotent: discarding again is still a no-op.
-        discard_close_tombstone_for(&r, workspace_id);
-        assert!(!r.take_workspace_closed_during_launch(workspace_id));
-    }
-
     /// An async auto-launch failure MUST leave a retained Done
     /// snapshot in the pending placeholder map so a React
     /// lifecycle hook that subscribes after the event fired can
@@ -1065,5 +1050,82 @@ mod tests {
             crate::workspace_lifecycle::TransportKind::SshDocker,
             "second install overwrites the first"
         );
+    }
+
+    /// If the user closed a workspace tab while its auto-launch
+    /// was still in `Launching` state and the async path then
+    /// failed, the close-during-launch tombstone is present.
+    /// `try_install_async_failure_placeholder` MUST consume the
+    /// tombstone and MUST NOT install a Done placeholder for the
+    /// now-closed tab. Otherwise — because workspace tabs reuse
+    /// the workspace UUID as `tab_id` — reopening the same
+    /// workspace later would bootstrap from the stale Done
+    /// placeholder, synthesize an auto-launch error, clear
+    /// `awaitingAutoLaunch`, and then ignore the next launch's
+    /// real terminal id.
+    #[test]
+    fn try_install_async_failure_placeholder_skips_install_when_tombstone_present() {
+        let r = TerminalMeshRegistry::new();
+        let workspace_id = uuid::Uuid::new_v4();
+        let tab_id = workspace_id.to_string();
+        // Simulate: user closed the tab mid-launch.
+        r.mark_workspace_closed_during_launch(workspace_id);
+        // Async launch then fails — should NOT install the Done
+        // envelope for this closed tab.
+        let result = try_install_async_failure_placeholder(
+            &r,
+            &tab_id,
+            workspace_id,
+            crate::workspace_lifecycle::TransportKind::Ssh,
+        );
+        assert!(
+            result.is_none(),
+            "tombstone present must skip the placeholder install"
+        );
+        assert!(
+            r.snapshot_for_tab(&tab_id).is_none(),
+            "snapshot_for_tab must return None — no stale Done placeholder for the closed tab"
+        );
+        // The tombstone must have been CONSUMED (not just
+        // observed), otherwise a future successful launch's
+        // `take_workspace_closed_during_launch` would reap the
+        // wrong terminal.
+        assert!(
+            !r.take_workspace_closed_during_launch(workspace_id),
+            "tombstone must be consumed by the failure path"
+        );
+    }
+
+    /// No tombstone → the failure path installs the Done envelope
+    /// as before. This is the common path (transport-level error
+    /// without a close-during-launch race).
+    #[test]
+    fn try_install_async_failure_placeholder_installs_when_no_tombstone() {
+        let r = TerminalMeshRegistry::new();
+        let workspace_id = uuid::Uuid::new_v4();
+        let tab_id = workspace_id.to_string();
+        let result = try_install_async_failure_placeholder(
+            &r,
+            &tab_id,
+            workspace_id,
+            crate::workspace_lifecycle::TransportKind::SshDocker,
+        );
+        let envelope = result.expect("no tombstone must install the placeholder");
+        assert!(matches!(
+            envelope.status,
+            crate::workspace_lifecycle::TabStatus::Done
+        ));
+        assert_eq!(
+            envelope.transport_kind,
+            crate::workspace_lifecycle::TransportKind::SshDocker
+        );
+        // The Done envelope is now visible to late subscribers.
+        let late = r
+            .snapshot_for_tab(&tab_id)
+            .expect("late snapshot lookup returns the installed Done envelope");
+        assert!(matches!(
+            late.status,
+            crate::workspace_lifecycle::TabStatus::Done
+        ));
     }
 }
