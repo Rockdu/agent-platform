@@ -464,7 +464,7 @@ export function TerminalMeshView({
         </aside>
       )}
       <div ref={containerRef} className="terminal-mesh-view__xterm" />
-      {!ready && !error && (
+      {!ready && !error && !autoLaunchError && (
         <p className="placeholder__hint">
           {awaitingAutoLaunch && !existingTerminalId
             ? "等待 claude 启动…"

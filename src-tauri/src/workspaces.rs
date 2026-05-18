@@ -1245,18 +1245,65 @@ pub fn close_workspace(
     if crate::workspace_launch_scheduler::should_mark_close_during_launch(pre_cancel_state) {
         terminal_registry.mark_workspace_closed_during_launch(id);
     }
-    // Pull the workspace's tab_id (if any) so we can also clear the
-    // pending-launch placeholder. The placeholder only exists for
-    // the queued-but-not-yet-spawned window; clearing eagerly avoids
-    // leaving a phantom Pending entry visible after close.
+    // Pull the workspace's tab_id (if any) and reap the scheduler-
+    // owned terminal + clear the pending-launch placeholder.
+    // Returns the terminal id (if any) that was reaped + had its
+    // actor command tx claimed — the caller fires the actor
+    // `Shutdown` outside the helper so the helper itself stays
+    // synchronous and unit-testable without a tokio runtime.
     if let Some(rec) = registry.find_by_id(id) {
         if let Some(t) = rec.open_tab_id.as_deref() {
-            let _ = terminal_registry.clear_pending_for_tab(t);
+            if let Some((terminal_id, tx)) =
+                reap_scheduler_owned_terminal_for_tab(&terminal_registry, t)
+            {
+                if let Some(tx) = tx {
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(terminal_mesh_core::ActorCommand::Shutdown)
+                            .await;
+                    });
+                }
+                tracing::debug!(
+                    %id,
+                    tab_id = %t,
+                    %terminal_id,
+                    "close_workspace: reaped scheduler-owned terminal by tab id"
+                );
+            }
         }
     }
     registry
         .close_workspace(id)
         .map_err(|e| WorkspaceErrorDto::from(&e))
+}
+
+/// Synchronous reap of the scheduler-owned terminal bound to a
+/// tab id, called from `close_workspace`. Clears any pending-launch
+/// placeholder; if a real terminal is registered under the tab id,
+/// claims its actor command tx (so the caller can fire `Shutdown`
+/// outside the helper) and drops it from the registry so the
+/// retained snapshot does not outlive the tab.
+///
+/// Returns `Some((terminal_id, command_tx))` when a terminal was
+/// found; `None` when only a placeholder existed (still cleared) or
+/// no entry existed at all. The placeholder-only case avoids the
+/// race window where the user closes a workspace whose auto-launch
+/// has settled the spawn AND registered the terminal but whose
+/// real-id event hasn't reached the frontend yet — the frontend's
+/// `closeTab` would otherwise lookup `terminalIdByTabId[tabId]`,
+/// get null, and skip the shutdown.
+pub fn reap_scheduler_owned_terminal_for_tab(
+    terminal_registry: &crate::terminal_mesh::TerminalMeshRegistry,
+    tab_id: &str,
+) -> Option<(
+    Uuid,
+    Option<tokio::sync::mpsc::Sender<terminal_mesh_core::ActorCommand>>,
+)> {
+    let _ = terminal_registry.clear_pending_for_tab(tab_id);
+    let terminal_id = terminal_registry.lookup_terminal_by_tab(tab_id)?;
+    let tx = terminal_registry.lookup_command_tx(terminal_id);
+    terminal_registry.forget(terminal_id);
+    Some((terminal_id, tx))
 }
 
 #[tauri::command]
@@ -1544,6 +1591,63 @@ mod tests {
         reg.open_workspace(rec.workspace_id, "tab-1").unwrap();
         let r = reg.resolve_for_tab("tab-1").expect("resolved");
         assert_eq!(r.workspace_id, rec.workspace_id);
+    }
+
+    /// Reap a settled scheduler-owned terminal by tab id. This
+    /// closes the close-during-id-resolution race: when the
+    /// executor's Ok branch has registered the terminal under the
+    /// tab id but the frontend lifecycle hook hasn't populated
+    /// `terminalIdByTabId[tabId]` yet, the frontend's `closeTab`
+    /// path can't issue the shutdown — the backend must take over.
+    #[test]
+    fn reap_scheduler_owned_terminal_drops_registry_entry_and_claims_tx() {
+        use crate::terminal_mesh::TerminalMeshRegistry;
+        let term_registry = TerminalMeshRegistry::new();
+        let terminal_id = Uuid::new_v4();
+        let tab_id = Uuid::new_v4().to_string();
+        let (tx, _rx) =
+            tokio::sync::mpsc::channel::<terminal_mesh_core::ActorCommand>(8);
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        term_registry.record(
+            terminal_id,
+            tx,
+            buf,
+            Some(tab_id.clone()),
+            crate::workspace_lifecycle::TabKind::Workspace,
+            None,
+            crate::workspace_lifecycle::TransportKind::Local,
+        );
+        // Sanity: terminal is registered under the tab id.
+        assert_eq!(
+            term_registry.lookup_terminal_by_tab(&tab_id),
+            Some(terminal_id)
+        );
+        let result = reap_scheduler_owned_terminal_for_tab(&term_registry, &tab_id);
+        let (reaped_id, reaped_tx) = result.expect("terminal found and reaped");
+        assert_eq!(reaped_id, terminal_id);
+        assert!(reaped_tx.is_some(), "actor command tx returned for shutdown");
+        // After reap: registry no longer resolves the tab to a
+        // terminal — defense in depth so the next operation sees
+        // a clean slate.
+        assert_eq!(
+            term_registry.lookup_terminal_by_tab(&tab_id),
+            None,
+            "terminal forgotten after reap"
+        );
+    }
+
+    /// When no terminal is registered under the tab id (e.g. the
+    /// user closes a workspace that never spawned anything, or
+    /// the only state is a pending placeholder), the helper
+    /// returns None — the placeholder is still cleared as a side
+    /// effect.
+    #[test]
+    fn reap_scheduler_owned_terminal_returns_none_when_no_terminal_registered() {
+        use crate::terminal_mesh::TerminalMeshRegistry;
+        let term_registry = TerminalMeshRegistry::new();
+        let tab_id = Uuid::new_v4().to_string();
+        let result = reap_scheduler_owned_terminal_for_tab(&term_registry, &tab_id);
+        assert!(result.is_none());
     }
 
     #[test]

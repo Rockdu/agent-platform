@@ -24,7 +24,12 @@ async fn main() -> ExitCode {
         .init();
 
     let args: Vec<String> = env::args().skip(1).collect();
-    let parsed = match parse_args(args) {
+    // Privileged terminal-mesh capability handle, sourced from the
+    // env (NOT argv — env keeps it out of `ps` output). Present
+    // only when the orchestrator's MCP config minted the
+    // privileged mount and embedded the handle.
+    let terminal_mesh_capability = env::var("TERMINAL_MESH_CAPABILITY").ok();
+    let parsed = match parse_args(args, terminal_mesh_capability) {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(error = %e, "terminal-mesh-sidecar: bad args");
@@ -36,6 +41,7 @@ async fn main() -> ExitCode {
         workspace = %parsed.workspace.display(),
         host_rpc_sock = %parsed.host_rpc_sock.display(),
         cross_tab_read_marker = parsed.cross_tab_read,
+        has_terminal_mesh_capability = parsed.terminal_mesh_capability.is_some(),
         "terminal-mesh-sidecar: ready"
     );
 
@@ -68,9 +74,12 @@ async fn main() -> ExitCode {
             }
         };
         let sock = parsed.host_rpc_sock.clone();
-        let response = handle_mcp_request(&parsed.client_id, msg, |bridge_req| async move {
-            call_bridge_once(&sock, &bridge_req).await
-        })
+        let response = handle_mcp_request(
+            &parsed.client_id,
+            parsed.terminal_mesh_capability.as_deref(),
+            msg,
+            |bridge_req| async move { call_bridge_once(&sock, &bridge_req).await },
+        )
         .await;
         let mut bytes = match encode_message(&response) {
             Ok(b) => b,

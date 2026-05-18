@@ -272,6 +272,30 @@ pub(crate) fn spawn_orchestrator_claude(
 ) -> Result<OrchestratorSession, OrchestratorError> {
     let tab_id = Uuid::new_v4().to_string();
     let workspace_root_for_dev_path = workspace_root_for_dev();
+
+    // Mint the orchestrator's privileged `terminal-mesh` capability
+    // FIRST so the MCP config can embed it as
+    // `TERMINAL_MESH_CAPABILITY` in the orchestrator's terminal-mesh
+    // sidecar entry. The sidecar forwards this handle on
+    // `listTabs` requests so the host bridge gate (which requires
+    // the caller to PRESENT the token — clientId alone is
+    // forgeable) can grant `All` scope.
+    //
+    // The handle never crosses the frontend IPC boundary because
+    // the session field is `#[serde(skip)]`; it only reaches the
+    // sidecar via the orchestrator-owned MCP config env.
+    let terminal_mesh_capability =
+        match crate::dispatcher::insert_orchestrator_mount(mount_registry, "terminal-mesh", Some(&tab_id)) {
+            Ok(resp) => Some(resp.handle),
+            Err(dto) => {
+                return Err(OrchestratorError::SpawnFailed {
+                    message: format!(
+                        "failed to mint orchestrator terminal-mesh capability: {dto}"
+                    ),
+                });
+            }
+        };
+
     let doc = mcp_config::generate_config_with_host_rpc_sock(
         &tab_id,
         agent_platform_root,
@@ -279,6 +303,7 @@ pub(crate) fn spawn_orchestrator_claude(
         app_data_root,
         &workspace_root_for_dev_path,
         host_rpc_sock,
+        terminal_mesh_capability.as_deref(),
     )
     .map_err(|e| OrchestratorError::McpConfigFailed {
         message: e.to_string(),
@@ -316,48 +341,20 @@ pub(crate) fn spawn_orchestrator_claude(
         crate::workspace_lifecycle::TabKind::Orchestrator,
         None,
     ) {
-        Ok(terminal_id) => {
-            // task21 / AC-3.3: mint the orchestrator's privileged
-            // `terminal-mesh` mount with `cross_tab_read_flag = true`.
-            // The handle is stashed on the (Rust-only) session field;
-            // it never crosses the IPC boundary because the field is
-            // `#[serde(skip)]`. `insert_orchestrator_mount` requires
-            // the built-in/manifest metadata to declare
-            // `cross_tab_read` — `terminal-mesh` does (see
-            // `builtin_plugins::BUILTIN_PLUGINS`). Failure here means
-            // the metadata table is misconfigured; surface as
-            // `SpawnFailed` so the round trip is observable to the
-            // frontend.
-            let terminal_mesh_capability = match crate::dispatcher::insert_orchestrator_mount(
-                mount_registry,
-                "terminal-mesh",
-                Some(&tab_id),
-            ) {
-                Ok(resp) => Some(resp.handle),
-                Err(dto) => {
-                    // Clean up the PTY we just spawned and the config
-                    // we just wrote — without the privileged mount,
-                    // the orchestrator session can't satisfy AC-3.3.
-                    registry.forget(terminal_id);
-                    mcp_config::delete_config(app_data_root, &tab_id);
-                    return Err(OrchestratorError::SpawnFailed {
-                        message: format!(
-                            "failed to mint orchestrator terminal-mesh capability: {dto}"
-                        ),
-                    });
-                }
-            };
-            Ok(OrchestratorSession {
-                terminal_id,
-                tab_id,
-                mcp_config_path,
-                terminal_mesh_capability,
-            })
-        }
+        Ok(terminal_id) => Ok(OrchestratorSession {
+            terminal_id,
+            tab_id,
+            mcp_config_path,
+            terminal_mesh_capability,
+        }),
         Err(e) => {
             // Clean up the just-written MCP config so the next
             // attempt doesn't trip the startup_gc / orphan-config
-            // checks later.
+            // checks later. The MountRegistry entry leaks
+            // (in-memory only, bounded by app lifetime) — no
+            // `remove_mount` API exists; the leak is acceptable
+            // because the handle never reaches any other code
+            // path without an OrchestratorSession to look it up.
             mcp_config::delete_config(app_data_root, &tab_id);
             Err(OrchestratorError::SpawnFailed {
                 message: e.to_string(),

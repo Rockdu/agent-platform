@@ -28,10 +28,18 @@ pub struct SidecarArgs {
     pub workspace: PathBuf,
     pub host_rpc_sock: PathBuf,
     /// Configuration-intent marker accepted from the orchestrator's
-    /// MCP config (Codex round-37 review: "configuration intent only;
-    /// the host bridge's clientId-based auth is authoritative"). This
-    /// flag does NOT change the sidecar's behavior in any way.
+    /// MCP config ("configuration intent only; the host bridge's
+    /// clientId-based auth is authoritative"). This flag does NOT
+    /// change the sidecar's behavior in any way.
     pub cross_tab_read: bool,
+    /// Privileged terminal-mesh capability handle, sourced from the
+    /// `TERMINAL_MESH_CAPABILITY` env var. Present only in the
+    /// orchestrator's sidecar config. Forwarded to the host bridge
+    /// as `terminalMeshCapability` in `listTabs` so the bridge gate
+    /// can grant `All` scope (the gate requires the CALLER to
+    /// present the capability, not just exist on the stored side —
+    /// clientId alone is forgeable).
+    pub terminal_mesh_capability: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -46,7 +54,13 @@ pub enum SidecarArgError {
 
 /// Parse CLI args from an iterator (skip argv[0] before calling).
 /// Accepts: `--client-id <id>` `--workspace <path>` `--host-rpc-sock <path>` `[--cross-tab-read]`.
-pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<SidecarArgs, SidecarArgError> {
+/// The optional `terminal_mesh_capability` is the env-sourced
+/// capability handle; the binary entry point reads `TERMINAL_MESH_CAPABILITY`
+/// and passes it through here so tests can inject deterministic values.
+pub fn parse_args<I: IntoIterator<Item = String>>(
+    args: I,
+    terminal_mesh_capability: Option<String>,
+) -> Result<SidecarArgs, SidecarArgError> {
     let mut client_id: Option<String> = None;
     let mut workspace: Option<PathBuf> = None;
     let mut host_rpc_sock: Option<PathBuf> = None;
@@ -79,6 +93,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<SidecarArgs
         host_rpc_sock: host_rpc_sock
             .ok_or(SidecarArgError::MissingRequired("--host-rpc-sock"))?,
         cross_tab_read,
+        terminal_mesh_capability,
     })
 }
 
@@ -141,6 +156,13 @@ struct BridgeReadScrollbackParams<'a> {
 #[serde(rename_all = "camelCase")]
 struct BridgeListTabsParams<'a> {
     client_id: &'a str,
+    /// Privileged orchestrator capability handle, sourced from the
+    /// `TERMINAL_MESH_CAPABILITY` env var. The host bridge gate
+    /// grants `ListTabsScope::All` only when the caller PRESENTS
+    /// the capability AND it matches the stored value — clientId
+    /// alone is forgeable. Omitted from the wire when None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_mesh_capability: Option<&'a str>,
 }
 
 /// Translate an MCP `tools/call` request into a bridge JSON-RPC call.
@@ -148,8 +170,13 @@ struct BridgeListTabsParams<'a> {
 /// JSON-RPC request the caller should send over the socket. The
 /// dispatch is keyed by the MCP `tool_name` so adding tools is a pure
 /// arm-extension.
+///
+/// `terminal_mesh_capability` is the env-sourced privileged handle
+/// (present only in the orchestrator's sidecar config). Forwarded
+/// for `list_tabs` so the host bridge can grant `All` scope.
 pub fn build_bridge_request(
     client_id: &str,
+    terminal_mesh_capability: Option<&str>,
     tool_name: &str,
     tool_args: Value,
     request_id: JsonRpcId,
@@ -176,10 +203,14 @@ pub fn build_bridge_request(
         }
         "terminal_mesh.list_tabs" => {
             // The list_tabs tool takes no inputSchema fields beyond
-            // the implicit clientId, so tool_args is ignored.
+            // the implicit clientId + capability, so tool_args is
+            // ignored.
             let _ = tool_args;
-            let params = serde_json::to_value(BridgeListTabsParams { client_id })
-                .expect("bridge params serialize");
+            let params = serde_json::to_value(BridgeListTabsParams {
+                client_id,
+                terminal_mesh_capability,
+            })
+            .expect("bridge params serialize");
             Ok(JsonRpcMessage::request(
                 request_id,
                 "terminalMesh.listTabs",
@@ -267,6 +298,7 @@ pub async fn call_bridge_once(
 /// mock.
 pub async fn handle_mcp_request<F, Fut>(
     client_id: &str,
+    terminal_mesh_capability: Option<&str>,
     req: JsonRpcRequest,
     bridge: F,
 ) -> JsonRpcMessage
@@ -289,8 +321,13 @@ where
                 .unwrap_or("")
                 .to_string();
             let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
-            let bridge_req =
-                match build_bridge_request(client_id, &tool_name, arguments, JsonRpcId::Number(1)) {
+            let bridge_req = match build_bridge_request(
+                client_id,
+                terminal_mesh_capability,
+                &tool_name,
+                arguments,
+                JsonRpcId::Number(1),
+            ) {
                     Ok(r) => r,
                     Err(err) => {
                         return JsonRpcMessage::Response(JsonRpcResponse {
@@ -361,7 +398,7 @@ mod tests {
             "--host-rpc-sock".into(),
             "/tmp/host.sock".into(),
         ];
-        let parsed = parse_args(args).expect("parse ok");
+        let parsed = parse_args(args, None).expect("parse ok");
         assert_eq!(parsed.client_id, "claude:abc:terminal-mesh");
         assert_eq!(parsed.workspace, PathBuf::from("/tmp/ws"));
         assert_eq!(parsed.host_rpc_sock, PathBuf::from("/tmp/host.sock"));
@@ -379,13 +416,13 @@ mod tests {
             "/tmp/h.sock".into(),
             "--cross-tab-read".into(),
         ];
-        let parsed = parse_args(args).expect("parse ok");
+        let parsed = parse_args(args, None).expect("parse ok");
         assert!(parsed.cross_tab_read, "marker preserved");
     }
 
     #[test]
     fn parse_args_rejects_missing_required() {
-        let err = parse_args(vec!["--client-id".into(), "x".into()]).unwrap_err();
+        let err = parse_args(vec!["--client-id".into(), "x".into()], None).unwrap_err();
         assert!(matches!(err, SidecarArgError::MissingRequired("--workspace")));
     }
 
@@ -440,6 +477,7 @@ mod tests {
         });
         let req = build_bridge_request(
             "claude:T:terminal-mesh",
+            None,
             "terminal_mesh.read_scrollback",
             tool_args,
             JsonRpcId::Number(7),
@@ -460,6 +498,7 @@ mod tests {
         let tool_args = json!({ "target_tab_id": "abc" });
         let req = build_bridge_request(
             "claude:T:terminal-mesh",
+            None,
             "terminal_mesh.read_scrollback",
             tool_args,
             JsonRpcId::Number(7),
@@ -473,11 +512,14 @@ mod tests {
     }
 
     #[test]
-    fn build_bridge_request_for_list_tabs_forwards_only_client_id() {
-        // list_tabs takes no tool args; only clientId reaches the
-        // bridge.
+    fn build_bridge_request_for_list_tabs_omits_capability_when_none() {
+        // Regular workspace clients (no capability) MUST NOT
+        // include the `terminalMeshCapability` field on the wire —
+        // the host bridge's `#[serde(default)]` would otherwise see
+        // `Some("")` etc. and conflate it with a real handle.
         let req = build_bridge_request(
             "claude:T:terminal-mesh",
+            None,
             "terminal_mesh.list_tabs",
             Value::Null,
             JsonRpcId::Number(9),
@@ -490,22 +532,69 @@ mod tests {
         let params = r.params.expect("params present");
         assert_eq!(params["clientId"], "claude:T:terminal-mesh");
         assert!(
-            params.get("targetTabId").is_none(),
-            "list_tabs must NOT forward read_scrollback fields"
+            params.get("terminalMeshCapability").is_none(),
+            "capability MUST be omitted from the wire when None"
         );
+        assert!(params.get("targetTabId").is_none());
         assert!(params.get("maxBytes").is_none());
+    }
+
+    #[test]
+    fn build_bridge_request_for_list_tabs_forwards_capability_when_present() {
+        // Orchestrator's sidecar receives the capability via the
+        // `TERMINAL_MESH_CAPABILITY` env var; the bridge request
+        // MUST forward it as `terminalMeshCapability` so the host
+        // gate can grant `All` scope (the gate requires the
+        // CALLER to PRESENT the token — clientId alone is
+        // forgeable).
+        let req = build_bridge_request(
+            "claude:T:terminal-mesh",
+            Some("orch-handle-xyz"),
+            "terminal_mesh.list_tabs",
+            Value::Null,
+            JsonRpcId::Number(11),
+        )
+        .expect("build ok");
+        let JsonRpcMessage::Request(r) = req else {
+            panic!("expected Request");
+        };
+        let params = r.params.expect("params present");
+        assert_eq!(params["clientId"], "claude:T:terminal-mesh");
+        assert_eq!(
+            params["terminalMeshCapability"], "orch-handle-xyz",
+            "capability forwarded byte-for-byte"
+        );
     }
 
     #[test]
     fn build_bridge_request_rejects_unknown_tool_name() {
         let err = build_bridge_request(
             "claude:T:terminal-mesh",
+            None,
             "terminal_mesh.not_a_real_tool",
             Value::Null,
             JsonRpcId::Number(1),
         )
         .expect_err("unknown tool must error");
         assert_eq!(err.code, -32601);
+    }
+
+    #[test]
+    fn parse_args_round_trip_carries_terminal_mesh_capability() {
+        let args = vec![
+            "--client-id".into(),
+            "claude:abc:terminal-mesh".into(),
+            "--workspace".into(),
+            "/tmp/ws".into(),
+            "--host-rpc-sock".into(),
+            "/tmp/host.sock".into(),
+        ];
+        let parsed =
+            parse_args(args, Some("orch-handle-abc".into())).expect("parse ok");
+        assert_eq!(
+            parsed.terminal_mesh_capability.as_deref(),
+            Some("orch-handle-abc")
+        );
     }
 
     #[test]
@@ -549,7 +638,7 @@ mod tests {
             method: "tools/list".to_string(),
             params: None,
         };
-        let resp = handle_mcp_request("claude:T:terminal-mesh", req, |_| async {
+        let resp = handle_mcp_request("claude:T:terminal-mesh", None, req, |_| async {
             panic!("tools/list must not call the bridge");
             #[allow(unreachable_code)]
             Ok::<_, std::io::Error>(JsonRpcResponse {
@@ -586,7 +675,7 @@ mod tests {
                 "arguments": {}
             })),
         };
-        let resp = handle_mcp_request("claude:T:terminal-mesh", req, |bridge_req| async move {
+        let resp = handle_mcp_request("claude:T:terminal-mesh", None, req, |bridge_req| async move {
             let JsonRpcMessage::Request(r) = bridge_req else {
                 panic!("expected Request");
             };
@@ -621,6 +710,51 @@ mod tests {
         assert!(text.contains("abc"));
     }
 
+    /// When the sidecar holds the orchestrator's privileged
+    /// capability, `handle_mcp_request` MUST forward it on the
+    /// bridge call for `list_tabs` so the host gate can grant
+    /// `All` scope.
+    #[tokio::test]
+    async fn handle_mcp_request_tools_call_list_tabs_forwards_capability_to_bridge() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: JsonRpcId::Number(12),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "terminal_mesh.list_tabs",
+                "arguments": {}
+            })),
+        };
+        let resp = handle_mcp_request(
+            "claude:T:terminal-mesh",
+            Some("orch-handle-12345"),
+            req,
+            |bridge_req| async move {
+                let JsonRpcMessage::Request(r) = bridge_req else {
+                    panic!("expected Request");
+                };
+                assert_eq!(r.method, "terminalMesh.listTabs");
+                let params = r.params.expect("params");
+                assert_eq!(params["clientId"], "claude:T:terminal-mesh");
+                assert_eq!(
+                    params["terminalMeshCapability"], "orch-handle-12345",
+                    "capability forwarded from sidecar"
+                );
+                Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: JsonRpcId::Number(1),
+                    result: Some(json!({ "tabs": [] })),
+                    error: None,
+                })
+            },
+        )
+        .await;
+        let JsonRpcMessage::Response(r) = resp else {
+            panic!("expected Response");
+        };
+        assert!(r.result.is_some());
+    }
+
     #[tokio::test]
     async fn handle_mcp_request_tools_call_forwards_to_bridge_and_returns_text() {
         let req = JsonRpcRequest {
@@ -632,7 +766,7 @@ mod tests {
                 "arguments": { "target_tab_id": "tab-x", "max_bytes": 4096 }
             })),
         };
-        let resp = handle_mcp_request("claude:T:terminal-mesh", req, |bridge_req| async move {
+        let resp = handle_mcp_request("claude:T:terminal-mesh", None, req, |bridge_req| async move {
             // Assert the bridge request shape.
             let JsonRpcMessage::Request(r) = bridge_req else {
                 panic!("expected Request");
@@ -667,7 +801,7 @@ mod tests {
                 "arguments": { "target_tab_id": "tab-z" }
             })),
         };
-        let resp = handle_mcp_request("claude:T:terminal-mesh", req, |_| async {
+        let resp = handle_mcp_request("claude:T:terminal-mesh", None, req, |_| async {
             Ok(JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 id: JsonRpcId::Number(1),
@@ -702,7 +836,7 @@ mod tests {
                 "arguments": {}
             })),
         };
-        let resp = handle_mcp_request("claude:T:terminal-mesh", req, |_| async {
+        let resp = handle_mcp_request("claude:T:terminal-mesh", None, req, |_| async {
             panic!("must not call bridge for unknown tool");
             #[allow(unreachable_code)]
             Ok::<_, std::io::Error>(JsonRpcResponse {

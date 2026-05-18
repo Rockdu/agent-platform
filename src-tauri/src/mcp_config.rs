@@ -175,6 +175,7 @@ pub fn generate_config(
         app_data,
         workspace_root_for_dev,
         None,
+        None,
     )
 }
 
@@ -190,6 +191,16 @@ pub fn generate_config_with_host_rpc_sock(
     app_data: &Path,
     workspace_root_for_dev: &Path,
     host_rpc_sock: Option<&Path>,
+    // Orchestrator's privileged `terminal-mesh` capability handle.
+    // When Some AND the plugin being generated is the orchestrator's
+    // `terminal-mesh` entry, embed it as the env var
+    // `TERMINAL_MESH_CAPABILITY` so the sidecar can forward it in
+    // `listTabs` requests. The host bridge gate grants `All` scope
+    // only when the caller PRESENTS this token AND it matches the
+    // stored value — clientId alone is forgeable.
+    //
+    // env (not argv) keeps the handle out of `ps` output.
+    orchestrator_terminal_mesh_capability: Option<&str>,
 ) -> Result<McpConfigDocument, McpConfigError> {
     validate_tab_id(tab_id)?;
 
@@ -244,6 +255,16 @@ pub fn generate_config_with_host_rpc_sock(
 
         let mut env: BTreeMap<String, String> = BTreeMap::new();
         env.insert("APP_DATA_DIR".to_string(), app_data.display().to_string());
+        // Orchestrator's privileged terminal-mesh capability handle:
+        // only embedded for the orchestrator's `terminal-mesh` entry.
+        // Other plugins / non-orchestrator configs see no capability
+        // env var (the host bridge's `terminalMeshCapability`
+        // requirement falls through to `OwnTab` scope for them).
+        if kind == McpConfigKind::Orchestrator && plugin_id == ORCHESTRATOR_CROSS_TAB_PLUGIN {
+            if let Some(handle) = orchestrator_terminal_mesh_capability {
+                env.insert("TERMINAL_MESH_CAPABILITY".to_string(), handle.to_string());
+            }
+        }
 
         // Defensive: refuse to ship any env key that looks like a secret.
         for key in env.keys() {
@@ -456,6 +477,10 @@ pub async fn generate_mcp_config(
         &app_data,
         &workspace_root,
         bootstrap.host_rpc_sock.as_deref(),
+        // Regular (non-orchestrator) tabs never get the privileged
+        // capability — the orchestrator is the only caller that
+        // mints + embeds the handle.
+        None,
     )
     .map_err(|e| McpConfigErrorDto::from(&e))?;
     let final_path = write_atomic(&app_data, &tab_id, &doc).map_err(|e| McpConfigErrorDto::from(&e))?;
@@ -640,6 +665,7 @@ mod tests {
             app_data.path(),
             workspace_root.path(),
             Some(std::path::Path::new("/tmp/host.sock")),
+            None,
         )
         .expect("generate");
         let entry = doc
@@ -683,6 +709,7 @@ mod tests {
             app_data.path(),
             workspace_root.path(),
             Some(std::path::Path::new("/tmp/host-std.sock")),
+            None,
         )
         .expect("generate");
         let entry = doc
@@ -863,6 +890,100 @@ mod tests {
         assert!(server.get("command").is_some());
         assert!(server.get("args").is_some());
         assert!(server.get("env").is_some());
+    }
+
+    /// The orchestrator's `terminal-mesh` sidecar entry MUST
+    /// receive the privileged capability handle in env so the
+    /// sidecar can forward it on `listTabs` calls. The host
+    /// bridge gate requires the caller to PRESENT the token —
+    /// clientId alone is forgeable.
+    #[test]
+    fn orchestrator_terminal_mesh_entry_carries_capability_env_when_provided() {
+        let app_data = tempfile::TempDir::new().unwrap();
+        let workspace_root = tempfile::TempDir::new().unwrap();
+        let workspace = make_workspace_dir();
+        stub_sidecar_for(workspace_root.path(), "terminal-mesh-sidecar");
+        let doc = generate_config_with_host_rpc_sock(
+            "tab-orch",
+            workspace.path(),
+            McpConfigKind::Orchestrator,
+            app_data.path(),
+            workspace_root.path(),
+            Some(std::path::Path::new("/tmp/host.sock")),
+            Some("orch-handle-XYZ"),
+        )
+        .expect("generate");
+        let entry = doc
+            .mcp_servers
+            .get("terminal-mesh")
+            .expect("terminal-mesh entry");
+        assert_eq!(
+            entry.env.get("TERMINAL_MESH_CAPABILITY").map(|s| s.as_str()),
+            Some("orch-handle-XYZ"),
+            "orchestrator terminal-mesh entry MUST carry the capability env; env={:?}",
+            entry.env
+        );
+    }
+
+    /// Non-orchestrator configs MUST NOT carry the capability env
+    /// var, regardless of whether a value was passed to the
+    /// generator. This is belt-and-suspenders alongside the
+    /// `kind == Orchestrator && plugin_id == ORCHESTRATOR_CROSS_TAB_PLUGIN`
+    /// gate.
+    #[test]
+    fn standard_config_never_includes_capability_env_even_if_value_supplied() {
+        let app_data = tempfile::TempDir::new().unwrap();
+        let workspace_root = tempfile::TempDir::new().unwrap();
+        let workspace = make_workspace_dir();
+        stub_sidecar_for(workspace_root.path(), "terminal-mesh-sidecar");
+        let doc = generate_config_with_host_rpc_sock(
+            "tab-std",
+            workspace.path(),
+            McpConfigKind::Standard,
+            app_data.path(),
+            workspace_root.path(),
+            Some(std::path::Path::new("/tmp/host-std.sock")),
+            Some("attacker-supplied-handle"),
+        )
+        .expect("generate");
+        let entry = doc
+            .mcp_servers
+            .get("terminal-mesh")
+            .expect("terminal-mesh entry");
+        assert!(
+            !entry.env.contains_key("TERMINAL_MESH_CAPABILITY"),
+            "standard config MUST NOT carry the capability env; env={:?}",
+            entry.env
+        );
+    }
+
+    /// Even on the orchestrator config, when the caller did not
+    /// supply a capability (None), the env var must be absent — no
+    /// empty-string sentinel leaks through.
+    #[test]
+    fn orchestrator_config_omits_capability_env_when_none() {
+        let app_data = tempfile::TempDir::new().unwrap();
+        let workspace_root = tempfile::TempDir::new().unwrap();
+        let workspace = make_workspace_dir();
+        stub_sidecar_for(workspace_root.path(), "terminal-mesh-sidecar");
+        let doc = generate_config_with_host_rpc_sock(
+            "tab-orch",
+            workspace.path(),
+            McpConfigKind::Orchestrator,
+            app_data.path(),
+            workspace_root.path(),
+            Some(std::path::Path::new("/tmp/host.sock")),
+            None,
+        )
+        .expect("generate");
+        let entry = doc
+            .mcp_servers
+            .get("terminal-mesh")
+            .expect("terminal-mesh entry");
+        assert!(
+            !entry.env.contains_key("TERMINAL_MESH_CAPABILITY"),
+            "missing capability must NOT introduce an env var"
+        );
     }
 
     #[test]
