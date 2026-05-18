@@ -1092,15 +1092,20 @@ pub async fn terminal_shutdown(
     registry: State<'_, TerminalMeshRegistry>,
 ) -> Result<(), TerminalMeshErrorDto> {
     let id = parse_terminal_id(&terminal_id).map_err(|e| TerminalMeshErrorDto::from(&e))?;
-    let tx = registry
-        .lookup_command_tx(id)
-        .ok_or_else(|| TerminalMeshError::NotFound {
-            terminal_id: id.to_string(),
-        })
-        .map_err(|e| TerminalMeshErrorDto::from(&e))?;
-    // Best-effort send; if the actor has already exited the channel
-    // is closed and that's acceptable.
-    let _ = tx.send(ActorCommand::Shutdown).await;
+    // The live command tx may already be gone — when the actor
+    // exits naturally, `forward_events_to_webview` calls
+    // `forget_live` to clear the live entry while keeping the
+    // retained snapshot for Done-queue survival. The user's
+    // explicit close (e.g. closing a Done-row tab) MUST drop the
+    // retained snapshot too so `list_tabs` and lifecycle
+    // bootstraps stop surfacing the dead tab. Treat "no live tx"
+    // as "already exited; just clean up the retained side and
+    // succeed."
+    if let Some(tx) = registry.lookup_command_tx(id) {
+        // Best-effort send; if the actor has already exited the
+        // channel is closed and that's acceptable.
+        let _ = tx.send(ActorCommand::Shutdown).await;
+    }
     registry.forget(id);
     Ok(())
 }
@@ -2007,6 +2012,53 @@ mod tests {
         assert!(
             r.snapshot_for_tab("tab-natural").is_some(),
             "retained tab index must survive forget_live"
+        );
+    }
+
+    /// Done-row close after natural exit MUST drop the retained
+    /// snapshot. The natural-exit path calls `forget_live` (live
+    /// tx is gone); the subsequent explicit `terminal_shutdown`
+    /// Tauri command needs to call `forget(id)` even when
+    /// `lookup_command_tx` returns None (no live tx remains).
+    /// Without this, `terminalMesh.list_tabs` keeps surfacing the
+    /// dead tab and reload bootstraps render a phantom row.
+    #[test]
+    fn forget_after_forget_live_clears_retained_snapshot() {
+        let r = TerminalMeshRegistry::new();
+        let id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
+        let buf = StdArc::new(StdMutex::new(String::new()));
+        r.record(
+            id,
+            tx,
+            buf,
+            Some("tab-done-then-close".into()),
+            TabKind::Workspace,
+            None,
+            TransportKind::Local,
+        );
+        // Natural exit: live tx is dropped, retained snapshot
+        // survives so the Done queue can render the tab.
+        r.forget_live(id);
+        assert!(
+            r.lookup_command_tx(id).is_none(),
+            "post-forget_live there is no live tx"
+        );
+        assert!(
+            r.snapshot_for_terminal(id).is_some(),
+            "retained snapshot survives forget_live"
+        );
+        // User clicks close on the Done row. The Tauri command
+        // sees lookup_command_tx is None but MUST still call
+        // forget to drop the retained side.
+        r.forget(id);
+        assert!(
+            r.snapshot_for_terminal(id).is_none(),
+            "explicit forget after forget_live drops the retained snapshot"
+        );
+        assert!(
+            r.snapshot_for_tab("tab-done-then-close").is_none(),
+            "snapshot_tab_index entry also dropped so list_tabs stops surfacing the tab"
         );
     }
 

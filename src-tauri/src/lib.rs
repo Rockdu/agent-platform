@@ -278,25 +278,41 @@ impl LaunchExecutor for RealLaunchExecutor {
                 .try_state::<orchestrator::OrchestratorBootstrap>()
                 .map(|b| b.app_data_root.clone());
 
-            let Some(path) = claude_path else {
+            // Local routing needs the host-resolved absolute
+            // `claude` path; Remote routing uses the bare `claude`
+            // command on the remote host (`auto_launch_command_for_routing`
+            // ignores the path for Remote). Only abort the launch
+            // when discovery is needed but absent — Remote
+            // workspaces must still be allowed to proceed when
+            // local discovery is not Ready (e.g. claude is
+            // installed only on the remote machine).
+            let path = if let Some(p) = claude_path {
+                p
+            } else if workspace_launch_scheduler::should_block_auto_launch_on_local_discovery(
+                routing,
+            ) {
                 tracing::warn!(
                     %workspace_id,
                     %tab_id,
-                    "auto-launch skipped: claude discovery not ready"
+                    "auto-launch skipped: claude discovery not ready (Local routing)"
                 );
-                let kind = match routing {
-                    workspace_launch_scheduler::TransportRouting::Local =>
-                        crate::workspace_lifecycle::TransportKind::Local,
-                    workspace_launch_scheduler::TransportRouting::Ssh =>
-                        crate::workspace_lifecycle::TransportKind::Ssh,
-                    workspace_launch_scheduler::TransportRouting::DockerOverSsh =>
-                        crate::workspace_lifecycle::TransportKind::SshDocker,
-                };
-                surface_auto_launch_async_failure(&app, &registry, &tab_id, kind);
+                surface_auto_launch_async_failure(
+                    &app,
+                    &registry,
+                    &tab_id,
+                    crate::workspace_lifecycle::TransportKind::Local,
+                );
                 if let Some(sched) = scheduler {
                     sched.notify_launch_settled(workspace_id);
                 }
                 return;
+            } else {
+                // Remote routing — the executor will set
+                // `spec.command = "claude"` via the bare-name
+                // helper, so any PathBuf works as the unused
+                // value passed in. Empty PathBuf is the clearest
+                // sentinel.
+                PathBuf::new()
             };
             let core_location = location.to_core_workspace_location();
             let cwd_for_spec = match &core_location {

@@ -270,6 +270,29 @@ pub fn select_transport_kind_for(location: &WorkspaceLocation) -> TransportRouti
     }
 }
 
+/// Pure helper: should the local `DiscoveryCache` be required to
+/// be `Ready` before an auto-launch is enqueued? Yes for Local
+/// routing (the spec.command is the host-resolved absolute path).
+/// No for Remote routing — the executor invokes the bare `claude`
+/// command on the remote host and the local discovery path is
+/// meaningless there, so blocking on local discovery would deny
+/// users with claude installed only on the remote machine.
+pub fn should_block_auto_launch_on_local_discovery(routing: TransportRouting) -> bool {
+    matches!(routing, TransportRouting::Local)
+}
+
+/// Pure helper: should `close_workspace` drop a close-during-
+/// launch tombstone? Only when the workspace is actually
+/// `Launching` at close time. `scheduler.cancel(id)` returns
+/// false for BOTH `Launching` (the target case) AND `NotPresent`
+/// (already settled / never enqueued), so using `!was_pending`
+/// as the gate over-marks the tombstone for normal closes; the
+/// next auto-launch for the same workspace would then consume
+/// the stale tombstone and immediately shut down its terminal.
+pub fn should_mark_close_during_launch(state: SchedulerState) -> bool {
+    matches!(state, SchedulerState::Launching)
+}
+
 /// Pure helper: claude discovery must be in the Ready state before a
 /// launch can be enqueued. Extracted from the Tauri command so unit
 /// tests can exercise the rejection paths without a Tauri harness.
@@ -308,12 +331,22 @@ pub fn request_workspace_auto_launch(
     discovery: State<'_, DiscoveryCache>,
     terminal_registry: State<'_, TerminalMeshRegistry>,
 ) -> Result<(), AutoLaunchErrorDto> {
-    // Reject up front when claude discovery is not Ready so the
-    // frontend can show the typed error. Per the spec there is NO
-    // silent fallback for this case.
-    try_check_discovery_ready(discovery.snapshot())?;
+    // Resolve the workspace BEFORE the local discovery check so we
+    // can skip the check for Remote routing. Remote spawns use the
+    // bare `claude` command on the remote host (the local
+    // discovery path is meaningless on the remote side), so a user
+    // with claude installed only on the remote machine must still
+    // be able to auto-launch a Remote workspace even when the
+    // local `DiscoveryCache` is not Ready.
     let workspace_uuid = Uuid::parse_str(&workspace_id).ok();
     let record = workspace_uuid.and_then(|id| registry.find_by_id(id));
+    let routing_for_discovery_gate = record
+        .as_ref()
+        .map(|r| select_transport_kind_for(&r.location))
+        .unwrap_or(TransportRouting::Local);
+    if should_block_auto_launch_on_local_discovery(routing_for_discovery_gate) {
+        try_check_discovery_ready(discovery.snapshot())?;
+    }
     let launch = try_build_pending_launch(
         &workspace_id,
         tab_id.clone(),
@@ -650,6 +683,41 @@ mod tests {
             }
             other => panic!("expected AutoLaunchDisabled; got {other:?}"),
         }
+    }
+
+    /// `close_workspace` may only mark the close-during-launch
+    /// tombstone when the scheduler reports `Launching`. The
+    /// `Pending` case is already handled by the synchronous
+    /// `cancel` call; the `NotPresent` case (already settled or
+    /// never enqueued) MUST NOT mark, otherwise the next auto-
+    /// launch for the same workspace would consume a stale
+    /// tombstone and have its terminal reaped on spawn.
+    #[test]
+    fn should_mark_close_during_launch_only_for_launching_state() {
+        assert!(should_mark_close_during_launch(SchedulerState::Launching));
+        assert!(!should_mark_close_during_launch(SchedulerState::Pending));
+        assert!(!should_mark_close_during_launch(SchedulerState::NotPresent));
+    }
+
+    /// Local routing requires the host's `DiscoveryCache` to be
+    /// `Ready` so the executor has an absolute `claude` path to
+    /// hand to `LocalTransport`. Remote routings (SSH, Docker-
+    /// over-SSH) execute the bare `claude` command on the remote
+    /// host; the local discovery path is meaningless there. The
+    /// pure-helper gate ensures users with claude installed only
+    /// on the remote machine can still auto-launch Remote
+    /// workspaces.
+    #[test]
+    fn should_block_auto_launch_on_local_discovery_routing_matrix() {
+        assert!(should_block_auto_launch_on_local_discovery(
+            TransportRouting::Local
+        ));
+        assert!(!should_block_auto_launch_on_local_discovery(
+            TransportRouting::Ssh
+        ));
+        assert!(!should_block_auto_launch_on_local_discovery(
+            TransportRouting::DockerOverSsh
+        ));
     }
 
     #[test]

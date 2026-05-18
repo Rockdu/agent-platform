@@ -1186,22 +1186,20 @@ pub fn close_workspace(
     terminal_registry: State<'_, crate::terminal_mesh::TerminalMeshRegistry>,
 ) -> Result<(), WorkspaceErrorDto> {
     let id = parse_workspace_id(&workspace_id)?;
-    // Removing a queued auto-launch entry frees the slot without
-    // consuming it. In-flight launches are not cancelable at this
-    // layer; the user's close still succeeds, but we leave a
-    // tombstone so the executor's post-spawn check can shut down
-    // the eventually-spawned terminal and avoid orphaning the
-    // child process when the tab is already gone.
-    let was_pending = scheduler.cancel(id);
-    if !was_pending {
-        // Either the workspace is already past `Launching` (the
-        // executor's spawn is in flight or just settled) or no
-        // launch was ever enqueued. The first case is the one we
-        // need to handle: drop a tombstone so the executor's
-        // post-spawn check reaps the terminal. The second case is
-        // a harmless no-op — no executor will ever consume the
-        // tombstone, and the entry stays in the set until the
-        // next close-during-launch for the same workspace.
+    // Capture the scheduler state BEFORE the cancel attempt so we
+    // can distinguish "in flight, cannot interrupt → need a
+    // tombstone for the executor's post-spawn reap" from "settled
+    // or never enqueued → no executor will spawn, no tombstone
+    // needed." `cancel` returns false for both `Launching` AND
+    // `NotPresent`; using `!was_pending` as the gate over-marks
+    // the tombstone for normal closes of long-running tabs,
+    // which the next auto-launch for the same workspace would
+    // then consume and immediately shut down. Reading `state`
+    // first lets us mark only when the workspace is actually
+    // `Launching`.
+    let pre_cancel_state = scheduler.state(id);
+    let _was_pending = scheduler.cancel(id);
+    if crate::workspace_launch_scheduler::should_mark_close_during_launch(pre_cancel_state) {
         terminal_registry.mark_workspace_closed_during_launch(id);
     }
     // Pull the workspace's tab_id (if any) so we can also clear the
