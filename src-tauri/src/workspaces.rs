@@ -118,6 +118,37 @@ impl WorkspaceRecord {
     }
 }
 
+impl WorkspaceLocation {
+    /// Convert the registry-side `WorkspaceLocation` (nested
+    /// `Remote { ssh, container }` shape per spec §6.1) to the
+    /// transport-side core `WorkspaceLocation` (flat
+    /// `Remote { user, host, port, canonical_remote_path, container
+    /// }` shape that the transport modules consume directly). Used
+    /// by the auto-launch executor to thread the workspace location
+    /// into `TerminalSpec::workspace_location`.
+    pub fn to_core_workspace_location(&self) -> terminal_mesh_core::transport::WorkspaceLocation {
+        use terminal_mesh_core::transport::{
+            ContainerLocation as CoreContainerLocation,
+            WorkspaceLocation as CoreWorkspaceLocation,
+        };
+        match self {
+            WorkspaceLocation::Local { path } => CoreWorkspaceLocation::Local {
+                path: Some(path.clone()),
+            },
+            WorkspaceLocation::Remote { ssh, container } => CoreWorkspaceLocation::Remote {
+                user: ssh.user.clone(),
+                host: ssh.host.clone(),
+                port: ssh.port,
+                canonical_remote_path: ssh.canonical_remote_path.clone(),
+                container: container.as_ref().map(|c| CoreContainerLocation {
+                    container_id: c.container_id.clone(),
+                    cwd_in_container: c.cwd_in_container.clone(),
+                }),
+            },
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
     #[error("invalid workspace name: {reason}")]
@@ -145,6 +176,12 @@ pub enum WorkspaceError {
 
     #[error("io error in `{context}`: {message}")]
     Io { context: String, message: String },
+
+    /// One of the Remote workspace fields (host / canonical remote
+    /// path / port / container id) failed validation. `field`
+    /// identifies which input the frontend should highlight.
+    #[error("remote field `{field}` invalid: {reason}")]
+    RemoteFieldInvalid { field: String, reason: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -157,6 +194,7 @@ pub enum WorkspaceErrorDto {
     NotFound { workspace_id: String },
     AlreadyOpen { existing_tab_id: String },
     Io { context: String, message: String },
+    RemoteFieldInvalid { field: String, reason: String },
 }
 
 impl From<&WorkspaceError> for WorkspaceErrorDto {
@@ -187,6 +225,10 @@ impl From<&WorkspaceError> for WorkspaceErrorDto {
             WorkspaceError::Io { context, message } => Self::Io {
                 context: context.clone(),
                 message: message.clone(),
+            },
+            WorkspaceError::RemoteFieldInvalid { field, reason } => Self::RemoteFieldInvalid {
+                field: field.clone(),
+                reason: reason.clone(),
             },
         }
     }
@@ -623,6 +665,40 @@ impl WorkspaceRegistry {
         Ok(self.with_conversation_count(record))
     }
 
+    /// Persist a `WorkspaceLocation::Remote` record. Validates the
+    /// host / canonical_remote_path / port / container_id fields per
+    /// the spec §6.1 identity tuple invariants and the per-field
+    /// non-empty contract the Remote workspace registration uses.
+    pub fn register_remote_workspace(
+        &self,
+        name: &str,
+        ssh: SshLocation,
+        container: Option<ContainerLocation>,
+        auto_launch_claude: bool,
+    ) -> Result<WorkspaceRecord, WorkspaceError> {
+        validate_workspace_name(name)?;
+        validate_remote_fields(&ssh, container.as_ref())?;
+        let mut guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
+        let now = now_rfc3339();
+        let mut profile = WorkspaceProfile::default_local();
+        profile.auto_launch_claude = auto_launch_claude;
+        let record = WorkspaceRecord {
+            workspace_id: Uuid::new_v4(),
+            name: name.to_string(),
+            location: WorkspaceLocation::Remote { ssh, container },
+            // Profile per workspace; auto_launch_claude is the
+            // caller-supplied flag.
+            profile,
+            created_at: now.clone(),
+            last_used_at: now,
+            open_tab_id: None,
+            conversation_rounds_count: 0,
+        };
+        guard.records.insert(record.workspace_id, record.clone());
+        Self::persist(&guard)?;
+        Ok(record)
+    }
+
     pub fn open_workspace(
         &self,
         workspace_id: Uuid,
@@ -696,6 +772,45 @@ impl RegistryInner {
             WorkspaceLocation::Remote { .. } => false,
         })
     }
+}
+
+/// Per-field validation for the Remote workspace registration
+/// surface for the Remote workspace registration. Fields rejected here surface as
+/// `WorkspaceError::RemoteFieldInvalid` with a `field` discriminator
+/// the frontend uses to highlight the offending input.
+pub fn validate_remote_fields(
+    ssh: &SshLocation,
+    container: Option<&ContainerLocation>,
+) -> Result<(), WorkspaceError> {
+    if ssh.host.trim().is_empty() {
+        return Err(WorkspaceError::RemoteFieldInvalid {
+            field: "host".into(),
+            reason: "host must not be empty".into(),
+        });
+    }
+    if ssh.canonical_remote_path.trim().is_empty() {
+        return Err(WorkspaceError::RemoteFieldInvalid {
+            field: "canonicalRemotePath".into(),
+            reason: "canonical remote path must not be empty".into(),
+        });
+    }
+    if let Some(port) = ssh.port
+        && port == 0
+    {
+        return Err(WorkspaceError::RemoteFieldInvalid {
+            field: "port".into(),
+            reason: "port must be 1..=65535".into(),
+        });
+    }
+    if let Some(c) = container
+        && c.container_id.trim().is_empty()
+    {
+        return Err(WorkspaceError::RemoteFieldInvalid {
+            field: "containerId".into(),
+            reason: "container id must not be empty when container mode is enabled".into(),
+        });
+    }
+    Ok(())
 }
 
 pub fn validate_workspace_name(name: &str) -> Result<(), WorkspaceError> {
@@ -858,6 +973,34 @@ pub fn register_workspace(
 ) -> Result<WorkspaceRecord, WorkspaceErrorDto> {
     registry
         .register_workspace(Path::new(&path), auto_launch_claude)
+        .map_err(|e| WorkspaceErrorDto::from(&e))
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn register_remote_workspace(
+    name: String,
+    host: String,
+    user: Option<String>,
+    port: Option<u16>,
+    canonical_remote_path: String,
+    container_id: Option<String>,
+    cwd_in_container: Option<String>,
+    auto_launch_claude: bool,
+    registry: State<'_, WorkspaceRegistry>,
+) -> Result<WorkspaceRecord, WorkspaceErrorDto> {
+    let ssh = SshLocation {
+        user,
+        host,
+        port,
+        canonical_remote_path,
+    };
+    let container = container_id.map(|container_id| ContainerLocation {
+        container_id,
+        cwd_in_container,
+    });
+    registry
+        .register_remote_workspace(&name, ssh, container, auto_launch_claude)
         .map_err(|e| WorkspaceErrorDto::from(&e))
 }
 
@@ -1665,6 +1808,143 @@ mod tests {
         );
         let after = reloaded.find_by_id(rec.workspace_id).expect("present");
         assert!(after.profile.auto_launch_claude);
+    }
+
+    /// `register_remote_workspace` persists a Remote record with the
+    /// supplied SSH + container fields and the auto-launch flag,
+    /// then a reload sees the same record.
+    #[test]
+    fn register_remote_workspace_persists_remote_record() {
+        let (storage, home, reg) = fresh_registry();
+        let workspaces_root = home.path().join("AgentPlatform").join("workspaces");
+        let ssh = SshLocation {
+            user: Some("alice".into()),
+            host: "h.example".into(),
+            port: Some(2222),
+            canonical_remote_path: "/srv/work".into(),
+        };
+        let container = Some(ContainerLocation {
+            container_id: "ctr-7".into(),
+            cwd_in_container: Some("/app".into()),
+        });
+        let rec = reg
+            .register_remote_workspace("remote-ws", ssh.clone(), container.clone(), false)
+            .expect("register remote");
+        assert!(matches!(rec.location, WorkspaceLocation::Remote { .. }));
+        assert!(!rec.profile.auto_launch_claude);
+        drop(reg);
+        let reloaded = WorkspaceRegistry::load(
+            storage.path().to_path_buf(),
+            Some(workspaces_root),
+        );
+        let after = reloaded.find_by_id(rec.workspace_id).expect("present");
+        match &after.location {
+            WorkspaceLocation::Remote { ssh, container } => {
+                assert_eq!(ssh.user.as_deref(), Some("alice"));
+                assert_eq!(ssh.host, "h.example");
+                assert_eq!(ssh.port, Some(2222));
+                assert_eq!(ssh.canonical_remote_path, "/srv/work");
+                let c = container.as_ref().expect("container present");
+                assert_eq!(c.container_id, "ctr-7");
+                assert_eq!(c.cwd_in_container.as_deref(), Some("/app"));
+            }
+            other => panic!("expected Remote location; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_remote_workspace_rejects_blank_host() {
+        let (_storage, _home, reg) = fresh_registry();
+        let err = reg
+            .register_remote_workspace(
+                "x",
+                SshLocation {
+                    user: None,
+                    host: "   ".into(),
+                    port: None,
+                    canonical_remote_path: "/srv".into(),
+                },
+                None,
+                true,
+            )
+            .unwrap_err();
+        match err {
+            WorkspaceError::RemoteFieldInvalid { field, .. } => assert_eq!(field, "host"),
+            other => panic!("expected RemoteFieldInvalid(host); got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_remote_workspace_rejects_blank_canonical_path() {
+        let (_storage, _home, reg) = fresh_registry();
+        let err = reg
+            .register_remote_workspace(
+                "x",
+                SshLocation {
+                    user: None,
+                    host: "h".into(),
+                    port: None,
+                    canonical_remote_path: "".into(),
+                },
+                None,
+                true,
+            )
+            .unwrap_err();
+        match err {
+            WorkspaceError::RemoteFieldInvalid { field, .. } => {
+                assert_eq!(field, "canonicalRemotePath")
+            }
+            other => panic!("expected RemoteFieldInvalid(canonicalRemotePath); got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_remote_workspace_rejects_port_zero() {
+        let (_storage, _home, reg) = fresh_registry();
+        let err = reg
+            .register_remote_workspace(
+                "x",
+                SshLocation {
+                    user: None,
+                    host: "h".into(),
+                    port: Some(0),
+                    canonical_remote_path: "/srv".into(),
+                },
+                None,
+                true,
+            )
+            .unwrap_err();
+        match err {
+            WorkspaceError::RemoteFieldInvalid { field, .. } => assert_eq!(field, "port"),
+            other => panic!("expected RemoteFieldInvalid(port); got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_remote_workspace_rejects_blank_container_id_when_container_set() {
+        let (_storage, _home, reg) = fresh_registry();
+        let err = reg
+            .register_remote_workspace(
+                "x",
+                SshLocation {
+                    user: None,
+                    host: "h".into(),
+                    port: None,
+                    canonical_remote_path: "/srv".into(),
+                },
+                Some(ContainerLocation {
+                    container_id: "  ".into(),
+                    cwd_in_container: None,
+                }),
+                true,
+            )
+            .unwrap_err();
+        match err {
+            WorkspaceError::RemoteFieldInvalid { field, .. } => {
+                assert_eq!(field, "containerId")
+            }
+            other => panic!("expected RemoteFieldInvalid(containerId); got {other:?}"),
+        }
     }
 
     /// Canonical-duplicate detection must skip `Remote` records so a

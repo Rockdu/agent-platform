@@ -209,56 +209,163 @@ impl LaunchExecutor for RealLaunchExecutor {
             // Resolve the discovered `claude` binary from the
             // bootstrap-time cache. If discovery is not Ready, log
             // and settle without spawning so the scheduler slot
-            // drains cleanly; the frontend will surface the
-            // discovery error through the existing onboarding path.
+            // drains cleanly.
             let claude_path: Option<PathBuf> = app
                 .try_state::<DiscoveryCache>()
                 .and_then(|c| c.snapshot())
                 .and_then(|r| r.ok().map(|rec| rec.path));
             let workspace_id = launch.workspace_id;
             let tab_id = launch.tab_id.clone();
-            match claude_path {
-                Some(path) => {
-                    let spec = terminal_mesh_core::TerminalSpec {
-                        terminal_id: uuid::Uuid::new_v4(),
-                        command: path,
-                        args: launch.claude_argv.clone(),
-                        cwd: Some(launch.local_path.clone()),
-                        env: Vec::new(),
-                        cols: 80,
-                        rows: 24,
-                    };
-                    let spawn_result = terminal_mesh::spawn_into_registry(
+            let location = launch.workspace_location.clone();
+            let routing = workspace_launch_scheduler::select_transport_kind_for(&location);
+
+            // For Remote workspaces we need the SSH binary path +
+            // an app_data dir for the ControlMaster socket. The SSH
+            // binary defaults to `/usr/bin/ssh`; the app_data dir is
+            // the same one bootstrap uses.
+            let app_data_root_for_transport: Option<PathBuf> = app
+                .try_state::<orchestrator::OrchestratorBootstrap>()
+                .map(|b| b.app_data_root.clone());
+
+            let Some(path) = claude_path else {
+                tracing::warn!(
+                    %workspace_id,
+                    %tab_id,
+                    "auto-launch skipped: claude discovery not ready"
+                );
+                if let Some(sched) = scheduler {
+                    sched.notify_launch_settled(workspace_id);
+                }
+                return;
+            };
+            let core_location = location.to_core_workspace_location();
+            let cwd_for_spec = match &core_location {
+                terminal_mesh_core::transport::WorkspaceLocation::Local { path } => path.clone(),
+                terminal_mesh_core::transport::WorkspaceLocation::Remote { .. } => None,
+            };
+            let spec = terminal_mesh_core::TerminalSpec {
+                terminal_id: uuid::Uuid::new_v4(),
+                command: path,
+                args: launch.claude_argv.clone(),
+                cwd: cwd_for_spec,
+                env: Vec::new(),
+                cols: 80,
+                rows: 24,
+                workspace_location: Some(core_location),
+            };
+            // Pick the transport matching the workspace location.
+            // Local stays on the default LocalTransport path; Remote
+            // routes through SSH or DockerOverSsh per the workspace location.
+            let spawn_result = match routing {
+                workspace_launch_scheduler::TransportRouting::Local => {
+                    terminal_mesh::spawn_into_registry(
                         spec,
                         &app,
                         &registry,
                         Some(tab_id.clone()),
                         TabKind::Workspace,
                         Some(workspace_id.to_string()),
-                    );
-                    match spawn_result {
-                        Ok(terminal_id) => {
-                            // Now that the terminal is recorded,
-                            // clear the pending flag (no-op if the
-                            // snapshot defaulted to false already)
-                            // and let the rail row reflect Running.
-                            on_pending_launch_changed(&registry, &app, terminal_id, false);
+                    )
+                }
+                workspace_launch_scheduler::TransportRouting::Ssh => {
+                    let Some(app_data) = app_data_root_for_transport.as_ref() else {
+                        tracing::error!(
+                            %workspace_id,
+                            %tab_id,
+                            "auto-launch SSH skipped: app_data_root not available"
+                        );
+                        if let Some(sched) = scheduler {
+                            sched.notify_launch_settled(workspace_id);
+                        }
+                        return;
+                    };
+                    match terminal_mesh_core::SshTransport::from_app_data(
+                        PathBuf::from("/usr/bin/ssh"),
+                        app_data,
+                    ) {
+                        Ok(t) => {
+                            let transport: std::sync::Arc<
+                                dyn terminal_mesh_core::transport::Transport,
+                            > = std::sync::Arc::new(t);
+                            terminal_mesh::spawn_into_registry_with_transport(
+                                spec,
+                                transport,
+                                &app,
+                                &registry,
+                                Some(tab_id.clone()),
+                                TabKind::Workspace,
+                                Some(workspace_id.to_string()),
+                            )
                         }
                         Err(err) => {
                             tracing::error!(
                                 %workspace_id,
                                 %tab_id,
                                 %err,
-                                "auto-launch spawn_into_registry failed"
+                                "SshTransport::from_app_data failed"
                             );
+                            if let Some(sched) = scheduler {
+                                sched.notify_launch_settled(workspace_id);
+                            }
+                            return;
                         }
                     }
                 }
-                None => {
-                    tracing::warn!(
+                workspace_launch_scheduler::TransportRouting::DockerOverSsh => {
+                    let Some(app_data) = app_data_root_for_transport.as_ref() else {
+                        tracing::error!(
+                            %workspace_id,
+                            %tab_id,
+                            "auto-launch Docker skipped: app_data_root not available"
+                        );
+                        if let Some(sched) = scheduler {
+                            sched.notify_launch_settled(workspace_id);
+                        }
+                        return;
+                    };
+                    match terminal_mesh_core::DockerOverSshTransport::from_app_data(
+                        PathBuf::from("/usr/bin/ssh"),
+                        app_data,
+                    ) {
+                        Ok(t) => {
+                            let transport: std::sync::Arc<
+                                dyn terminal_mesh_core::transport::Transport,
+                            > = std::sync::Arc::new(t);
+                            terminal_mesh::spawn_into_registry_with_transport(
+                                spec,
+                                transport,
+                                &app,
+                                &registry,
+                                Some(tab_id.clone()),
+                                TabKind::Workspace,
+                                Some(workspace_id.to_string()),
+                            )
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                %workspace_id,
+                                %tab_id,
+                                %err,
+                                "DockerOverSshTransport::from_app_data failed"
+                            );
+                            if let Some(sched) = scheduler {
+                                sched.notify_launch_settled(workspace_id);
+                            }
+                            return;
+                        }
+                    }
+                }
+            };
+            match spawn_result {
+                Ok(terminal_id) => {
+                    on_pending_launch_changed(&registry, &app, terminal_id, false);
+                }
+                Err(err) => {
+                    tracing::error!(
                         %workspace_id,
                         %tab_id,
-                        "auto-launch skipped: claude discovery not ready"
+                        %err,
+                        "auto-launch spawn failed"
                     );
                 }
             }
@@ -583,6 +690,7 @@ pub fn run() {
             workspaces::list_workspaces,
             workspaces::create_workspace,
             workspaces::register_workspace,
+            workspaces::register_remote_workspace,
             workspaces::open_workspace,
             workspaces::close_workspace,
             workspaces::resolve_workspace_for_tab,

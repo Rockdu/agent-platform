@@ -640,6 +640,7 @@ pub async fn terminal_spawn(
         env: req.env,
         cols,
         rows,
+        workspace_location: None,
     };
 
     let terminal_id = spawn_into_registry(
@@ -674,7 +675,34 @@ pub(crate) fn spawn_into_registry(
     tab_kind: TabKind,
     workspace_id: Option<String>,
 ) -> Result<Uuid, TerminalMeshError> {
-    let handle = TerminalActor::spawn_local(spec).map_err(TerminalMeshError::from)?;
+    spawn_into_registry_with_transport(
+        spec,
+        Arc::new(terminal_mesh_core::transport::LocalTransport::new()),
+        app,
+        registry,
+        tab_id,
+        tab_kind,
+        workspace_id,
+    )
+}
+
+/// Sibling of `spawn_into_registry` that lets the caller inject a
+/// non-`LocalTransport`. Used by `RealLaunchExecutor` to route
+/// Remote auto-launches through `SshTransport` /
+/// `DockerOverSshTransport` per the Remote-routing contract. The spec's
+/// `workspace_location` field flows through into the
+/// `TransportSpawnRequest.workspace` slot.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_into_registry_with_transport(
+    spec: TerminalSpec,
+    transport: Arc<dyn terminal_mesh_core::transport::Transport>,
+    app: &AppHandle,
+    registry: &TerminalMeshRegistry,
+    tab_id: Option<String>,
+    tab_kind: TabKind,
+    workspace_id: Option<String>,
+) -> Result<Uuid, TerminalMeshError> {
+    let handle = TerminalActor::spawn(transport, spec).map_err(TerminalMeshError::from)?;
     let TerminalHandle {
         terminal_id: id,
         events_rx,
@@ -1591,6 +1619,7 @@ mod tests {
                 env: vec![],
                 cols: 80,
                 rows: 24,
+                workspace_location: None,
             })
             .expect("spawn");
             let TerminalHandle {

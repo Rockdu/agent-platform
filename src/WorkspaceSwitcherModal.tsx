@@ -4,6 +4,7 @@ import {
   createWorkspace,
   isWorkspaceErrorDto,
   localPath,
+  registerRemoteWorkspace,
   registerWorkspace,
   type WorkspaceErrorDto,
   type WorkspaceRecord,
@@ -20,7 +21,30 @@ type SwitcherMode = "create" | "recent" | "settings";
 
 type CreateSource =
   | { kind: "auto" }
-  | { kind: "existing"; pickedPath: string | null };
+  | { kind: "existing"; pickedPath: string | null }
+  | {
+      kind: "remote-ssh";
+      host: string;
+      user: string;
+      port: string;
+      canonicalRemotePath: string;
+      containerEnabled: boolean;
+      containerId: string;
+      cwdInContainer: string;
+    };
+
+function freshRemoteSource(): CreateSource {
+  return {
+    kind: "remote-ssh",
+    host: "",
+    user: "",
+    port: "",
+    canonicalRemotePath: "",
+    containerEnabled: false,
+    containerId: "",
+    cwdInContainer: "",
+  };
+}
 
 export interface WorkspaceSwitcherModalProps {
   open: boolean;
@@ -137,7 +161,7 @@ export function WorkspaceSwitcherModal({
           return;
         }
         created = await createWorkspace(trimmed, autoLaunchClaude);
-      } else {
+      } else if (source.kind === "existing") {
         if (!source.pickedPath) {
           setError({
             kind: "invalidName",
@@ -146,6 +170,46 @@ export function WorkspaceSwitcherModal({
           return;
         }
         created = await registerWorkspace(source.pickedPath, autoLaunchClaude);
+      } else {
+        // Remote SSH workspace.
+        const trimmedName = name.trim();
+        if (!trimmedName) {
+          setError({ kind: "invalidName", reason: "请输入工作区名称" });
+          return;
+        }
+        let port: number | null = null;
+        if (source.port.trim() !== "") {
+          const parsed = Number.parseInt(source.port.trim(), 10);
+          if (!Number.isFinite(parsed) || parsed < 1 || parsed > 65535) {
+            setError({
+              kind: "remoteFieldInvalid",
+              field: "port",
+              reason: "端口需在 1..=65535 范围内",
+            });
+            return;
+          }
+          port = parsed;
+        }
+        const userTrimmed = source.user.trim();
+        const containerId = source.containerEnabled
+          ? source.containerId.trim()
+          : "";
+        const cwdInContainerTrimmed = source.containerEnabled
+          ? source.cwdInContainer.trim()
+          : "";
+        created = await registerRemoteWorkspace({
+          name: trimmedName,
+          host: source.host.trim(),
+          user: userTrimmed === "" ? null : userTrimmed,
+          port,
+          canonicalRemotePath: source.canonicalRemotePath.trim(),
+          containerId: source.containerEnabled ? containerId : null,
+          cwdInContainer:
+            source.containerEnabled && cwdInContainerTrimmed !== ""
+              ? cwdInContainerTrimmed
+              : null,
+          autoLaunchClaude,
+        });
       }
       if (created) {
         await onAdopt(created);
@@ -337,6 +401,15 @@ function CreatePane(props: {
           />{" "}
           选择已有目录
         </label>
+        <label>
+          <input
+            type="radio"
+            name="source"
+            checked={source.kind === "remote-ssh"}
+            onChange={() => setSource(freshRemoteSource())}
+          />{" "}
+          远程 SSH 工作区
+        </label>
       </div>
       {source.kind === "auto" && (
         <label className="workspace-switcher-modal__field">
@@ -371,6 +444,103 @@ function CreatePane(props: {
           )}
         </div>
       )}
+      {source.kind === "remote-ssh" && (
+        <div className="workspace-switcher-modal__field workspace-switcher-modal__remote">
+          <label>
+            名称
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="项目名 (字母、数字、汉字、-、_、.、空格,≤ 64)"
+              spellCheck={false}
+            />
+          </label>
+          <label>
+            主机
+            <input
+              type="text"
+              value={source.host}
+              onChange={(e) => setSource({ ...source, host: e.target.value })}
+              placeholder="host.example.com (必填)"
+              spellCheck={false}
+            />
+          </label>
+          <label>
+            用户（可选）
+            <input
+              type="text"
+              value={source.user}
+              onChange={(e) => setSource({ ...source, user: e.target.value })}
+              placeholder="默认使用本地用户名"
+              spellCheck={false}
+            />
+          </label>
+          <label>
+            端口（可选）
+            <input
+              type="text"
+              inputMode="numeric"
+              value={source.port}
+              onChange={(e) => setSource({ ...source, port: e.target.value })}
+              placeholder="默认 22"
+            />
+          </label>
+          <label>
+            远程工作目录
+            <input
+              type="text"
+              value={source.canonicalRemotePath}
+              onChange={(e) =>
+                setSource({ ...source, canonicalRemotePath: e.target.value })
+              }
+              placeholder="/home/me/repo (必填)"
+              spellCheck={false}
+            />
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={source.containerEnabled}
+              onChange={(e) =>
+                setSource({ ...source, containerEnabled: e.target.checked })
+              }
+            />{" "}
+            在已有 Docker 容器内运行（仅支持现存容器，不会创建/启动/停止容器）
+          </label>
+          {source.containerEnabled && (
+            <>
+              <label>
+                容器 ID
+                <input
+                  type="text"
+                  value={source.containerId}
+                  onChange={(e) =>
+                    setSource({ ...source, containerId: e.target.value })
+                  }
+                  placeholder="必填"
+                  spellCheck={false}
+                />
+              </label>
+              <label>
+                容器内工作目录（可选）
+                <input
+                  type="text"
+                  value={source.cwdInContainer}
+                  onChange={(e) =>
+                    setSource({ ...source, cwdInContainer: e.target.value })
+                  }
+                  placeholder="默认沿用远程工作目录"
+                  spellCheck={false}
+                />
+              </label>
+            </>
+          )}
+          <p className="workspace-switcher-modal__hint">
+            远程 claude 仅以 shell 形式运行；本应用的 MCP 插件不会注入到远程 claude（v1 范围，DEC-9）。
+          </p>
+        </div>
+      )}
       <label className="workspace-switcher-modal__field workspace-switcher-modal__auto-launch">
         <input
           type="checkbox"
@@ -389,7 +559,12 @@ function CreatePane(props: {
           disabled={
             busy ||
             (source.kind === "auto" && name.trim() === "") ||
-            (source.kind === "existing" && !source.pickedPath)
+            (source.kind === "existing" && !source.pickedPath) ||
+            (source.kind === "remote-ssh" &&
+              (name.trim() === "" ||
+                source.host.trim() === "" ||
+                source.canonicalRemotePath.trim() === "" ||
+                (source.containerEnabled && source.containerId.trim() === "")))
           }
         >
           创建
@@ -534,5 +709,7 @@ function renderErrorMessage(error: WorkspaceErrorDto): string {
       return `该工作区已经在其他 tab 中打开: ${error.existingTabId}`;
     case "io":
       return `IO 错误 (${error.context}): ${error.message}`;
+    case "remoteFieldInvalid":
+      return `远程字段 ${error.field} 无效: ${error.reason}`;
   }
 }

@@ -67,7 +67,8 @@ export type WorkspaceErrorDto =
   | { kind: "notADirectory"; path: string }
   | { kind: "notFound"; workspaceId: string }
   | { kind: "alreadyOpen"; existingTabId: string }
-  | { kind: "io"; context: string; message: string };
+  | { kind: "io"; context: string; message: string }
+  | { kind: "remoteFieldInvalid"; field: string; reason: string };
 
 export function isWorkspaceErrorDto(value: unknown): value is WorkspaceErrorDto {
   if (typeof value !== "object" || value === null) return false;
@@ -79,7 +80,8 @@ export function isWorkspaceErrorDto(value: unknown): value is WorkspaceErrorDto 
     k === "notADirectory" ||
     k === "notFound" ||
     k === "alreadyOpen" ||
-    k === "io"
+    k === "io" ||
+    k === "remoteFieldInvalid"
   );
 }
 
@@ -104,6 +106,38 @@ export async function registerWorkspace(
   return await invoke<WorkspaceRecord>("register_workspace", {
     path,
     autoLaunchClaude,
+  });
+}
+
+/// Inputs for `registerRemoteWorkspace`. Mirrors the backend Tauri
+/// command shape. Optional SSH fields (`user`, `port`) and the
+/// container subform (`containerId`, `cwdInContainer`) are passed
+/// as `null` when omitted so the wire layer can distinguish
+/// "absent" from "empty string". Per-field validation lives on the
+/// host side and surfaces as `WorkspaceErrorDto::remoteFieldInvalid`.
+export interface RemoteWorkspaceFields {
+  name: string;
+  host: string;
+  user: string | null;
+  port: number | null;
+  canonicalRemotePath: string;
+  containerId: string | null;
+  cwdInContainer: string | null;
+  autoLaunchClaude: boolean;
+}
+
+export async function registerRemoteWorkspace(
+  fields: RemoteWorkspaceFields,
+): Promise<WorkspaceRecord> {
+  return await invoke<WorkspaceRecord>("register_remote_workspace", {
+    name: fields.name,
+    host: fields.host,
+    user: fields.user,
+    port: fields.port,
+    canonicalRemotePath: fields.canonicalRemotePath,
+    containerId: fields.containerId,
+    cwdInContainer: fields.cwdInContainer,
+    autoLaunchClaude: fields.autoLaunchClaude,
   });
 }
 

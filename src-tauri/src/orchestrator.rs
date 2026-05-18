@@ -305,6 +305,7 @@ pub(crate) fn spawn_orchestrator_claude(
         )],
         cols: 100,
         rows: 30,
+        workspace_location: None,
     };
 
     match spawn_into_registry(

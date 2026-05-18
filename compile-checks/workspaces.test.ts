@@ -6,7 +6,9 @@ import {
   createWorkspace,
   isWorkspaceErrorDto,
   localPath,
+  registerRemoteWorkspace,
   registerWorkspace,
+  type RemoteWorkspaceFields,
   type WorkspaceErrorDto,
   type WorkspaceRecord,
 } from "../src/workspaces";
@@ -42,6 +44,8 @@ export function _probe_error_dto_discrimination(e: WorkspaceErrorDto): string {
       return `alreadyOpen:${e.existingTabId}`;
     case "io":
       return `io:${e.context}:${e.message}`;
+    case "remoteFieldInvalid":
+      return `remoteFieldInvalid:${e.field}:${e.reason}`;
   }
 }
 
@@ -109,6 +113,35 @@ export function _probe_remote_location_round_trip(): void {
     conversationRoundsCount: 0,
   };
   void localPath(remote);
+}
+
+// Pins the Remote workspace create-form wire shape. The Tauri
+// command requires the full `RemoteWorkspaceFields` object;
+// omitting any required field (host, canonicalRemotePath, name,
+// autoLaunchClaude) must fail to compile.
+export function _probe_register_remote_workspace_signature(): void {
+  const fields: RemoteWorkspaceFields = {
+    name: "test",
+    host: "h.example",
+    user: null,
+    port: null,
+    canonicalRemotePath: "/srv",
+    containerId: null,
+    cwdInContainer: null,
+    autoLaunchClaude: true,
+  };
+  void registerRemoteWorkspace(fields);
+  // @ts-expect-error `host` is required on RemoteWorkspaceFields
+  const missing_host: RemoteWorkspaceFields = {
+    name: "x",
+    user: null,
+    port: null,
+    canonicalRemotePath: "/srv",
+    containerId: null,
+    cwdInContainer: null,
+    autoLaunchClaude: true,
+  };
+  void missing_host;
 }
 
 // Pins the create-form contract: `createWorkspace` and

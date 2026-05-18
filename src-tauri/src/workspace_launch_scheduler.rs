@@ -22,7 +22,6 @@
 //!   `launching` and invoking the executor.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -42,7 +41,10 @@ pub const DEFAULT_LAUNCH_CAP: usize = 4;
 pub struct PendingLaunch {
     pub workspace_id: Uuid,
     pub tab_id: String,
-    pub local_path: PathBuf,
+    /// Full workspace location (Local or Remote with optional
+    /// container) so the executor can route to `LocalTransport`,
+    /// `SshTransport`, or `DockerOverSshTransport` per the Remote-routing contract.
+    pub workspace_location: WorkspaceLocation,
     pub claude_argv: Vec<String>,
     /// Provided by callers; the scheduler itself does not read this,
     /// but it preserves enqueue-time provenance so the rail UI or
@@ -199,6 +201,7 @@ pub enum AutoLaunchErrorDto {
     /// Workspace location is Remote — auto-launch is Local-only in
     /// v1 (remote claude runs as a normal remote process without
     /// this app's MCP plugins).
+    #[allow(dead_code)]
     RemoteWorkspaceNotEligible { workspace_id: String },
     /// Workspace id does not parse or no record matches.
     WorkspaceNotFound { workspace_id: String },
@@ -223,26 +226,48 @@ pub fn try_build_pending_launch(
     let record = workspace.ok_or_else(|| AutoLaunchErrorDto::WorkspaceNotFound {
         workspace_id: workspace_id_str.to_string(),
     })?;
-    let local_path = match &record.location {
-        WorkspaceLocation::Local { path } => path.clone(),
-        WorkspaceLocation::Remote { .. } => {
-            return Err(AutoLaunchErrorDto::RemoteWorkspaceNotEligible {
-                workspace_id: workspace_id_str.to_string(),
-            });
-        }
-    };
     if !record.profile.auto_launch_claude {
         return Err(AutoLaunchErrorDto::AutoLaunchDisabled {
             workspace_id: workspace_id_str.to_string(),
         });
     }
+    // Remote workspaces are eligible now that the executor
+    // routes them through SshTransport / DockerOverSshTransport.
+    // The Remote-eligibility check is gone; the `RemoteWorkspaceNot
+    // Eligible` DTO variant is retained for future per-workspace
+    // policy gating but is no longer fired here.
     Ok(PendingLaunch {
         workspace_id: record.workspace_id,
         tab_id,
-        local_path,
+        workspace_location: record.location.clone(),
         claude_argv: record.profile.claude_argv.clone(),
         enqueued_at_unix_ms,
     })
+}
+
+/// Per-workspace transport routing decision used by
+/// `RealLaunchExecutor` to pick the right `Transport` impl. Pure
+/// function so the routing rules can be unit-tested without a
+/// Tauri harness.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum TransportRouting {
+    /// `LocalTransport` for `WorkspaceLocation::Local`.
+    Local,
+    /// `SshTransport` for `Remote` with no container.
+    Ssh,
+    /// `DockerOverSshTransport` for `Remote` with `container: Some(...)`.
+    DockerOverSsh,
+}
+
+pub fn select_transport_kind_for(location: &WorkspaceLocation) -> TransportRouting {
+    match location {
+        WorkspaceLocation::Local { .. } => TransportRouting::Local,
+        WorkspaceLocation::Remote {
+            container: Some(_),
+            ..
+        } => TransportRouting::DockerOverSsh,
+        WorkspaceLocation::Remote { container: None, .. } => TransportRouting::Ssh,
+    }
 }
 
 /// Pure helper: claude discovery must be in the Ready state before a
@@ -331,6 +356,7 @@ fn now_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
 
     #[derive(Default)]
@@ -354,7 +380,9 @@ mod tests {
         PendingLaunch {
             workspace_id: id,
             tab_id: id.to_string(),
-            local_path: PathBuf::from("/tmp/ws"),
+            workspace_location: WorkspaceLocation::Local {
+                path: PathBuf::from("/tmp/ws"),
+            },
             claude_argv: vec!["--dangerously-skip-permissions".into()],
             enqueued_at_unix_ms: 0,
         }
@@ -497,8 +525,12 @@ mod tests {
         }
     }
 
+    /// Remote workspaces are now eligible for auto-launch;
+    /// the scheduler's `RealLaunchExecutor` routes them through
+    /// `SshTransport` / `DockerOverSshTransport` per the
+    /// `workspace_location` field on the resulting `PendingLaunch`.
     #[test]
-    fn try_build_pending_launch_rejects_remote_workspace() {
+    fn try_build_pending_launch_accepts_remote_ssh_workspace() {
         use crate::workspaces::{
             ContainerLocation, SshLocation, WorkspaceLocation, WorkspaceProfile, WorkspaceRecord,
         };
@@ -521,19 +553,62 @@ mod tests {
             open_tab_id: None,
             conversation_rounds_count: 0,
         };
-        let err = try_build_pending_launch(
+        let launch = try_build_pending_launch(
             &id.to_string(),
             "tab-r".into(),
             Some(&record),
             0,
         )
-        .unwrap_err();
-        match err {
-            AutoLaunchErrorDto::RemoteWorkspaceNotEligible { workspace_id } => {
-                assert_eq!(workspace_id, id.to_string());
-            }
-            other => panic!("expected RemoteWorkspaceNotEligible; got {other:?}"),
-        }
+        .expect("remote workspace must be accepted");
+        assert!(matches!(
+            launch.workspace_location,
+            WorkspaceLocation::Remote { .. }
+        ));
+    }
+
+    #[test]
+    fn select_transport_kind_for_local_returns_local() {
+        use crate::workspaces::WorkspaceLocation;
+        let loc = WorkspaceLocation::Local {
+            path: std::path::PathBuf::from("/tmp/x"),
+        };
+        assert_eq!(select_transport_kind_for(&loc), TransportRouting::Local);
+    }
+
+    #[test]
+    fn select_transport_kind_for_remote_without_container_returns_ssh() {
+        use crate::workspaces::{SshLocation, WorkspaceLocation};
+        let loc = WorkspaceLocation::Remote {
+            ssh: SshLocation {
+                user: None,
+                host: "h".into(),
+                port: None,
+                canonical_remote_path: "/srv".into(),
+            },
+            container: None,
+        };
+        assert_eq!(select_transport_kind_for(&loc), TransportRouting::Ssh);
+    }
+
+    #[test]
+    fn select_transport_kind_for_remote_with_container_returns_docker_over_ssh() {
+        use crate::workspaces::{ContainerLocation, SshLocation, WorkspaceLocation};
+        let loc = WorkspaceLocation::Remote {
+            ssh: SshLocation {
+                user: None,
+                host: "h".into(),
+                port: None,
+                canonical_remote_path: "/srv".into(),
+            },
+            container: Some(ContainerLocation {
+                container_id: "c".into(),
+                cwd_in_container: None,
+            }),
+        };
+        assert_eq!(
+            select_transport_kind_for(&loc),
+            TransportRouting::DockerOverSsh
+        );
     }
 
     #[test]
@@ -640,7 +715,12 @@ mod tests {
         .expect("eligible");
         assert_eq!(launch.workspace_id, id);
         assert_eq!(launch.tab_id, "tab-h");
-        assert_eq!(launch.local_path, PathBuf::from("/tmp/happy-ws"));
+        match &launch.workspace_location {
+            crate::workspaces::WorkspaceLocation::Local { path } => {
+                assert_eq!(path, &PathBuf::from("/tmp/happy-ws"));
+            }
+            other => panic!("expected Local location; got {other:?}"),
+        }
         assert_eq!(launch.claude_argv, vec!["--dangerously-skip-permissions"]);
         assert_eq!(launch.enqueued_at_unix_ms, 12345);
     }

@@ -56,6 +56,15 @@ pub struct TerminalSpec {
     pub env: Vec<(String, String)>,
     pub cols: u16,
     pub rows: u16,
+    /// Optional override for the `TransportSpawnRequest.workspace`
+    /// field. When `None`, `TerminalActor::spawn` defaults to
+    /// `WorkspaceLocation::Local { path: cwd }` (baseline behavior).
+    /// When `Some(loc)`, the spec author is responsible for picking
+    /// a matching transport — typically by routing through one of
+    /// `LocalTransport` / `SshTransport` / `DockerOverSshTransport`.
+    /// Threaded by the production auto-launch path so Remote /
+    /// Docker workspaces reach the transport-side branch picker.
+    pub workspace_location: Option<WorkspaceLocation>,
 }
 
 #[derive(Debug)]
@@ -124,23 +133,33 @@ impl TerminalActor {
             env,
             cols,
             rows,
+            workspace_location,
         } = spec;
 
         let mut env_map: BTreeMap<String, String> = BTreeMap::new();
         for (k, v) in env {
             env_map.insert(k, v);
         }
+        let workspace = workspace_location.unwrap_or_else(|| WorkspaceLocation::Local {
+            path: cwd.clone(),
+        });
+        // For Local workspaces the legacy `cwd` field carries the
+        // path; Remote workspaces consume `canonical_remote_path`
+        // via the transport's own remote-cwd handling, so the
+        // transport-side `cwd` slot becomes `None` for them.
+        let transport_cwd = match &workspace {
+            WorkspaceLocation::Local { .. } => cwd.map(PathBufOrRemote::Local),
+            WorkspaceLocation::Remote { .. } => None,
+        };
         let request = TransportSpawnRequest {
-            workspace: WorkspaceLocation::Local {
-                path: cwd.clone(),
-            },
+            workspace,
             command: ShellCommand {
                 program: command,
                 args,
             },
             initial_size: TransportPtySize { cols, rows },
             env: env_map,
-            cwd: cwd.map(PathBufOrRemote::Local),
+            cwd: transport_cwd,
         };
 
         let mut session = transport
@@ -561,6 +580,7 @@ mod tests {
             env: vec![],
             cols: 80,
             rows: 24,
+            workspace_location: None,
         }
     }
 
@@ -734,6 +754,7 @@ mod tests {
             env: vec![("MY_VAR".into(), "hello".into())],
             cols: 80,
             rows: 24,
+            workspace_location: None,
         })
         .expect("spawn");
         let TerminalHandle {
