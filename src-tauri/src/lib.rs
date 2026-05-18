@@ -243,17 +243,17 @@ fn discard_close_tombstone_for(registry: &TerminalMeshRegistry, workspace_id: uu
     let _ = registry.take_workspace_closed_during_launch(workspace_id);
 }
 
-fn surface_auto_launch_async_failure(
-    app: &tauri::AppHandle,
+/// Build the Done lifecycle envelope for an async auto-launch
+/// failure AND install it into the pending placeholder map so
+/// late subscribers can recover the state via the bootstrap
+/// `snapshot_for_tab(tab_id)` fetch. Extracted from
+/// `surface_auto_launch_async_failure` so the install side is
+/// directly unit-testable without an `AppHandle` mock.
+fn install_done_envelope_for_tab(
     registry: &TerminalMeshRegistry,
     tab_id: &str,
     transport_kind: crate::workspace_lifecycle::TransportKind,
-) {
-    // If a placeholder is still installed (queued auto-launches),
-    // drain it before constructing the Done envelope so the
-    // pending map stops carrying a stale entry. The drained value
-    // is discarded — we rebuild the snapshot below.
-    let _ = registry.clear_pending_for_tab(tab_id);
+) -> crate::workspace_lifecycle::WorkspaceLifecycleSnapshot {
     let mut envelope = crate::workspace_lifecycle::WorkspaceLifecycleSnapshot::fresh_for_workspace_with_kind(
         crate::workspace_lifecycle::TabKind::Workspace,
         None,
@@ -262,6 +262,28 @@ fn surface_auto_launch_async_failure(
     envelope.pending_launch = false;
     envelope.status = crate::workspace_lifecycle::TabStatus::Done;
     envelope.done_reason = Some(crate::workspace_lifecycle::DoneReason::Disconnected);
+    // Overwrite any prior queued-launch placeholder (idempotent
+    // set). The user-close path (`close_workspace`) already calls
+    // `clear_pending_for_tab` so the Done entry is dropped when
+    // the user dismisses the tab.
+    registry.set_pending_for_tab(tab_id.to_string(), envelope.clone());
+    envelope
+}
+
+fn surface_auto_launch_async_failure(
+    app: &tauri::AppHandle,
+    registry: &TerminalMeshRegistry,
+    tab_id: &str,
+    transport_kind: crate::workspace_lifecycle::TransportKind,
+) {
+    // Install the Done envelope into the pending placeholder map
+    // so a late subscriber's `snapshot_for_tab(tab_id)` bootstrap
+    // fetch returns the Done state instead of None. Without this,
+    // a subscribe-after-event race would leave the React tab in
+    // `awaitingAutoLaunch: true` forever because the
+    // stuck-waiting watcher only flips the flag when it sees a
+    // Done snapshot — and there would be no snapshot to see.
+    let envelope = install_done_envelope_for_tab(registry, tab_id, transport_kind);
     crate::workspace_lifecycle::emit_lifecycle_updated_for_placeholder(app, tab_id, &envelope);
 }
 
@@ -961,5 +983,87 @@ mod tests {
         // Idempotent: discarding again is still a no-op.
         discard_close_tombstone_for(&r, workspace_id);
         assert!(!r.take_workspace_closed_during_launch(workspace_id));
+    }
+
+    /// An async auto-launch failure MUST leave a retained Done
+    /// snapshot in the pending placeholder map so a React
+    /// lifecycle hook that subscribes after the event fired can
+    /// still see the failure on its bootstrap fetch. Without
+    /// this, a subscribe-after-event race would leave the tab
+    /// stuck in `awaitingAutoLaunch: true` forever — the
+    /// stuck-waiting watcher only flips the flag when it sees a
+    /// Done snapshot, and there would be no snapshot to see.
+    #[test]
+    fn install_done_envelope_for_tab_makes_late_snapshot_lookup_return_done() {
+        let r = TerminalMeshRegistry::new();
+        let tab_id = "tab-late-subscribe";
+        // Pre-state: no snapshot for the tab.
+        assert!(
+            r.snapshot_for_tab(tab_id).is_none(),
+            "tab has no live snapshot before install"
+        );
+        // Install the Done envelope.
+        let envelope = install_done_envelope_for_tab(
+            &r,
+            tab_id,
+            crate::workspace_lifecycle::TransportKind::Ssh,
+        );
+        assert!(
+            matches!(envelope.status, crate::workspace_lifecycle::TabStatus::Done),
+            "installed envelope must be Done"
+        );
+        assert!(
+            matches!(
+                envelope.done_reason,
+                Some(crate::workspace_lifecycle::DoneReason::Disconnected)
+            ),
+            "installed envelope must carry the Disconnected done_reason"
+        );
+        assert_eq!(envelope.transport_kind, crate::workspace_lifecycle::TransportKind::Ssh);
+        // A late subscriber querying `snapshot_for_tab` (the
+        // path the React hook's bootstrap fetch uses) must now
+        // see the Done snapshot.
+        let late_lookup = r
+            .snapshot_for_tab(tab_id)
+            .expect("late snapshot lookup must return the installed Done envelope");
+        assert!(matches!(
+            late_lookup.status,
+            crate::workspace_lifecycle::TabStatus::Done
+        ));
+        assert!(matches!(
+            late_lookup.done_reason,
+            Some(crate::workspace_lifecycle::DoneReason::Disconnected)
+        ));
+        assert_eq!(
+            late_lookup.transport_kind,
+            crate::workspace_lifecycle::TransportKind::Ssh
+        );
+    }
+
+    /// Idempotent install: a second call replaces the first
+    /// snapshot (latest failure wins). Mirrors the
+    /// `set_pending_for_tab` overwrite semantics.
+    #[test]
+    fn install_done_envelope_for_tab_overwrites_prior_install() {
+        let r = TerminalMeshRegistry::new();
+        let tab_id = "tab-double-fail";
+        install_done_envelope_for_tab(
+            &r,
+            tab_id,
+            crate::workspace_lifecycle::TransportKind::Ssh,
+        );
+        install_done_envelope_for_tab(
+            &r,
+            tab_id,
+            crate::workspace_lifecycle::TransportKind::SshDocker,
+        );
+        let latest = r
+            .snapshot_for_tab(tab_id)
+            .expect("snapshot retained after double install");
+        assert_eq!(
+            latest.transport_kind,
+            crate::workspace_lifecycle::TransportKind::SshDocker,
+            "second install overwrites the first"
+        );
     }
 }

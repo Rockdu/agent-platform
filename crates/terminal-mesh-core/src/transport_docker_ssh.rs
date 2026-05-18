@@ -387,6 +387,12 @@ fn spawn_cleanup_in_background(
     container_id: String,
 ) {
     let mut cmd = std::process::Command::new(&ssh_program);
+    // `--` ends option parsing so the destination (and any
+    // future argv slot) cannot be reinterpreted as a `-`-prefixed
+    // option. Defense in depth: SshTransport::spawn already
+    // validates `user` and `host` fragments via
+    // `validate_ssh_destination_fragment`, but the cleanup argv
+    // is built independently and must carry the same guard.
     cmd.arg("-o").arg("BatchMode=yes")
         .arg("-o").arg("ControlMaster=auto")
         .arg("-o").arg("ControlPersist=yes")
@@ -394,6 +400,7 @@ fn spawn_cleanup_in_background(
         .arg("-o").arg("StrictHostKeyChecking=accept-new")
         .arg("-o").arg("ConnectTimeout=10")
         .arg("-p").arg(port.to_string())
+        .arg("--")
         .arg(user_host)
         .arg(compose_remote_command(&cleanup_cmd))
         .stdin(std::process::Stdio::null())

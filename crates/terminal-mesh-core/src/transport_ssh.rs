@@ -106,13 +106,48 @@ impl SshLocation {
 /// `compose_remote_command` into ONE quoted `sh -lc '...'` string
 /// so OpenSSH's "join all post-host argv with spaces and send to the
 /// remote shell" rule still produces correct remote semantics.
+/// Reject argv-destination fragments (the `user` and `host`
+/// strings that build into ssh's positional destination) when
+/// they could be reinterpreted as options. OpenSSH parses
+/// `-`-prefixed argv as options (e.g. `-oProxyCommand=…`,
+/// `-l`); a workspace record with `host` or `user` starting
+/// with `-` would let SSH run a local proxy command at probe
+/// or spawn time. Reject up front; the argv builder ALSO emits
+/// a `--` end-of-options marker as defense-in-depth (see
+/// `build_ssh_argv`).
+pub fn validate_ssh_destination_fragment(
+    value: &str,
+    field_label: &'static str,
+) -> Result<(), TransportError> {
+    if value.is_empty() {
+        return Err(TransportError::Protocol {
+            message: format!("SSH {field_label} must not be empty"),
+        });
+    }
+    if value.starts_with('-') {
+        return Err(TransportError::Protocol {
+            message: format!(
+                "SSH {field_label} must not start with '-' (option-injection risk): {value:?}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub fn build_ssh_argv(
     control_path: &Path,
     location: &SshLocation,
     wrapper_script: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>, TransportError> {
+    // Defense-in-depth: reject argv fragments that could be
+    // mis-parsed as ssh options BEFORE building argv, even though
+    // the `--` separator below also blocks the reinterpretation.
+    if let Some(user) = location.user.as_deref() {
+        validate_ssh_destination_fragment(user, "user")?;
+    }
+    validate_ssh_destination_fragment(&location.host, "host")?;
     let port = location.port.unwrap_or(22);
-    vec![
+    Ok(vec![
         "-tt".into(),
         "-o".into(),
         "BatchMode=yes".into(),
@@ -128,9 +163,14 @@ pub fn build_ssh_argv(
         "ConnectTimeout=10".into(),
         "-p".into(),
         port.to_string(),
+        // `--` ends option parsing so no later argv slot (the
+        // destination or the remote command) can be reinterpreted
+        // as a `-`-prefixed option even if validation is bypassed
+        // by a future caller.
+        "--".into(),
         location.user_host(),
         compose_remote_command(wrapper_script),
-    ]
+    ])
 }
 
 /// Wrap a multi-line wrapper script in a single shell-safe
@@ -683,7 +723,7 @@ pub(crate) fn spawn_ssh_with_wrapper_script(
     // through their ControlMaster. The common case (socket missing)
     // is a no-op.
     ensure_control_socket_owner_safe(&control_path)?;
-    let argv = build_ssh_argv(&control_path, location, wrapper_script);
+    let argv = build_ssh_argv(&control_path, location, wrapper_script)?;
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -1167,7 +1207,8 @@ mod tests {
             Path::new("/tmp/cm/abc.sock"),
             &loc(Some("alice"), "example.com", Some(2222), "/srv"),
             "echo hi",
-        );
+        )
+        .expect("argv builds for a normal user@host");
         assert!(argv.contains(&"-tt".to_string()));
         assert!(argv.contains(&"BatchMode=yes".to_string()));
         assert!(argv.contains(&"ControlMaster=auto".to_string()));
@@ -1182,6 +1223,80 @@ mod tests {
         // join-with-spaces rule produces correct remote semantics.
         let last = argv.last().expect("argv non-empty");
         assert_eq!(last, "sh -lc 'echo hi'");
+    }
+
+    /// `--` MUST appear immediately before the destination so
+    /// no later argv slot can be reinterpreted as an option,
+    /// even if validation is bypassed by a future caller.
+    #[test]
+    fn build_ssh_argv_emits_dash_dash_end_of_options_marker() {
+        let argv = build_ssh_argv(
+            Path::new("/tmp/cm/abc.sock"),
+            &loc(Some("alice"), "example.com", Some(2222), "/srv"),
+            "echo hi",
+        )
+        .expect("argv builds");
+        let dest_idx = argv
+            .iter()
+            .position(|a| a == "alice@example.com")
+            .expect("destination present");
+        assert!(
+            dest_idx > 0,
+            "destination cannot be the first argv element"
+        );
+        assert_eq!(
+            argv[dest_idx - 1],
+            "--",
+            "`--` end-of-options marker must precede the destination"
+        );
+    }
+
+    /// Reject hosts starting with `-` as an OpenSSH option-
+    /// injection vector. Same defense applies to `user`.
+    #[test]
+    fn build_ssh_argv_rejects_option_like_host() {
+        let err = build_ssh_argv(
+            Path::new("/tmp/cm/abc.sock"),
+            &loc(None, "-oProxyCommand=evil", Some(22), "/srv"),
+            "echo hi",
+        )
+        .expect_err("option-like host must be rejected");
+        match err {
+            TransportError::Protocol { message } => {
+                assert!(
+                    message.contains("host"),
+                    "Protocol error must mention the rejected field; got {message}"
+                );
+            }
+            other => panic!("expected Protocol; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_ssh_argv_rejects_option_like_user() {
+        let err = build_ssh_argv(
+            Path::new("/tmp/cm/abc.sock"),
+            &loc(Some("-lroot"), "h", Some(22), "/srv"),
+            "echo hi",
+        )
+        .expect_err("option-like user must be rejected");
+        match err {
+            TransportError::Protocol { message } => {
+                assert!(message.contains("user"), "got {message}");
+            }
+            other => panic!("expected Protocol; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_ssh_destination_fragment_rejects_leading_dash_and_empty() {
+        assert!(validate_ssh_destination_fragment("-oProxyCommand=x", "host").is_err());
+        assert!(validate_ssh_destination_fragment("-l", "host").is_err());
+        assert!(validate_ssh_destination_fragment("-", "host").is_err());
+        assert!(validate_ssh_destination_fragment("", "host").is_err());
+        assert!(validate_ssh_destination_fragment("h.example", "host").is_ok());
+        assert!(validate_ssh_destination_fragment("127.0.0.1", "host").is_ok());
+        assert!(validate_ssh_destination_fragment("alice", "user").is_ok());
     }
 
     #[test]
@@ -1219,7 +1334,8 @@ mod tests {
             Path::new("/tmp/cm/abc.sock"),
             &loc(None, "h", None, "/srv"),
             "x",
-        );
+        )
+        .expect("argv builds");
         assert!(argv.contains(&"h".to_string()));
         assert!(!argv.iter().any(|a| a.contains('@')));
     }
@@ -1230,7 +1346,8 @@ mod tests {
             Path::new("/tmp/cm/abc.sock"),
             &loc(None, "h", None, "/srv"),
             "x",
-        );
+        )
+        .expect("argv builds");
         let dash_p = argv.iter().position(|a| a == "-p").expect("has -p");
         assert_eq!(argv[dash_p + 1], "22");
     }
