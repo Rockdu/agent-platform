@@ -1,4 +1,4 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useState, type ComponentType, type LazyExoticComponent } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type LazyExoticComponent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
@@ -34,6 +34,7 @@ import type { DoneReason, WorkspaceLifecycleSnapshot } from "./terminal-mesh";
 import { resolveAutoLaunchTerminalToShutdown } from "./close-tab-shutdown";
 import { synthesizeStuckAutoLaunchError } from "./stuck-auto-launch";
 import { removeTabKeyedEntry } from "./remove-tab-keyed-entry";
+import { isStaleAutoLaunchRejection } from "./stale-auto-launch-rejection";
 import {
   DEFAULT_LIFECYCLE_SNAPSHOT,
   useWorkspaceLifecycleStatuses,
@@ -1052,6 +1053,14 @@ function BootstrapDebugCard({ state }: { state: BootstrapState }) {
 
 interface OpenTab {
   tabId: string;
+  /// Monotonic per-adoption counter. Workspace tabs reuse the
+  /// workspace UUID as `tabId`, so close-then-reopen produces
+  /// tabs with the same `tabId` but distinct `openGeneration`
+  /// values. The fire-and-forget `requestWorkspaceAutoLaunch`
+  /// rejection closure captures this at fire time and bails on
+  /// mismatch so a late rejection from a prior incarnation does
+  /// NOT clobber the reopened tab's state.
+  openGeneration: number;
   workspaceId: string;
   workspaceName: string;
   /// Local filesystem path for Local workspaces; empty string for
@@ -1314,11 +1323,28 @@ function MultiTerminalContainer() {
   // only owns the tab array + open/close/focus calls.
   const [workspaces, setWorkspaces] = useState<WorkspaceRecord[]>([]);
   const [tabs, setTabs] = useState<OpenTab[]>([]);
+  // Monotonic counter stamped onto each new tab at adoption time
+  // so the fire-and-forget `requestWorkspaceAutoLaunch` rejection
+  // closure can detect close-then-reopen incarnations of the same
+  // bare-workspace-UUID `tabId` and silently drop stale rejections.
+  const openGenerationCounterRef = useRef<number>(0);
+  // Live mirror of `tabs` for synchronous read from async
+  // callbacks. The rejection guard for `requestWorkspaceAutoLaunch`
+  // needs the LATEST tab generation at the moment the rejection
+  // arrives — not the value captured at render time. Synced in an
+  // effect below.
+  const tabsRef = useRef<OpenTab[]>([]);
   // Tab-set memo + parent-owned lifecycle hook. Hoisted above
   // adoptWorkspaceTab/closeTab so the close path can read
   // `terminalIdByTabId` to shut down scheduler-owned terminals
   // before the tab is dropped from state.
   const tabIds = useMemo(() => tabs.map((t) => t.tabId), [tabs]);
+  // Mirror the latest `tabs` into `tabsRef` so async callbacks
+  // (e.g. fire-and-forget rejection guards) can read the current
+  // value without a stale render-time closure.
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
   const { snapshotByTabId, terminalIdByTabId } =
     useWorkspaceLifecycleStatuses(tabIds);
   const [active, setActive] = useState<string>("");
@@ -1406,6 +1432,11 @@ function MultiTerminalContainer() {
       // — it keys by string — so this change is invisible at the
       // backend.
       const tabId = workspace.workspaceId;
+      // Stamp a fresh incarnation token. The fire-and-forget
+      // rejection closure captures this value and bails on
+      // mismatch so close-then-reopen-then-late-reject doesn't
+      // corrupt the new tab's state.
+      const capturedGeneration = ++openGenerationCounterRef.current;
       try {
         const refreshed = await openWorkspace(workspace.workspaceId, tabId);
         setError(null);
@@ -1428,6 +1459,7 @@ function MultiTerminalContainer() {
             ...prev,
             {
               tabId,
+              openGeneration: capturedGeneration,
               workspaceId: refreshed.workspaceId,
               workspaceName: refreshed.name,
               workspacePath: localPath(refreshed) ?? "",
@@ -1452,6 +1484,27 @@ function MultiTerminalContainer() {
         if (refreshed.profile.autoLaunchClaude) {
           void requestWorkspaceAutoLaunch(refreshed.workspaceId, tabId).catch(
             (err) => {
+              // Stale-incarnation guard: the workspace may have
+              // been closed (or closed + reopened) since this
+              // request fired; in those cases the current tab's
+              // `openGeneration` no longer matches the captured
+              // value and applying state would corrupt either an
+              // empty tab list (no-op) or a brand-new tab
+              // (clobber). `tabsRef.current` is the latest tabs
+              // array, synced via the mirror effect above.
+              if (
+                isStaleAutoLaunchRejection({
+                  tabs: tabsRef.current,
+                  tabId,
+                  capturedGeneration,
+                })
+              ) {
+                console.debug(
+                  "auto-launch rejection dropped: tab incarnation changed",
+                  { tabId, capturedGeneration },
+                );
+                return;
+              }
               if (isAutoLaunchErrorDto(err)) {
                 setAutoLaunchErrorByTabId((prev) => ({
                   ...prev,
@@ -1467,11 +1520,12 @@ function MultiTerminalContainer() {
               // the waiting flag so the view exits the
               // waiting branch — the typed-error banner (or
               // the empty placeholder for the catch-all)
-              // takes over. Without this, the tab keeps
-              // showing 等待 claude 启动… indefinitely.
+              // takes over. The setter still gates by
+              // generation as defense in depth in case a fast
+              // close races with the setter dispatch.
               setTabs((prev) =>
                 prev.map((t) =>
-                  t.tabId === tabId
+                  t.tabId === tabId && t.openGeneration === capturedGeneration
                     ? { ...t, awaitingAutoLaunch: false }
                     : t,
                 ),
