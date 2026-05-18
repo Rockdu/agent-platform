@@ -1419,7 +1419,9 @@ function MultiTerminalContainer() {
         }
         return t;
       });
-      return mutated ? next : prev;
+      const committed = mutated ? next : prev;
+      tabsRef.current = committed;
+      return committed;
     });
   }, [snapshotByTabId, terminalIdByTabId]);
 
@@ -1453,9 +1455,10 @@ function MultiTerminalContainer() {
         const willAutoLaunch = refreshed.profile.autoLaunchClaude;
         setTabs((prev) => {
           if (prev.some((t) => t.workspaceId === refreshed.workspaceId)) {
+            tabsRef.current = prev;
             return prev;
           }
-          return [
+          const next: OpenTab[] = [
             ...prev,
             {
               tabId,
@@ -1473,6 +1476,17 @@ function MultiTerminalContainer() {
               ownsAutoLaunchTerminal: willAutoLaunch,
             },
           ];
+          // CRITICAL: sync tabsRef synchronously here. The
+          // fire-and-forget rejection closure below may run
+          // synchronously / microtask-fast (e.g. backend
+          // rejects ClaudeDiscoveryNotReady immediately) — BEFORE
+          // the `useEffect` that mirrors `tabs` into `tabsRef`
+          // commits. Without this inline assignment, the
+          // staleness helper would see no matching tab in
+          // `tabsRef.current` and silently drop the rejection,
+          // leaving the pane stuck waiting forever.
+          tabsRef.current = next;
+          return next;
         });
         setActive(tabId);
         void refreshWorkspaces();
@@ -1523,13 +1537,15 @@ function MultiTerminalContainer() {
               // takes over. The setter still gates by
               // generation as defense in depth in case a fast
               // close races with the setter dispatch.
-              setTabs((prev) =>
-                prev.map((t) =>
+              setTabs((prev) => {
+                const next = prev.map((t) =>
                   t.tabId === tabId && t.openGeneration === capturedGeneration
                     ? { ...t, awaitingAutoLaunch: false }
                     : t,
-                ),
-              );
+                );
+                tabsRef.current = next;
+                return next;
+              });
             },
           );
         }
@@ -1583,6 +1599,7 @@ function MultiTerminalContainer() {
         if (active === tabId && remaining.length > 0) {
           setActive(remaining[remaining.length - 1].tabId);
         }
+        tabsRef.current = remaining;
         return remaining;
       });
       // Clear per-tab maps keyed by tabId. The tabId is the bare
