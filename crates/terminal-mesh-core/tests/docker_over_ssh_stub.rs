@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use terminal_mesh_core::{
     transport::{
-        ShellCommand, ShutdownMode, Transport, TransportError, TransportExitStatus,
-        TransportSpawnRequest, WorkspaceLocation,
+        ContainerLocation, ShellCommand, ShutdownMode, Transport, TransportError,
+        TransportExitStatus, TransportSpawnRequest, WorkspaceLocation,
     },
     DockerOverSshTransport,
 };
@@ -53,7 +53,10 @@ fn docker_request(canonical_remote_path: &str, container_id: &str) -> TransportS
             host: "h.example".into(),
             port: Some(2222),
             canonical_remote_path: canonical_remote_path.to_string(),
-            container: Some(container_id.to_string()),
+            container: Some(ContainerLocation {
+                container_id: container_id.to_string(),
+                cwd_in_container: None,
+            }),
         },
         command: ShellCommand {
             program: PathBuf::from("/bin/sh"),
@@ -231,6 +234,132 @@ fn docker_local_workspace_rejected_with_protocol_error() {
         matches!(err, TransportError::Protocol { .. }),
         "expected Protocol; got {err:?}"
     );
+}
+
+#[test]
+fn docker_missing_container_returns_typed_docker_error() {
+    let tmp = TempDir::new().unwrap();
+    let recorder = tmp.path().join("argv.log");
+    let t = docker_transport(
+        &tmp,
+        &recorder,
+        "printf 'Error response from daemon: No such container: my-container\\n' >&2\nexit 1\n",
+    );
+    let err = match t.spawn(docker_request("/srv", "my-container")) {
+        Ok(_) => panic!("must reject missing container"),
+        Err(e) => e,
+    };
+    match err {
+        TransportError::DockerContainerMissing { container } => {
+            assert_eq!(container, "my-container");
+        }
+        other => panic!("expected DockerContainerMissing; got {other:?}"),
+    }
+}
+
+#[test]
+fn docker_missing_binary_returns_typed_docker_error() {
+    let tmp = TempDir::new().unwrap();
+    let recorder = tmp.path().join("argv.log");
+    let t = docker_transport(
+        &tmp,
+        &recorder,
+        "printf 'sh: docker: command not found\\n' >&2\nexit 127\n",
+    );
+    let err = match t.spawn(docker_request("/srv", "my-container")) {
+        Ok(_) => panic!("must reject missing docker"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, TransportError::DockerExecFailed { .. }),
+        "expected DockerExecFailed; got {err:?}"
+    );
+}
+
+/// Lifecycle-modeling regression per spec §5.3: the stub records
+/// its own PID, ignores cooperative termination signals
+/// (`trap '' HUP TERM`), then sleeps long enough that the spawn
+/// state is unambiguously "running" when the test calls
+/// `shutdown(Kill)`. After Kill + a 5s poll deadline, the test
+/// verifies the modeled spawn process is GONE (kill -0 returns
+/// ESRCH) AND that the cleanup ssh invocation was recorded.
+#[test]
+fn docker_shutdown_kill_terminates_spawn_within_5s() {
+    let tmp = TempDir::new().unwrap();
+    let recorder = tmp.path().join("argv.log");
+    let pid_file = tmp.path().join("spawn.pid");
+    // Stub: write own pid, ignore cooperative signals, emit the
+    // shell-started sentinel so spawn() returns Ok, then sleep.
+    let body = format!(
+        "echo $$ > {pid_file}\ntrap '' HUP TERM\nprintf '\\033]1338;am-shell-started\\a'\nsleep 30\nprintf '\\033]1338;am-exit-status;0\\a'\nexit 0\n",
+        pid_file = pid_file.display(),
+    );
+    let t = docker_transport(&tmp, &recorder, &body);
+    let mut session = t
+        .spawn(docker_request("/srv", "my-container"))
+        .expect("spawn ok");
+
+    // Wait briefly for the stub to actually record its PID.
+    let pid: i32 = {
+        let mut pid: Option<i32> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if let Ok(s) = std::fs::read_to_string(&pid_file)
+                && let Ok(n) = s.trim().parse::<i32>()
+            {
+                pid = Some(n);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        pid.expect("stub spawn must record its PID within 2s")
+    };
+
+    // Trigger Kill and poll for termination.
+    session.shutdown(ShutdownMode::Kill).expect("shutdown");
+    let _ = session.wait();
+    session.cleanup().expect("cleanup");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut still_alive = true;
+    while std::time::Instant::now() < deadline {
+        // `kill -0` returns 0 if the process exists, ESRCH otherwise.
+        // We exec /bin/kill instead of the shell builtin so the
+        // probe works regardless of the test environment's shell.
+        let probe = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .output()
+            .expect("kill -0 probe");
+        if !probe.status.success() {
+            still_alive = false;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        !still_alive,
+        "spawn process pid={pid} must be terminated within 5s of shutdown(Kill)",
+    );
+
+    // And the cleanup ssh invocation still reached the recorder.
+    let argv = read_recorder(&recorder);
+    assert!(
+        argv.contains("docker exec") && argv.contains("kill") && argv.contains("rm -f"),
+        "cleanup ssh invocation must reach the recorder; got:\n{argv}",
+    );
+    for forbidden in [
+        "docker stop",
+        "docker run",
+        "docker start",
+        "docker rm",
+        "docker create",
+    ] {
+        assert!(
+            !argv.contains(forbidden),
+            "lifecycle must not emit `{forbidden}`; got:\n{argv}",
+        );
+    }
 }
 
 #[test]

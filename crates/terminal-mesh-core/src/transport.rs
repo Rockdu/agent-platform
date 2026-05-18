@@ -37,8 +37,20 @@ pub enum WorkspaceLocation {
         host: String,
         port: Option<u16>,
         canonical_remote_path: String,
-        container: Option<String>,
+        container: Option<ContainerLocation>,
     },
+}
+
+/// Container identity for `WorkspaceLocation::Remote.container`.
+/// `cwd_in_container` is the in-container working directory the
+/// docker wrapper `cd`'s into BEFORE exec'ing the login shell;
+/// when `None`, the wrapper falls back to `canonical_remote_path`
+/// (the SSH host path) so legacy data without a per-container cwd
+/// still lands in a meaningful directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerLocation {
+    pub container_id: String,
+    pub cwd_in_container: Option<String>,
 }
 
 #[derive(Debug, Clone)]

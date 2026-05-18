@@ -23,18 +23,19 @@
 //! attaches to existing user-managed containers only (§5.4).
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
 use crate::transport::{
-    DisconnectReason, PtySize, ShutdownMode, Transport, TransportError, TransportExitStatus,
-    TransportOutputStream, TransportResizeHandle, TransportSession, TransportShutdownHandle,
-    TransportSpawnRequest, TransportStdinSink, WorkspaceLocation,
+    ContainerLocation, DisconnectReason, PtySize, ShutdownMode, Transport, TransportError,
+    TransportExitStatus, TransportOutputStream, TransportResizeHandle, TransportSession,
+    TransportShutdownHandle, TransportSpawnRequest, TransportStdinSink, WorkspaceLocation,
 };
 use crate::transport_ssh::{
-    compose_remote_command, shell_single_quote, spawn_ssh_with_wrapper_script, ssh_control_path_for,
-    SshLocation, SSH_OSC_EXIT_STATUS_PREFIX, SSH_OSC_NUMBER, SSH_OSC_SHELL_STARTED,
+    classify_phase_a_failure, compose_remote_command, shell_single_quote,
+    spawn_ssh_with_wrapper_script, ssh_control_path_for, PhaseAClassifier, SshLocation,
+    SSH_OSC_EXIT_STATUS_PREFIX, SSH_OSC_NUMBER, SSH_OSC_SHELL_STARTED,
 };
 
 // ---------------------------------------------------------------------------
@@ -55,11 +56,15 @@ impl DockerLocation {
     pub fn from_workspace(workspace: &WorkspaceLocation) -> Option<Self> {
         match workspace {
             WorkspaceLocation::Remote {
-                container: Some(container_id),
+                container:
+                    Some(ContainerLocation {
+                        container_id,
+                        cwd_in_container,
+                    }),
                 ..
             } => Some(Self {
                 container_id: container_id.clone(),
-                cwd_in_container: None,
+                cwd_in_container: cwd_in_container.clone(),
             }),
             _ => None,
         }
@@ -137,6 +142,72 @@ pub fn compose_docker_remote_command(
     )
 }
 
+/// Pre-shell-phase classifier for docker. Recognizes docker
+/// stderr patterns BEFORE falling through to the SSH classifier so
+/// `docker exec` failures surface as typed
+/// `TransportError::{DockerContainerMissing, DockerExecFailed}`
+/// instead of being mis-classified as `SshShellDidNotStart`.
+///
+/// Patterns:
+///
+/// - `No such container` / `Error response from daemon: No such
+///   container` → `DockerContainerMissing`.
+/// - `docker: command not found` / `executable file not found ...
+///   docker` / `not in $PATH` next to `docker` → `DockerExecFailed`
+///   (the remote shell could not find the docker binary).
+/// - `the input device is not a TTY` → `DockerExecFailed` (docker
+///   refused `-it` because no TTY was allocated downstream — rare
+///   when the SSH `-tt` arg is preserved, but defended against).
+///
+/// Any other failure falls through to the standard SSH classifier
+/// so auth / connect / host-key failures still surface correctly.
+pub fn classify_docker_phase_a_failure(
+    container_id: &str,
+    shell_started: bool,
+    ssh_exit: Option<i32>,
+    stderr_tail: &str,
+    location: &SshLocation,
+) -> TransportError {
+    if stderr_tail.contains("No such container") {
+        return TransportError::DockerContainerMissing {
+            container: container_id.to_string(),
+        };
+    }
+    if stderr_tail.contains("docker: command not found")
+        || (stderr_tail.contains("executable file not found")
+            && stderr_tail.contains("docker"))
+        || (stderr_tail.contains("docker")
+            && stderr_tail.contains("not in $PATH"))
+    {
+        return TransportError::DockerExecFailed {
+            container: container_id.to_string(),
+            message: stderr_tail.to_string(),
+        };
+    }
+    if stderr_tail.contains("the input device is not a TTY") {
+        return TransportError::DockerExecFailed {
+            container: container_id.to_string(),
+            message: stderr_tail.to_string(),
+        };
+    }
+    classify_phase_a_failure(shell_started, ssh_exit, stderr_tail, location)
+}
+
+/// Construct a `PhaseAClassifier` bound to a specific
+/// `container_id` so the docker error variants can carry it as
+/// their `container` field.
+pub fn docker_phase_a_classifier(container_id: String) -> PhaseAClassifier {
+    Arc::new(move |shell_started, ssh_exit, stderr_tail, location| {
+        classify_docker_phase_a_failure(
+            &container_id,
+            shell_started,
+            ssh_exit,
+            stderr_tail,
+            location,
+        )
+    })
+}
+
 /// Compose the cleanup command sent over the same ControlMaster on
 /// `shutdown(Kill)`. The container is NEVER stopped — this just
 /// signals the wrapper process inside the existing container and
@@ -210,10 +281,18 @@ impl Transport for DockerOverSshTransport {
             }
         })?;
         let session_id = Uuid::new_v4().to_string();
+        // Prefer the in-container cwd when the workspace carries
+        // one; fall back to the SSH host path for legacy data where
+        // the container mount and SSH path are the same. The legacy
+        // fallback is regression-tested separately.
+        let cwd_for_wrapper = docker
+            .cwd_in_container
+            .as_deref()
+            .or(Some(ssh_location.canonical_remote_path.as_str()));
         let docker_cmd = compose_docker_remote_command(
             &docker.container_id,
             &session_id,
-            Some(&ssh_location.canonical_remote_path),
+            cwd_for_wrapper,
         );
         let inner_session = spawn_ssh_with_wrapper_script(
             &self.ssh_program,
@@ -221,6 +300,7 @@ impl Transport for DockerOverSshTransport {
             &ssh_location,
             &docker_cmd,
             request.initial_size,
+            docker_phase_a_classifier(docker.container_id.clone()),
         )?;
         Ok(Box::new(DockerOverSshTransportSession {
             inner: Some(inner_session),
@@ -554,7 +634,10 @@ mod tests {
             host: "h".into(),
             port: None,
             canonical_remote_path: "/srv".into(),
-            container: Some("ctr-7".into()),
+            container: Some(ContainerLocation {
+                container_id: "ctr-7".into(),
+                cwd_in_container: None,
+            }),
         };
         let loc = DockerLocation::from_workspace(&ws).expect("container present");
         assert_eq!(loc.container_id, "ctr-7");
@@ -570,6 +653,126 @@ mod tests {
             container: None,
         };
         assert!(DockerLocation::from_workspace(&ws).is_none());
+    }
+
+    /// `cwd_in_container` MUST survive the registry → core →
+    /// `compose_docker_remote_command` pipeline so a workspace whose
+    /// container mount differs from the SSH host path lands in the
+    /// correct directory inside the container.
+    #[test]
+    fn docker_wrapper_uses_cwd_in_container_when_present() {
+        let cmd = compose_docker_remote_command("c", "s", Some("/app/work"));
+        assert!(
+            cmd.contains("/app/work"),
+            "compose must use the supplied container cwd; got {cmd}"
+        );
+    }
+
+    /// Legacy data without a per-container cwd must fall back to the
+    /// SSH host path via the spawn-time `or` chain. Pinned here at
+    /// the helper layer; the spawn-path fallback is exercised via
+    /// the stub integration tests (the recorder catches whichever
+    /// cwd the wrapper actually receives).
+    #[test]
+    fn docker_wrapper_falls_back_when_cwd_in_container_is_none() {
+        // Mirror the spawn-path or-chain: cwd_in_container: None
+        // becomes the SSH path. Helper-level smoke that the helper
+        // accepts None and the spawn site is the one that supplies
+        // the fallback.
+        let cmd = compose_docker_remote_command("c", "s", None);
+        assert!(
+            !cmd.contains("AM_REMOTE_CWD"),
+            "compose with None cwd must omit the cd block; got {cmd}"
+        );
+    }
+
+    fn loc() -> SshLocation {
+        SshLocation {
+            user: Some("alice".into()),
+            host: "h.example".into(),
+            port: Some(2222),
+            canonical_remote_path: "/srv".into(),
+        }
+    }
+
+    #[test]
+    fn classify_docker_phase_a_failure_maps_no_such_container_to_typed_docker_error() {
+        let err = classify_docker_phase_a_failure(
+            "my-container",
+            false,
+            Some(1),
+            "Error response from daemon: No such container: my-container",
+            &loc(),
+        );
+        match err {
+            TransportError::DockerContainerMissing { container } => {
+                assert_eq!(container, "my-container");
+            }
+            other => panic!("expected DockerContainerMissing; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_docker_phase_a_failure_maps_docker_not_found_to_docker_exec_failed() {
+        let err = classify_docker_phase_a_failure(
+            "c",
+            false,
+            Some(127),
+            "bash: docker: command not found",
+            &loc(),
+        );
+        assert!(matches!(err, TransportError::DockerExecFailed { .. }));
+    }
+
+    #[test]
+    fn classify_docker_phase_a_failure_maps_not_a_tty_to_docker_exec_failed() {
+        let err = classify_docker_phase_a_failure(
+            "c",
+            false,
+            Some(1),
+            "the input device is not a TTY",
+            &loc(),
+        );
+        assert!(matches!(err, TransportError::DockerExecFailed { .. }));
+    }
+
+    /// Unrelated SSH failures must still classify via the SSH path
+    /// (e.g. auth failure should remain `SshAuth`, NOT a Docker
+    /// variant, even though the docker classifier ran first).
+    #[test]
+    fn classify_docker_phase_a_failure_falls_through_to_ssh_classifier_for_unrelated_stderr() {
+        let err = classify_docker_phase_a_failure(
+            "c",
+            false,
+            Some(255),
+            "alice@h.example: Permission denied (publickey).",
+            &loc(),
+        );
+        match err {
+            TransportError::SshAuth { user, host, port } => {
+                assert_eq!(user, "alice");
+                assert_eq!(host, "h.example");
+                assert_eq!(port, 2222);
+            }
+            other => panic!("expected SshAuth fall-through; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn docker_location_from_workspace_preserves_cwd_in_container() {
+        let ws = WorkspaceLocation::Remote {
+            user: None,
+            host: "h".into(),
+            port: None,
+            canonical_remote_path: "/srv".into(),
+            container: Some(ContainerLocation {
+                container_id: "ctr-9".into(),
+                cwd_in_container: Some("/app/inside".into()),
+            }),
+        };
+        let loc = DockerLocation::from_workspace(&ws).expect("present");
+        assert_eq!(loc.container_id, "ctr-9");
+        assert_eq!(loc.cwd_in_container.as_deref(), Some("/app/inside"));
     }
 
     #[test]

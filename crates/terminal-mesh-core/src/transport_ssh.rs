@@ -586,8 +586,18 @@ impl Transport for SshTransport {
             &location,
             &wrapper,
             request.initial_size,
+            default_phase_a_classifier(),
         )
     }
+}
+
+/// Default `PhaseAClassifier` that simply delegates to
+/// `classify_phase_a_failure`. Used by `SshTransport`; composed-on
+/// by `DockerOverSshTransport`.
+pub fn default_phase_a_classifier() -> PhaseAClassifier {
+    Arc::new(|shell_started, ssh_exit, stderr_tail, location| {
+        classify_phase_a_failure(shell_started, ssh_exit, stderr_tail, location)
+    })
 }
 
 /// Shared spawn engine extracted from `SshTransport::spawn` so
@@ -597,12 +607,26 @@ impl Transport for SshTransport {
 /// caller; this helper builds the argv, spawns ssh under a PTY,
 /// runs the gate, and returns either a live session or a typed
 /// pre-shell phase error.
+/// Pre-shell-phase classifier callback. Receives the captured
+/// stderr/output tail + ssh exit code + the SSH location and
+/// produces a typed `TransportError`. SshTransport passes a
+/// closure that delegates to `classify_phase_a_failure`;
+/// DockerOverSshTransport passes a docker-augmented closure that
+/// recognizes `No such container` / `docker: command not found` /
+/// `not a TTY` patterns BEFORE falling through to the SSH
+/// classifier. The pluggable seam is the only way to keep the
+/// pre-shell-phase classification a per-transport concern instead
+/// of baking SSH-only assumptions into the shared spawn engine.
+pub type PhaseAClassifier =
+    Arc<dyn Fn(bool, Option<i32>, &str, &SshLocation) -> TransportError + Send + Sync>;
+
 pub(crate) fn spawn_ssh_with_wrapper_script(
     ssh_program: &Path,
     control_dir: &Path,
     location: &SshLocation,
     wrapper_script: &str,
     initial_size: PtySize,
+    classifier: PhaseAClassifier,
 ) -> Result<Box<dyn TransportSession>, TransportError> {
     let control_path = ssh_control_path_for(control_dir, location);
     // Refuse to hand a foreign-owned existing socket file to
@@ -670,7 +694,7 @@ pub(crate) fn spawn_ssh_with_wrapper_script(
         })),
         PhaseAOutcome::FailedBeforeShell { ssh_exit } => {
             let tail = shared.stderr_tail();
-            let err = classify_phase_a_failure(false, ssh_exit, &tail, location);
+            let err = classifier(false, ssh_exit, &tail, location);
             // Best-effort clean up the child if it is still alive
             // (deadline case).
             if let Ok(mut guard) = child.lock()

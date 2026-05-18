@@ -29,10 +29,10 @@ pub use osc_agent_marker::{
 pub use prompt_detector::PromptDetector;
 pub use ring_buffer::{BufferTruncatedInfo, RingBuffer, RING_CAPACITY_BYTES};
 pub use transport::{
-    DisconnectReason, LocalTransport, PathBufOrRemote, PtySize as TransportPtySize, ShellCommand,
-    ShutdownMode, Transport, TransportError, TransportExitStatus, TransportOutputStream,
-    TransportResizeHandle, TransportSession, TransportShutdownHandle, TransportSpawnRequest,
-    TransportStdinSink, WorkspaceLocation,
+    ContainerLocation, DisconnectReason, LocalTransport, PathBufOrRemote,
+    PtySize as TransportPtySize, ShellCommand, ShutdownMode, Transport, TransportError,
+    TransportExitStatus, TransportOutputStream, TransportResizeHandle, TransportSession,
+    TransportShutdownHandle, TransportSpawnRequest, TransportStdinSink, WorkspaceLocation,
 };
 pub use transport_ssh::{
     build_sentinel_wrapper_script, build_ssh_argv, classify_phase_a_failure,
