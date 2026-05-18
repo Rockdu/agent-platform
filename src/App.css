@@ -672,11 +672,16 @@
 .terminal-mesh-view {
   position: absolute;
   inset: 0;
-  display: none;
+  display: flex;
   flex-direction: column;
+  /* visibility: hidden keeps the element in the render tree so
+     xterm's canvas context is NOT cleared by WebKit when switching
+     tabs. display: none would clear the canvas backing, erasing
+     terminal content on every tab switch. */
+  visibility: hidden;
 }
 .terminal-mesh-view--active {
-  display: flex;
+  visibility: visible;
 }
 .terminal-mesh-view__status-strip {
   display: flex;
