@@ -338,7 +338,7 @@ fn discovery_error_kind(err: &ClaudeDiscoveryError) -> &'static str {
 }
 
 #[tauri::command]
-pub fn request_workspace_auto_launch(
+pub async fn request_workspace_auto_launch(
     app: AppHandle,
     workspace_id: String,
     tab_id: String,
