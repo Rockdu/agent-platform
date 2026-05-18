@@ -1317,19 +1317,19 @@ function RailSections(props: RailSectionsProps) {
 
   return (
     <>
-      <section className="rail-section rail-section--running">
-        <header className="rail-section__header">
-          <span className="rail-section__label">运行区</span>
-          <span className="rail-section__count">{running.length}</span>
-        </header>
-        {running.map((t) => renderRow(t, { affordance: false }))}
-      </section>
       <section className="rail-section rail-section--done">
         <header className="rail-section__header">
           <span className="rail-section__label">完成区</span>
           <span className="rail-section__count">{done.length}</span>
         </header>
         {done.map((t) => renderRow(t, { affordance: true }))}
+      </section>
+      <section className="rail-section rail-section--running">
+        <header className="rail-section__header">
+          <span className="rail-section__label">运行区</span>
+          <span className="rail-section__count">{running.length}</span>
+        </header>
+        {running.map((t) => renderRow(t, { affordance: false }))}
       </section>
     </>
   );
