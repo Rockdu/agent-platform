@@ -516,14 +516,22 @@ pub fn init_control_master_dir(app_data: &Path) -> Result<PathBuf, TransportErro
     Ok(dir)
 }
 
-/// Best-effort stale-socket cleanup. Enumerates `*.sock` files in
-/// `control_dir`, removes any whose mtime is older than 1 hour. The
-/// 1-hour threshold is conservative — live `ControlPersist` sockets
-/// are continuously touched while connections multiplex through
-/// them, while sockets left over from crashed sessions are not.
+/// Best-effort stale-socket cleanup. Enumerates `*.sock` files
+/// in `control_dir` and unlinks any whose ControlMaster is no
+/// longer alive. Sockets with recent mtimes are assumed live
+/// (fast-path skip — `ControlPersist` sockets are touched on
+/// each new multiplex connection); old-mtime sockets are probed
+/// via `ssh -O check` before removal because Unix socket mtimes
+/// are NOT reliably refreshed by clients multiplexing through
+/// the master, so an old mtime alone does not imply a dead
+/// master.
+///
 /// Returns the number of sockets removed. Never touches files
 /// outside `control_dir`.
-pub fn cleanup_stale_master_sockets(control_dir: &Path) -> Result<usize, TransportError> {
+pub fn cleanup_stale_master_sockets(
+    ssh_program: &Path,
+    control_dir: &Path,
+) -> Result<usize, TransportError> {
     if !control_dir.is_dir() {
         return Ok(0);
     }
@@ -541,11 +549,48 @@ pub fn cleanup_stale_master_sockets(control_dir: &Path) -> Result<usize, Transpo
         }
         let Ok(meta) = entry.metadata() else { continue };
         let Ok(mtime) = meta.modified() else { continue };
-        if mtime < cutoff && std::fs::remove_file(&path).is_ok() {
+        if mtime >= cutoff {
+            // Recent mtime — assume live; skip without invoking
+            // ssh (keeps cleanup O(syscalls) on the common path).
+            continue;
+        }
+        // Old mtime: socket may be stale OR a long-lived
+        // multiplex that hasn't bumped its mtime recently.
+        // Probe liveness before unlinking.
+        if is_control_master_alive(ssh_program, &path) {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
             removed += 1;
         }
     }
     Ok(removed)
+}
+
+/// Liveness probe for an existing ControlMaster socket. Invokes
+/// `ssh -O check -o ControlPath=<path> <placeholder-host>` — the
+/// placeholder hostname is ignored by `-O check` because that
+/// command talks to the multiplex master directly via the
+/// control socket. Returns `true` only when ssh exits 0 (master
+/// alive); any subprocess failure (spawn-failed, signal-killed,
+/// non-zero exit) is treated as dead so the caller can safely
+/// unlink the socket file.
+///
+/// Stdout and stderr are redirected to null so the probe is
+/// silent on a clean run; the boolean return is the only
+/// observable.
+fn is_control_master_alive(ssh_program: &Path, socket_path: &Path) -> bool {
+    use std::process::{Command, Stdio};
+    let status = Command::new(ssh_program)
+        .arg("-o")
+        .arg(format!("ControlPath={}", socket_path.display()))
+        .arg("-O")
+        .arg("check")
+        .arg("placeholder-host")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    matches!(status, Ok(s) if s.success())
 }
 
 // ---------------------------------------------------------------------------
@@ -585,7 +630,7 @@ impl SshTransport {
         // Best-effort: cleanup failures do NOT fail construction
         // (a non-removable stale socket should not block remote
         // workspace creation), but they are logged.
-        if let Err(e) = cleanup_stale_master_sockets(&control_dir) {
+        if let Err(e) = cleanup_stale_master_sockets(&ssh_program, &control_dir) {
             tracing::warn!(
                 control_dir = %control_dir.display(),
                 error = %e,
@@ -1671,15 +1716,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cleanup_stale_master_sockets_removes_old_sock_files() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let dir = init_control_master_dir(tmp.path()).unwrap();
-        let recent = dir.join("recent.sock");
-        let stale = dir.join("stale.sock");
-        std::fs::write(&recent, b"not really a socket").unwrap();
-        std::fs::write(&stale, b"not really a socket").unwrap();
-        // Back-date the stale socket's mtime to 2 hours ago.
+    /// Write an executable stub at `path` that exits with
+    /// `exit_code` regardless of arguments. Used to simulate
+    /// `ssh -O check` returning alive (exit 0) or dead (exit 1)
+    /// without depending on platform-specific `/bin/true` and
+    /// `/bin/false` paths (macOS only has them under `/usr/bin/`).
+    fn write_stub_ssh(path: &Path, exit_code: i32) {
+        std::fs::write(path, format!("#!/bin/sh\nexit {exit_code}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    fn backdate_two_hours(path: &Path) {
         let old = filetime::FileTime::from_unix_time(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1688,11 +1741,67 @@ mod tests {
                 - 7200,
             0,
         );
-        filetime::set_file_mtime(&stale, old).unwrap();
-        let removed = cleanup_stale_master_sockets(&dir).unwrap();
+        filetime::set_file_mtime(path, old).unwrap();
+    }
+
+    #[test]
+    fn cleanup_stale_master_sockets_removes_old_sock_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = init_control_master_dir(tmp.path()).unwrap();
+        let recent = dir.join("recent.sock");
+        let stale = dir.join("stale.sock");
+        std::fs::write(&recent, b"not really a socket").unwrap();
+        std::fs::write(&stale, b"not really a socket").unwrap();
+        backdate_two_hours(&stale);
+        // Stub ssh that always exits non-zero → liveness probe
+        // reports DEAD for every old-mtime socket → unlink.
+        let stub = tmp.path().join("stub-ssh-dead");
+        write_stub_ssh(&stub, 1);
+        let removed = cleanup_stale_master_sockets(&stub, &dir).unwrap();
         assert_eq!(removed, 1, "exactly one stale socket should be removed");
-        assert!(recent.exists(), "recent socket must survive");
-        assert!(!stale.exists(), "stale socket must be removed");
+        assert!(recent.exists(), "recent socket must survive (mtime fast-path)");
+        assert!(!stale.exists(), "stale socket with dead probe must be removed");
+    }
+
+    /// Live multiplex master can have an old mtime because Unix
+    /// socket mtimes are NOT refreshed by clients multiplexing
+    /// through the socket. The liveness probe (`ssh -O check`)
+    /// MUST keep such sockets even when the mtime fast-path
+    /// would have flagged them for removal.
+    #[test]
+    fn cleanup_stale_master_sockets_keeps_live_socket_with_old_mtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = init_control_master_dir(tmp.path()).unwrap();
+        let live_but_old = dir.join("live.sock");
+        std::fs::write(&live_but_old, b"x").unwrap();
+        backdate_two_hours(&live_but_old);
+        // Stub ssh that always exits 0 → liveness probe reports
+        // ALIVE → socket MUST NOT be removed despite old mtime.
+        let stub = tmp.path().join("stub-ssh-alive");
+        write_stub_ssh(&stub, 0);
+        let removed = cleanup_stale_master_sockets(&stub, &dir).unwrap();
+        assert_eq!(removed, 0, "alive socket must be kept regardless of mtime");
+        assert!(
+            live_but_old.exists(),
+            "live multiplex socket must survive even with stale mtime"
+        );
+    }
+
+    /// Symmetric: a truly dead old-mtime socket should be
+    /// unlinked once the liveness probe confirms it. Pins the
+    /// removal contract directly under the new probe-gated path.
+    #[test]
+    fn cleanup_stale_master_sockets_removes_dead_socket_with_old_mtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = init_control_master_dir(tmp.path()).unwrap();
+        let dead = dir.join("dead.sock");
+        std::fs::write(&dead, b"x").unwrap();
+        backdate_two_hours(&dead);
+        let stub = tmp.path().join("stub-ssh-dead");
+        write_stub_ssh(&stub, 1);
+        let removed = cleanup_stale_master_sockets(&stub, &dir).unwrap();
+        assert_eq!(removed, 1, "dead socket with old mtime must be removed");
+        assert!(!dead.exists());
     }
 
     #[test]
@@ -1741,12 +1850,24 @@ mod tests {
         );
         filetime::set_file_mtime(&stale, old).unwrap();
 
+        // Stub ssh that returns NON-ZERO for `-O check` so the
+        // liveness probe reports the stale socket as dead and
+        // cleanup removes it. (A 0-exit stub would now keep the
+        // socket — that's the live-mtime contract pinned in
+        // `cleanup_stale_master_sockets_keeps_live_socket_with_old_mtime`.)
         let stub_ssh = tmp.path().join("stub-ssh");
-        std::fs::write(&stub_ssh, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&stub_ssh, b"#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub_ssh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub_ssh, perms).unwrap();
+        }
         let _t = SshTransport::from_app_data(stub_ssh, tmp.path()).expect("from_app_data");
         assert!(
             !stale.exists(),
-            "from_app_data must remove stale sockets at construction"
+            "from_app_data must remove stale sockets at construction (probe-confirmed dead)"
         );
     }
 
@@ -1773,14 +1894,22 @@ mod tests {
         let dir = init_control_master_dir(tmp.path()).unwrap();
         let other = dir.join("ignored.txt");
         std::fs::write(&other, b"x").unwrap();
-        cleanup_stale_master_sockets(&dir).unwrap();
+        let stub = tmp.path().join("stub-ssh");
+        write_stub_ssh(&stub, 0);
+        // ssh program path is irrelevant here — no .sock files
+        // reach the probe path. Pass a working stub so the
+        // signature requirement is satisfied.
+        cleanup_stale_master_sockets(&stub, &dir).unwrap();
         assert!(other.exists(), "non-sock files must be left alone");
     }
 
     #[test]
     fn cleanup_stale_master_sockets_returns_zero_for_missing_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let removed = cleanup_stale_master_sockets(&tmp.path().join("does-not-exist")).unwrap();
+        let stub = tmp.path().join("stub-ssh");
+        write_stub_ssh(&stub, 0);
+        let removed =
+            cleanup_stale_master_sockets(&stub, &tmp.path().join("does-not-exist")).unwrap();
         assert_eq!(removed, 0);
     }
 

@@ -293,7 +293,7 @@ impl DockerOverSshTransport {
         app_data: &Path,
     ) -> Result<Self, TransportError> {
         let control_dir = crate::transport_ssh::init_control_master_dir(app_data)?;
-        if let Err(e) = crate::transport_ssh::cleanup_stale_master_sockets(&control_dir) {
+        if let Err(e) = crate::transport_ssh::cleanup_stale_master_sockets(&ssh_program, &control_dir) {
             tracing::warn!(
                 control_dir = %control_dir.display(),
                 error = %e,
