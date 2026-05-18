@@ -871,6 +871,41 @@ enum PhaseAOutcome {
     FailedBeforeShell { ssh_exit: Option<i32> },
 }
 
+/// After observing the ssh child's exit, drain the reader thread
+/// while polling for the `am-shell-started` sentinel. Returns
+/// `true` if the sentinel was observed (the wrapper emitted both
+/// sentinels before the inner command's fast exit closed the
+/// PTY, so the pre-shell handshake actually completed), `false`
+/// if the drain finished without ever seeing it (genuine
+/// pre-shell failure).
+///
+/// Bounded by `deadline`: the reader exits on master-PTY EOF,
+/// which happens at the latest when ssh exits, so under normal
+/// operation the loop terminates promptly. The deadline is a
+/// safety bound for pathological IO scheduling.
+///
+/// Extracted as a pure helper so the race-window classification
+/// can be tested without a `portable_pty::Child` stub.
+fn drain_and_recheck_shell_started(
+    shared: &SharedSshState,
+    deadline: Duration,
+) -> bool {
+    let drain_deadline = Instant::now() + deadline;
+    while !shared.reader_done.load(Ordering::SeqCst)
+        && Instant::now() < drain_deadline
+    {
+        if shared.shell_started.load(Ordering::SeqCst) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Last-chance recheck after the reader has finished (or the
+    // drain deadline expired). The reader may have stored the
+    // sentinel in the final iteration just before setting
+    // reader_done.
+    shared.shell_started.load(Ordering::SeqCst)
+}
+
 fn await_phase_a(
     shared: Arc<SharedSshState>,
     child: Arc<Mutex<Option<Box<dyn Child + Send + Sync>>>>,
@@ -891,8 +926,17 @@ fn await_phase_a(
             exited = Some(status.exit_code() as i32);
         }
         if let Some(code) = exited {
-            // Drain any final reader-thread output before classifying.
-            thread::sleep(Duration::from_millis(50));
+            // Fast-exit race: `try_wait` can observe ssh's exit
+            // BEFORE the reader thread has parsed the
+            // `am-shell-started` sentinel that ssh wrote to the
+            // PTY just before exiting (especially for the
+            // registration probe's `/bin/sh -lc ':'`). The drain
+            // helper polls `reader_done` and `shell_started`
+            // until either the sentinel is observed or the
+            // reader finishes — closing the race window.
+            if drain_and_recheck_shell_started(&shared, Duration::from_millis(500)) {
+                return PhaseAOutcome::ShellStarted;
+            }
             return PhaseAOutcome::FailedBeforeShell {
                 ssh_exit: Some(code),
             };
@@ -1759,5 +1803,90 @@ mod tests {
     fn ssh_location_from_workspace_returns_none_for_local() {
         let ws = WorkspaceLocation::Local { path: None };
         assert!(SshLocation::from_workspace(&ws).is_none());
+    }
+
+    /// Race-window regression: when ssh's child exits before the
+    /// reader thread parses `am-shell-started`, the drain helper
+    /// MUST observe the sentinel that arrives during the drain
+    /// window. Run 20 iterations with the sentinel arriving
+    /// ~5-20ms after the drain starts; assert every iteration
+    /// returns `true` (pre-shell handshake actually completed).
+    #[test]
+    fn drain_and_recheck_observes_sentinel_set_during_drain_window() {
+        for iter in 0..20 {
+            let shared = Arc::new(SharedSshState::new());
+            let shared_for_setter = Arc::clone(&shared);
+            // Set the sentinel a few ms after the drain starts to
+            // exercise the in-loop observation path.
+            let delay_ms = 5 + (iter % 16);
+            let setter = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(delay_ms));
+                shared_for_setter.note_shell_started();
+            });
+            let observed =
+                drain_and_recheck_shell_started(&shared, Duration::from_millis(500));
+            setter.join().unwrap();
+            assert!(
+                observed,
+                "iter {iter}: sentinel set during drain MUST be observed (delay={delay_ms}ms)"
+            );
+        }
+    }
+
+    /// Late-arrival case: the reader stores the sentinel and
+    /// then sets `reader_done` (mirroring the real reader thread
+    /// after EOF). The helper's last-chance recheck MUST observe
+    /// the sentinel — the previous code returned without
+    /// rechecking, which was the bug.
+    #[test]
+    fn drain_and_recheck_observes_sentinel_then_reader_done() {
+        let shared = Arc::new(SharedSshState::new());
+        // Pre-set BOTH so the in-loop check at iteration 1
+        // exits via shell_started before the loop sees
+        // reader_done. This pins the "reader finished and
+        // sentinel was set" composite state.
+        shared.note_shell_started();
+        shared.reader_done.store(true, Ordering::SeqCst);
+        let observed =
+            drain_and_recheck_shell_started(&shared, Duration::from_millis(500));
+        assert!(observed, "reader-done + sentinel-set MUST classify as ShellStarted");
+    }
+
+    /// Genuine failure: reader finished without ever seeing the
+    /// sentinel. The helper must return `false` so the caller
+    /// classifies the exit as `FailedBeforeShell`.
+    #[test]
+    fn drain_and_recheck_returns_false_when_reader_done_without_sentinel() {
+        let shared = Arc::new(SharedSshState::new());
+        shared.reader_done.store(true, Ordering::SeqCst);
+        let observed =
+            drain_and_recheck_shell_started(&shared, Duration::from_millis(100));
+        assert!(
+            !observed,
+            "reader done without sentinel must classify as pre-shell failure"
+        );
+    }
+
+    /// Deadline timeout: neither sentinel nor reader-done set.
+    /// Helper returns `false` after the deadline elapses.
+    #[test]
+    fn drain_and_recheck_returns_false_after_deadline_with_no_signals() {
+        let shared = Arc::new(SharedSshState::new());
+        let start = Instant::now();
+        let observed =
+            drain_and_recheck_shell_started(&shared, Duration::from_millis(40));
+        let elapsed = start.elapsed();
+        assert!(!observed, "no signals → no sentinel observed");
+        assert!(
+            elapsed >= Duration::from_millis(40),
+            "helper must wait the full deadline; elapsed={elapsed:?}"
+        );
+        // Upper bound check — the loop polls at 5ms intervals so
+        // some slack is fine, but a runaway loop would blow past
+        // 500ms.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "helper must not exceed the deadline by more than poll-jitter; elapsed={elapsed:?}"
+        );
     }
 }
