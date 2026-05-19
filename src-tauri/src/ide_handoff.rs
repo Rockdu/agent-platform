@@ -213,18 +213,42 @@ impl IdePreferenceStore {
 /// Windows it accepts any file (Windows uses extension probing
 /// `cmd.exe`/`bat`/`.exe` which we don't need for the MVP IDE
 /// commands).
+///
+/// On macOS, Tauri GUI processes inherit a stripped PATH
+/// (`/usr/bin:/bin:...`) that omits Homebrew and user-installed
+/// CLI tools. To compensate, well-known macOS locations are
+/// probed in addition to `$PATH`.
 pub fn which_in_path(command: &str) -> Option<PathBuf> {
     if command.is_empty() {
         return None;
     }
-    let raw_path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&raw_path) {
-        if dir.as_os_str().is_empty() {
-            continue;
+    // Probe $PATH first so user overrides win.
+    if let Some(raw_path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&raw_path) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let candidate = dir.join(command);
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
         }
-        let candidate = dir.join(command);
-        if is_executable(&candidate) {
-            return Some(candidate);
+    }
+    // macOS fallback: check common locations not included in the
+    // stripped PATH that Tauri GUI processes inherit.
+    #[cfg(target_os = "macos")]
+    {
+        let extra_dirs = [
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/sbin",
+        ];
+        for dir in extra_dirs {
+            let candidate = std::path::Path::new(dir).join(command);
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -359,6 +383,45 @@ pub fn ide_open_workspace(
     let pref = store.snapshot();
     open_workspace_in_ide(&pref, Path::new(&workspace_path))
         .map_err(|e| IdeHandoffErrorDto::from(&e))
+}
+
+/// Open a remote SSH workspace in the configured IDE using the
+/// VS Code / Cursor remote URI scheme:
+/// `vscode-remote://ssh-remote+[user@]host[:port]/path`
+///
+/// Cursor (and VS Code with Remote-SSH) recognise the `--folder-uri`
+/// flag and connect to the remote host transparently.
+#[tauri::command]
+pub fn ide_open_remote_workspace(
+    ssh_user: Option<String>,
+    ssh_host: String,
+    ssh_port: Option<u16>,
+    remote_path: String,
+    store: State<'_, IdePreferenceStore>,
+) -> Result<(), IdeHandoffErrorDto> {
+    let pref = store.snapshot();
+    // Build the authority part: [user@]host[:port]
+    let authority = match (ssh_user.as_deref(), ssh_port) {
+        (Some(u), Some(p)) => format!("{u}@{ssh_host}:{p}"),
+        (Some(u), None) => format!("{u}@{ssh_host}"),
+        (None, Some(p)) => format!("{ssh_host}:{p}"),
+        (None, None) => ssh_host.clone(),
+    };
+    // Encode the path so spaces and special chars survive URI parsing.
+    // Simple percent-encode: replace space; leave / and alphanumerics.
+    let encoded_path: String = remote_path
+        .chars()
+        .flat_map(|c| {
+            if c == ' ' {
+                "%20".chars().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect();
+    let folder_uri = format!("vscode-remote://ssh-remote+{authority}{encoded_path}");
+    let args = vec!["--folder-uri".to_string(), folder_uri];
+    open_with(&pref.ide_command, &args).map_err(|e| IdeHandoffErrorDto::from(&e))
 }
 
 #[tauri::command]

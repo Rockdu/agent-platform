@@ -15,6 +15,7 @@ import {
 import {
   isIdeHandoffErrorDto,
   openWorkspaceInIde,
+  openRemoteWorkspaceInIde,
   revealWorkspaceInFinder,
   type IdeHandoffErrorDto,
 } from "./ide-handoff";
@@ -131,17 +132,23 @@ export function TerminalMeshView({
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const onOpenIde = useCallback(async () => {
-    // Defense in depth: the UI also disables this button for
-    // Remote tabs, but a handler bypass (e.g. keyboard shortcut)
-    // must not try to open a non-existent local path in Cursor.
-    if (isRemote || !cwd) return;
     setIdeError(null);
     try {
-      await openWorkspaceInIde(cwd);
+      if (isRemote && workspaceLocation?.kind === "remote") {
+        const { ssh } = workspaceLocation;
+        await openRemoteWorkspaceInIde({
+          sshUser: ssh.user,
+          sshHost: ssh.host,
+          sshPort: ssh.port,
+          remotePath: ssh.canonicalRemotePath,
+        });
+      } else if (!isRemote && cwd) {
+        await openWorkspaceInIde(cwd);
+      }
     } catch (err) {
       if (isIdeHandoffErrorDto(err)) setIdeError(err);
     }
-  }, [cwd, isRemote]);
+  }, [cwd, isRemote, workspaceLocation]);
 
   const onRevealFinder = useCallback(async () => {
     if (isRemote || !cwd) return;
@@ -408,12 +415,7 @@ export function TerminalMeshView({
               type="button"
               className="terminal-mesh-view__status-action"
               onClick={() => void onOpenIde()}
-              disabled={isRemote}
-              title={
-                isRemote
-                  ? "远程工作区暂不支持本机 Cursor 打开"
-                  : undefined
-              }
+              title={isRemote ? "通过 SSH Remote 在 Cursor 中打开远程工作区" : undefined}
             >
               Cursor 中打开
             </button>
@@ -576,12 +578,7 @@ function WorkspaceSettingsPanel(props: {
           <button
             type="button"
             onClick={() => void onOpenIde()}
-            disabled={isRemote}
-            title={
-              isRemote
-                ? "远程工作区暂不支持本机 Cursor 打开"
-                : undefined
-            }
+            title={isRemote ? "通过 SSH Remote 在 Cursor 中打开远程工作区" : undefined}
           >
             Cursor 中打开
           </button>

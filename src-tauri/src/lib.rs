@@ -925,6 +925,7 @@ pub fn run() {
             ide_handoff::ide_get_preference,
             ide_handoff::ide_set_preference,
             ide_handoff::ide_open_workspace,
+            ide_handoff::ide_open_remote_workspace,
             ide_handoff::ide_reveal_in_finder,
             orchestrator::orchestrator_status,
             orchestrator::orchestrator_launch_claude,

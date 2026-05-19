@@ -39,6 +39,22 @@ export async function openWorkspaceInIde(workspacePath: string): Promise<void> {
   await invoke<void>("ide_open_workspace", { workspacePath });
 }
 
+/// Open a remote SSH workspace in Cursor / VS Code via the
+/// `vscode-remote://ssh-remote+[user@]host[:port]/path` URI scheme.
+export async function openRemoteWorkspaceInIde(params: {
+  sshUser: string | null;
+  sshHost: string;
+  sshPort: number | null;
+  remotePath: string;
+}): Promise<void> {
+  await invoke<void>("ide_open_remote_workspace", {
+    sshUser: params.sshUser,
+    sshHost: params.sshHost,
+    sshPort: params.sshPort,
+    remotePath: params.remotePath,
+  });
+}
+
 export async function revealWorkspaceInFinder(workspacePath: string): Promise<void> {
   await invoke<void>("ide_reveal_in_finder", { workspacePath });
 }
