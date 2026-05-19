@@ -1463,6 +1463,27 @@ function MultiTerminalContainer() {
     void refreshWorkspaces();
   }, [refreshWorkspaces]);
 
+  // Session restoration: on first workspace load, re-open all workspaces
+  // whose openTabId is still set (app was quit without closing the tabs).
+  // On a clean tab-close the backend clears openTabId, so only workspaces
+  // that were open when the app last quit (or crashed) are restored.
+  // tmux -A in the auto-launch command reattaches to any surviving session.
+  const sessionRestoredRef = useRef(false);
+  // Stable ref to adoptWorkspaceTab so the restoration effect doesn't
+  // depend on the callback's identity (avoids re-running after each render).
+  const adoptWorkspaceTabRef = useRef<typeof adoptWorkspaceTab | null>(null);
+  useEffect(() => {
+    if (sessionRestoredRef.current) return;
+    if (workspaces.length === 0) return;
+    if (!adoptWorkspaceTabRef.current) return;
+    sessionRestoredRef.current = true;
+    const toRestore = workspaces.filter((w) => w.openTabId != null && !w.profile.stashed);
+    const adopt = adoptWorkspaceTabRef.current;
+    for (const w of toRestore) {
+      void adopt(w);
+    }
+  }, [workspaces]);
+
   // Stuck-waiting watcher: when an auto-launched tab's snapshot
   // transitions to Done without ever publishing a real terminal
   // id (the back-end's `surface_auto_launch_async_failure` path
@@ -1715,6 +1736,9 @@ function MultiTerminalContainer() {
     },
     [refreshWorkspaces],
   );
+  // Keep the restoration ref up-to-date so the one-shot session
+  // restore effect always calls the latest version of adoptWorkspaceTab.
+  adoptWorkspaceTabRef.current = adoptWorkspaceTab;
 
   const onPickExistingFromModal = useCallback(
     async (workspace: WorkspaceRecord) => {
