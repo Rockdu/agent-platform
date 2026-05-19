@@ -1357,6 +1357,13 @@ function MultiTerminalContainer() {
   // only owns the tab array + open/close/focus calls.
   const [workspaces, setWorkspaces] = useState<WorkspaceRecord[]>([]);
   const [tabs, setTabs] = useState<OpenTab[]>([]);
+  // "灵动岛" style completion toast: shown briefly when a workspace
+  // tab transitions into 完成区 (TaskComplete or quiescence).
+  const [completionToast, setCompletionToast] = useState<{
+    workspaceName: string;
+    summary?: string;
+  } | null>(null);
+  const completionToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Monotonic counter stamped onto each new tab at adoption time
   // so the fire-and-forget `requestWorkspaceAutoLaunch` rejection
   // closure can detect close-then-reopen incarnations of the same
@@ -1458,6 +1465,38 @@ function MultiTerminalContainer() {
       return committed;
     });
   }, [snapshotByTabId, terminalIdByTabId]);
+
+  // "灵动岛" completion toast: watch for TaskComplete transitions
+  // and show a brief overlay when any workspace Claude finishes.
+  const prevSnapshotRef = useRef<Record<string, WorkspaceLifecycleSnapshot>>({});
+  useEffect(() => {
+    for (const tab of tabs) {
+      const prev = prevSnapshotRef.current[tab.tabId];
+      const curr = snapshotByTabId[tab.tabId];
+      if (!curr) continue;
+      // Fire when the tab just received a TaskComplete done reason
+      // (was Running/busy, now Done with TaskComplete).
+      if (
+        curr.status === "Done" &&
+        curr.doneReason?.kind === "TaskComplete" &&
+        prev &&
+        (prev.status !== "Done" || prev.doneReason?.kind !== "TaskComplete")
+      ) {
+        const summary = curr.doneReason.kind === "TaskComplete"
+          ? curr.doneReason.summary
+          : undefined;
+        if (completionToastTimerRef.current) {
+          clearTimeout(completionToastTimerRef.current);
+        }
+        setCompletionToast({ workspaceName: tab.workspaceName, summary });
+        completionToastTimerRef.current = setTimeout(() => {
+          setCompletionToast(null);
+          completionToastTimerRef.current = null;
+        }, 4000);
+      }
+    }
+    prevSnapshotRef.current = { ...snapshotByTabId };
+  }, [snapshotByTabId, tabs]);
 
   const adoptWorkspaceTab = useCallback(
     async (workspace: WorkspaceRecord) => {
@@ -1706,6 +1745,17 @@ function MultiTerminalContainer() {
 
   return (
     <section className="terminal-mesh-container">
+      {completionToast && (
+        <div className="completion-toast" role="status" aria-live="polite">
+          <span className="completion-toast__icon">✓</span>
+          <div className="completion-toast__body">
+            <span className="completion-toast__name">{completionToast.workspaceName}</span>
+            {completionToast.summary && (
+              <span className="completion-toast__summary">{completionToast.summary}</span>
+            )}
+          </div>
+        </div>
+      )}
       <aside
         className="terminal-mesh-container__rail"
         role="tablist"
