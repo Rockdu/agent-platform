@@ -1477,9 +1477,13 @@ function MultiTerminalContainer() {
     if (workspaces.length === 0) return;
     if (!adoptWorkspaceTabRef.current) return;
     sessionRestoredRef.current = true;
-    const toRestore = workspaces.filter((w) => w.openTabId != null && !w.profile.stashed);
+    // Restore all workspaces on restart — including ones the user
+    // closed with ×. The × button closes the PTY session but the
+    // workspace remains in the registry; on restart the user expects
+    // to see all their workspaces back. Stashed workspaces go into
+    // 暂存区 rather than being auto-adopted as active tabs.
     const adopt = adoptWorkspaceTabRef.current;
-    for (const w of toRestore) {
+    for (const w of workspaces) {
       void adopt(w);
     }
   }, [workspaces]);
