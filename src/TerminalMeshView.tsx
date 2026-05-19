@@ -120,6 +120,10 @@ export function TerminalMeshView({
   const terminalIdRef = useRef<string | null>(null);
   const disposedRef = useRef(false);
   const wasActiveRef = useRef(false);
+  // Always-fresh ref so the onData closure in the setup effect never
+  // holds a stale onSubmit even as the prop changes between renders.
+  const onSubmitRef = useRef(onSubmit);
+  onSubmitRef.current = onSubmit;
   const [error, setError] = useState<TerminalMeshErrorDto | null>(null);
   const [ready, setReady] = useState(false);
   const [status, setStatus] = useState<TerminalRunStatus>({ kind: "running" });
@@ -304,8 +308,10 @@ export function TerminalMeshView({
       void writeTerminalStdin(id, data).catch(() => {});
       // When the user presses Enter (carriage return), notify the
       // parent so it can switch focus to the next waiting tab.
-      if (data.includes("\r") && onSubmit) {
-        onSubmit();
+      // Use the ref so we always call the latest callback without
+      // needing to re-run the setup effect when it changes.
+      if (data.includes("\r")) {
+        onSubmitRef.current?.();
       }
     });
 
