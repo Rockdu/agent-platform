@@ -101,6 +101,11 @@ export interface WorkspaceLifecycleSnapshot {
   /// renders a `等待启动` badge instead of the default Running badge
   /// when this is true.
   pendingLaunch: boolean;
+  /// `true` while the shell/agent is displaying a prompt and waiting
+  /// for user input (set by `PromptWaiting` attention event, cleared
+  /// on user-initiated stdin). Used to move a Running terminal into
+  /// 完成区 (waiting-for-instruction) rather than 运行区 (busy).
+  promptVisible: boolean;
 }
 
 // Single envelope shape shared between the initial `workspace_

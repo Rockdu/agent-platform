@@ -26,6 +26,7 @@ function makeSnap(overrides: Partial<WorkspaceLifecycleSnapshot> = {}): Workspac
     doneReason: null,
     lastActivityAtUnixMs: 0,
     pendingLaunch: false,
+    promptVisible: false,
     ...overrides,
   };
 }

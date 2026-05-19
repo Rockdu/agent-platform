@@ -33,6 +33,7 @@ export const DEFAULT_LIFECYCLE_SNAPSHOT: WorkspaceLifecycleSnapshot = {
   doneReason: null,
   lastActivityAtUnixMs: 0,
   pendingLaunch: false,
+  promptVisible: false,
 };
 
 /**

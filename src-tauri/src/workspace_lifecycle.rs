@@ -81,6 +81,14 @@ pub struct WorkspaceLifecycleSnapshot {
     /// in line".
     #[serde(default)]
     pub pending_launch: bool,
+    /// `true` while the terminal's shell/agent has displayed a prompt
+    /// and is waiting for user input. Set when `PromptWaiting` fires;
+    /// cleared when the user sends stdin (`userInitiated = true`).
+    /// Drives the 完成区 / 运行区 rail split on the frontend — a
+    /// terminal at the prompt is "done with its current task" even
+    /// while `status == Running`, so it belongs in 完成区.
+    #[serde(default)]
+    pub prompt_visible: bool,
 }
 
 impl WorkspaceLifecycleSnapshot {
@@ -125,6 +133,7 @@ impl WorkspaceLifecycleSnapshot {
             done_reason: None,
             last_activity_at_unix_ms: now_unix_ms(),
             pending_launch: false,
+            prompt_visible: false,
         }
     }
 }
@@ -228,6 +237,9 @@ pub fn apply_attention_to_snapshot(
     if let Some(reason) = done_reason_from_attention(kind) {
         snap.status = TabStatus::Done;
         snap.done_reason = Some(reason);
+        snap.prompt_visible = false;
+    } else if matches!(kind, AttentionKind::PromptWaiting) {
+        snap.prompt_visible = true;
     }
 }
 
@@ -261,6 +273,10 @@ pub fn resume_running_from_done(
     snap: &mut WorkspaceLifecycleSnapshot,
     now_unix_ms: i64,
 ) -> bool {
+    // Clear prompt_visible on every user-initiated stdin regardless
+    // of the current status: once the user submits input, the prompt
+    // is consumed and the terminal transitions to "busy".
+    snap.prompt_visible = false;
     match snap.status {
         TabStatus::Done => {
             snap.status = TabStatus::Running;
@@ -283,11 +299,17 @@ pub fn update_snapshot_for_user_stdin(
     terminal_id: Uuid,
 ) -> Option<WorkspaceLifecycleSnapshot> {
     let now = now_unix_ms();
-    let mut transitioned = false;
+    let mut changed = false;
     let updated = registry.update_snapshot(terminal_id, |snap| {
-        transitioned = resume_running_from_done(snap, now);
+        let was_prompt_visible = snap.prompt_visible;
+        let status_changed = resume_running_from_done(snap, now);
+        // Emit whenever status changed (Done→Running) OR prompt_visible
+        // was cleared (Running at prompt → Running busy): a Running
+        // terminal that was showing a prompt just received user input
+        // and must move from 完成区 back to 运行区.
+        changed = status_changed || was_prompt_visible;
     })?;
-    if transitioned {
+    if changed {
         Some(updated)
     } else {
         None

@@ -1277,7 +1277,12 @@ function RailSections(props: RailSectionsProps) {
   for (const tab of tabs) {
     const snap = snapshotByTabId[tab.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
     if (snap.tabKind !== "Workspace") continue;
-    if (snap.status === "Done") {
+    // 完成区: terminal is Done (any reason) OR is Running but showing
+    // a prompt (PromptWaiting fired — agent finished its current task
+    // and is idle, waiting for the next instruction).
+    // 运行区: terminal is Running and NOT at the prompt (launching,
+    // or actively working on a user-submitted task).
+    if (snap.status === "Done" || snap.promptVisible) {
       done.push(tab);
     } else {
       running.push(tab);
