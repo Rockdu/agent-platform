@@ -1301,8 +1301,11 @@ function RailSections(props: RailSectionsProps) {
     const sb = snapshotByTabId[b.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
     return sa.lastActivityAtUnixMs - sb.lastActivityAtUnixMs;
   };
+  // 运行区: FIFO — earliest activity first (oldest task at top).
   running.sort(byActivity);
-  done.sort(byActivity);
+  // 完成区: most recently finished at top so the next agent to
+  // dispatch to is immediately visible.
+  done.sort((a, b) => -byActivity(a, b));
 
   const renderRow = (tab: OpenTab, opts: { affordance: boolean }) => {
     const snap = snapshotByTabId[tab.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;

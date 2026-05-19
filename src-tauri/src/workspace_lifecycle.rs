@@ -233,7 +233,12 @@ pub fn apply_attention_to_snapshot(
     kind: &AttentionKind,
     now_unix_ms: i64,
 ) {
-    snap.last_activity_at_unix_ms = now_unix_ms;
+    // PromptWaiting is a quiescence signal (1 s of no output) — not
+    // real user or agent activity. Don't bump the activity timestamp
+    // so the 完成区 sort order stays stable between idle terminals.
+    if !matches!(kind, AttentionKind::PromptWaiting) {
+        snap.last_activity_at_unix_ms = now_unix_ms;
+    }
     if let Some(reason) = done_reason_from_attention(kind) {
         snap.status = TabStatus::Done;
         snap.done_reason = Some(reason);
