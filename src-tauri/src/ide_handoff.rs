@@ -339,8 +339,36 @@ pub fn open_workspace_in_ide(
     workspace_path: &Path,
 ) -> Result<(), IdeHandoffError> {
     ensure_dir(workspace_path)?;
-    let mut subs = HashMap::new();
     let path_str = workspace_path.display().to_string();
+
+    // On macOS, `open -a <AppName> <path>` is the most reliable way
+    // to open a folder in a GUI editor. It works regardless of whether
+    // the editor's CLI tool is installed in $PATH or accessible from
+    // the stripped PATH that Tauri GUI processes inherit.
+    #[cfg(target_os = "macos")]
+    {
+        let app_name = match pref.ide_command.as_str() {
+            "cursor" => Some("Cursor"),
+            "code"   => Some("Visual Studio Code"),
+            "zed"    => Some("Zed"),
+            _        => None,
+        };
+        if let Some(app) = app_name {
+            let result = std::process::Command::new("/usr/bin/open")
+                .args(["-a", app, &path_str])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            if result.is_ok() {
+                return Ok(());
+            }
+            // open -a failed (app not installed); fall through to CLI path.
+        }
+    }
+
+    // Generic path: use the configured CLI command with template args.
+    let mut subs = HashMap::new();
     subs.insert("path", path_str.as_str());
     let args = fill_template(&pref.ide_args_template, &subs);
     open_with(&pref.ide_command, &args)
@@ -438,6 +466,30 @@ pub fn ide_open_remote_workspace(
         })
         .collect();
     let folder_uri = format!("vscode-remote://ssh-remote+{authority}{encoded_path}");
+
+    // On macOS, use `open -a <AppName> --args --folder-uri <uri>`.
+    // The `--args` flag tells open(1) to pass subsequent arguments to
+    // the app rather than treating them as file paths.
+    #[cfg(target_os = "macos")]
+    {
+        let app_name = match pref.ide_command.as_str() {
+            "cursor" => Some("Cursor"),
+            "code"   => Some("Visual Studio Code"),
+            _        => None,
+        };
+        if let Some(app) = app_name {
+            let result = std::process::Command::new("/usr/bin/open")
+                .args(["-a", app, "--args", "--folder-uri", &folder_uri])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            if result.is_ok() {
+                return Ok(());
+            }
+        }
+    }
+
     let args = vec!["--folder-uri".to_string(), folder_uri];
     open_with(&pref.ide_command, &args).map_err(|e| IdeHandoffErrorDto::from(&e))
 }
