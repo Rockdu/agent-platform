@@ -1667,6 +1667,30 @@ function MultiTerminalContainer() {
     tabs[tabs.length - 1]?.tabId ??
     null;
 
+  // Called when the user presses Enter in a terminal. Switches focus
+  // to the next tab in 完成区 (idle, waiting for instruction) so the
+  // user can dispatch tasks to other waiting agents without manually
+  // clicking. Wraps around; skips the current tab.
+  const onTerminalSubmit = useCallback(
+    (currentTabId: string) => {
+      const idle = tabs.filter(
+        (t) => {
+          if (t.tabId === currentTabId) return false;
+          const snap = snapshotByTabId[t.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
+          return snap.tabKind === "Workspace" &&
+            (snap.status === "Done" || !snap.agentBusy);
+        },
+      );
+      if (idle.length === 0) return;
+      // Pick the next idle tab after the current one (circular).
+      const currentIndex = tabs.findIndex((t) => t.tabId === currentTabId);
+      const next =
+        idle.find((t) => tabs.indexOf(t) > currentIndex) ?? idle[0];
+      if (next) setActive(next.tabId);
+    },
+    [tabs, snapshotByTabId],
+  );
+
   const openWorkspaceIds = new Set(tabs.map((t) => t.workspaceId));
 
   // Lifted lifecycle hook: feeds both the rail badges AND the
@@ -1741,6 +1765,7 @@ function MultiTerminalContainer() {
               existingTerminalId={
                 t.awaitingAutoLaunch ? terminalIdByTabId[t.tabId] : undefined
               }
+              onSubmit={() => onTerminalSubmit(t.tabId)}
             />
           ))}
         </div>

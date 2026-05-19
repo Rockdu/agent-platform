@@ -1044,6 +1044,7 @@ pub async fn terminal_write_stdin(
             terminal_id: id.to_string(),
         })
         .map_err(|e| TerminalMeshErrorDto::from(&e))?;
+    let is_submission = user_initiated.unwrap_or(true) && data.contains('\r');
     tx.send(ActorCommand::WriteStdin(data.into_bytes()))
         .await
         .map_err(|e| {
@@ -1052,10 +1053,7 @@ pub async fn terminal_write_stdin(
                 message: e.to_string(),
             })
         })?;
-    // Frontend keyboard input defaults to user-initiated; programmatic
-    // restorers (e.g. scrollback subscribe replays) pass `Some(false)`
-    // so a Done tab stays Done.
-    if user_initiated.unwrap_or(true) {
+    if is_submission {
         crate::workspace_lifecycle::on_user_stdin(&registry, &app, id);
     }
     Ok(())

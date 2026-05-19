@@ -90,6 +90,9 @@ export interface TerminalMeshViewProps {
   /// bound workspace), the action strip falls back to the legacy
   /// `cwd`-truthy behavior.
   workspaceLocation?: WorkspaceLocation;
+  /// Called when the user presses Enter (submits a task). The parent
+  /// uses this to switch focus to the next tab in 完成区.
+  onSubmit?: () => void;
 }
 
 export function TerminalMeshView({
@@ -103,6 +106,7 @@ export function TerminalMeshView({
   autoLaunchError,
   awaitingAutoLaunch,
   workspaceLocation,
+  onSubmit,
 }: TerminalMeshViewProps) {
   const isRemote = workspaceLocation?.kind === "remote";
   // Workspace tabs always get the action strip + settings toggle so
@@ -298,6 +302,11 @@ export function TerminalMeshView({
       const id = terminalIdRef.current;
       if (!id) return;
       void writeTerminalStdin(id, data).catch(() => {});
+      // When the user presses Enter (carriage return), notify the
+      // parent so it can switch focus to the next waiting tab.
+      if (data.includes("\r") && onSubmit) {
+        onSubmit();
+      }
     });
 
     return () => {
