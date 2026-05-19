@@ -50,6 +50,8 @@ import {
 } from "./orchestrator";
 import {
   closeWorkspace,
+  stashWorkspace,
+  unstashWorkspace,
   isAutoLaunchErrorDto,
   isWorkspaceErrorDto,
   listWorkspaces,
@@ -1174,10 +1176,12 @@ interface WorkspaceRailRowProps {
   // snapshot back to Running. The click on its own does not mutate
   // lifecycle.
   doneAffordance?: () => void;
+  stashAffordance?: () => void;
+  unstashAffordance?: () => void;
 }
 
 function WorkspaceRailRow(props: WorkspaceRailRowProps) {
-  const { tab, snapshot, isActive, onSelect, onClose, doneAffordance } = props;
+  const { tab, snapshot, isActive, onSelect, onClose, doneAffordance, stashAffordance, unstashAffordance } = props;
   const icon = transportKindIcon(snapshot.transportKind);
   const transportLabel = transportKindLabel(snapshot.transportKind);
   const isDone = snapshot.status === "Done";
@@ -1235,6 +1239,28 @@ function WorkspaceRailRow(props: WorkspaceRailRowProps) {
           下一条指令
         </button>
       )}
+      {stashAffordance && (
+        <button
+          type="button"
+          className="rail-row__stash"
+          onClick={stashAffordance}
+          aria-label={`暂存 ${tab.workspaceName}`}
+          title="暂存"
+        >
+          ⏸
+        </button>
+      )}
+      {unstashAffordance && (
+        <button
+          type="button"
+          className="rail-row__unstash"
+          onClick={unstashAffordance}
+          aria-label={`恢复 ${tab.workspaceName}`}
+          title="恢复到完成区"
+        >
+          ▶
+        </button>
+      )}
       <button
         type="button"
         className="terminal-mesh-container__close"
@@ -1250,42 +1276,28 @@ function WorkspaceRailRow(props: WorkspaceRailRowProps) {
 interface RailSectionsProps {
   tabs: OpenTab[];
   activeId: string | null;
+  stashedTabIds: ReadonlySet<string>;
   onSelect: (tabId: string) => void;
   onClose: (tabId: string) => void;
-  // Called when the user clicks the 下一条指令 affordance on a Done
-  // row. Distinct from `onSelect` because the parent uses it to
-  // bump a per-tab focus nonce so `TerminalMeshView` will move
-  // keyboard focus into the terminal on the next active render.
+  onStash: (tabId: string) => void;
+  onUnstash: (tabId: string) => void;
   onResume: (tabId: string) => void;
-  // Snapshot map lifted to the parent so the same lifecycle hook
-  // instance feeds both the rail row badges AND the per-tab
-  // `existingTerminalId` resolution for the primary-terminal
-  // ownership path.
   snapshotByTabId: Readonly<Record<string, WorkspaceLifecycleSnapshot>>;
 }
 
 function RailSections(props: RailSectionsProps) {
-  const { tabs, activeId, onSelect, onClose, onResume, snapshotByTabId } = props;
+  const { tabs, activeId, stashedTabIds, onSelect, onClose, onStash, onUnstash, onResume, snapshotByTabId } = props;
 
-  // Partition by snapshot status; filter to Workspace-kind tabs only
-  // so the orchestrator slot never leaks into the workspace rail —
-  // the orchestrator lives outside this container, but this defensive
-  // filter also covers any future routing that mounts an orchestrator-
-  // kind tab by accident.
   const running: OpenTab[] = [];
   const done: OpenTab[] = [];
+  const stashed: OpenTab[] = [];
   for (const tab of tabs) {
+    if (stashedTabIds.has(tab.tabId)) {
+      stashed.push(tab);
+      continue;
+    }
     const snap = snapshotByTabId[tab.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
     if (snap.tabKind !== "Workspace") continue;
-    // 完成区: terminal is Done (any reason) OR is Running but showing
-    // a prompt (PromptWaiting fired — agent finished its current task
-    // and is idle, waiting for the next instruction).
-    // 运行区: terminal is Running and NOT at the prompt (launching,
-    // or actively working on a user-submitted task).
-    // 完成区: terminal is Done (any reason) OR is Running but idle
-    // (agentBusy=false means no task submitted yet, or Claude just
-    // finished and TaskComplete reset it). 运行区: Running AND user
-    // has submitted a task that's still in flight (agentBusy=true).
     if (snap.status === "Done" || !snap.agentBusy) {
       done.push(tab);
     } else {
@@ -1307,13 +1319,9 @@ function RailSections(props: RailSectionsProps) {
   // dispatch to is immediately visible.
   done.sort((a, b) => -byActivity(a, b));
 
-  const renderRow = (tab: OpenTab, opts: { affordance: boolean }) => {
+  const renderRow = (tab: OpenTab, isStashed: boolean) => {
     const snap = snapshotByTabId[tab.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
-    // Only `TaskComplete` Done states keep the actor + PTY alive.
-    // The other Done reasons (`CleanCompletion`, `NonZeroExit`,
-    // `Disconnected`) all correspond to actor exit — a click on
-    // the resume target would route stdin to a NotFound terminal.
-    const resumeOffered = opts.affordance && canOfferResumeFromDone(snap);
+    const resumeOffered = !isStashed && canOfferResumeFromDone(snap);
     return (
       <WorkspaceRailRow
         key={tab.tabId}
@@ -1323,6 +1331,8 @@ function RailSections(props: RailSectionsProps) {
         onSelect={onSelect}
         onClose={onClose}
         doneAffordance={resumeOffered ? () => onResume(tab.tabId) : undefined}
+        stashAffordance={isStashed ? undefined : () => onStash(tab.tabId)}
+        unstashAffordance={isStashed ? () => onUnstash(tab.tabId) : undefined}
       />
     );
   };
@@ -1334,15 +1344,24 @@ function RailSections(props: RailSectionsProps) {
           <span className="rail-section__label">完成区</span>
           <span className="rail-section__count">{done.length}</span>
         </header>
-        {done.map((t) => renderRow(t, { affordance: true }))}
+        {done.map((t) => renderRow(t, false))}
       </section>
       <section className="rail-section rail-section--running">
         <header className="rail-section__header">
           <span className="rail-section__label">运行区</span>
           <span className="rail-section__count">{running.length}</span>
         </header>
-        {running.map((t) => renderRow(t, { affordance: false }))}
+        {running.map((t) => renderRow(t, false))}
       </section>
+      {stashed.length > 0 && (
+        <section className="rail-section rail-section--stashed">
+          <header className="rail-section__header">
+            <span className="rail-section__label">暂存区</span>
+            <span className="rail-section__count">{stashed.length}</span>
+          </header>
+          {stashed.map((t) => renderRow(t, true))}
+        </section>
+      )}
     </>
   );
 }
@@ -1357,6 +1376,10 @@ function MultiTerminalContainer() {
   // only owns the tab array + open/close/focus calls.
   const [workspaces, setWorkspaces] = useState<WorkspaceRecord[]>([]);
   const [tabs, setTabs] = useState<OpenTab[]>([]);
+  // Set of tab IDs currently in 暂存区. Persisted via WorkspaceProfile.stashed
+  // (backend) but mirrored here for O(1) rail-partition lookup.
+  const [stashedTabIds, setStashedTabIds] = useState<Set<string>>(new Set());
+
   // "灵动岛" style completion toast: shown briefly when a workspace
   // tab transitions into 完成区 (TaskComplete or quiescence).
   const [completionToast, setCompletionToast] = useState<{
@@ -1418,6 +1441,18 @@ function MultiTerminalContainer() {
     try {
       const list = await listWorkspaces();
       setWorkspaces(list);
+      // Re-sync stash state from the persisted profile so restarts
+      // preserve which tabs were stashed.
+      setStashedTabIds(prev => {
+        const next = new Set(prev);
+        for (const w of list) {
+          const tabId = w.openTabId;
+          if (!tabId) continue;
+          if (w.profile.stashed) next.add(tabId);
+          else next.delete(tabId);
+        }
+        return next;
+      });
     } catch (err) {
       if (isWorkspaceErrorDto(err)) setError(err);
     }
@@ -1465,6 +1500,41 @@ function MultiTerminalContainer() {
       return committed;
     });
   }, [snapshotByTabId, terminalIdByTabId]);
+
+  const stashTab = useCallback(
+    async (tabId: string) => {
+      const target = tabs.find((t) => t.tabId === tabId);
+      if (!target) return;
+      setStashedTabIds((prev) => new Set([...prev, tabId]));
+      void stashWorkspace(target.workspaceId).catch(() => {
+        setStashedTabIds((prev) => { const n = new Set(prev); n.delete(tabId); return n; });
+      });
+      // If stashing the active tab, move focus to the next non-stash tab.
+      if (active === tabId) {
+        const nonStash = tabs.filter(
+          (t) => t.tabId !== tabId && !stashedTabIds.has(t.tabId),
+        );
+        const idx = tabs.findIndex((t) => t.tabId === tabId);
+        const next =
+          nonStash.find((t) => tabs.indexOf(t) > idx) ??
+          nonStash[nonStash.length - 1];
+        if (next) setActive(next.tabId);
+      }
+    },
+    [tabs, active, stashedTabIds],
+  );
+
+  const unstashTab = useCallback(
+    async (tabId: string) => {
+      const target = tabs.find((t) => t.tabId === tabId);
+      if (!target) return;
+      setStashedTabIds((prev) => { const n = new Set(prev); n.delete(tabId); return n; });
+      void unstashWorkspace(target.workspaceId).catch(() => {
+        setStashedTabIds((prev) => new Set([...prev, tabId]));
+      });
+    },
+    [tabs],
+  );
 
   // "灵动岛" completion toast: watch for TaskComplete transitions
   // and show a brief overlay when any workspace Claude finishes.
@@ -1718,19 +1788,19 @@ function MultiTerminalContainer() {
       const idle = tabs.filter(
         (t) => {
           if (t.tabId === currentTabId) return false;
+          if (stashedTabIds.has(t.tabId)) return false; // skip stashed
           const snap = snapshotByTabId[t.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
           return snap.tabKind === "Workspace" &&
             (snap.status === "Done" || !snap.agentBusy);
         },
       );
       if (idle.length === 0) return;
-      // Pick the next idle tab after the current one (circular).
       const currentIndex = tabs.findIndex((t) => t.tabId === currentTabId);
       const next =
         idle.find((t) => tabs.indexOf(t) > currentIndex) ?? idle[0];
       if (next) setActive(next.tabId);
     },
-    [tabs, snapshotByTabId],
+    [tabs, snapshotByTabId, stashedTabIds],
   );
 
   const openWorkspaceIds = new Set(tabs.map((t) => t.workspaceId));
@@ -1764,8 +1834,11 @@ function MultiTerminalContainer() {
         <RailSections
           tabs={tabs}
           activeId={activeId}
+          stashedTabIds={stashedTabIds}
           onSelect={setActive}
           onClose={(id) => void closeTab(id)}
+          onStash={(id) => void stashTab(id)}
+          onUnstash={(id) => void unstashTab(id)}
           onResume={focusTerminal}
           snapshotByTabId={snapshotByTabId}
         />

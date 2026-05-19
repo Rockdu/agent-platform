@@ -1016,3 +1016,30 @@
   from { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
   to   { opacity: 0; transform: translateX(-50%) translateY(-8px) scale(0.95); }
 }
+
+/* 暂存区 rail section */
+.rail-section--stashed {
+  opacity: 0.75;
+}
+.rail-section--stashed .rail-section__label {
+  color: #888;
+}
+
+/* Stash / unstash per-row buttons */
+.rail-row__stash,
+.rail-row__unstash {
+  flex: 0 0 auto;
+  background: transparent;
+  color: #aaa;
+  border: 1px solid #555;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 10px;
+  cursor: pointer;
+  line-height: 1.2;
+}
+.rail-row__stash:hover,
+.rail-row__unstash:hover {
+  color: #fff;
+  border-color: #888;
+}

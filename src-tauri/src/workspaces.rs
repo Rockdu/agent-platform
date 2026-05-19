@@ -69,6 +69,11 @@ pub struct ContainerLocation {
 pub struct WorkspaceProfile {
     pub auto_launch_claude: bool,
     pub claude_argv: Vec<String>,
+    /// When `true` the workspace is parked in the 暂存区 rail section.
+    /// The PTY is kept alive (if open); the tab is excluded from
+    /// auto-focus routing. Defaults to `false` for existing records.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stashed: bool,
 }
 
 impl WorkspaceProfile {
@@ -76,6 +81,7 @@ impl WorkspaceProfile {
         Self {
             auto_launch_claude: true,
             claude_argv: vec!["--dangerously-skip-permissions".to_string()],
+            stashed: false,
         }
     }
 }
@@ -764,6 +770,25 @@ impl WorkspaceRegistry {
         Ok(self.with_conversation_count(updated))
     }
 
+    /// Mutate the workspace's `profile` in-place and persist.
+    /// The closure receives a mutable reference to the profile;
+    /// whatever it sets is written to disk atomically.
+    pub fn update_profile(
+        &self,
+        workspace_id: Uuid,
+        f: impl FnOnce(&mut WorkspaceProfile),
+    ) -> Result<(), WorkspaceError> {
+        let mut guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
+        let mut record = guard.records.get(&workspace_id).cloned().ok_or_else(|| {
+            WorkspaceError::NotFound {
+                workspace_id: workspace_id.to_string(),
+            }
+        })?;
+        f(&mut record.profile);
+        guard.records.insert(workspace_id, record);
+        Self::persist(&guard)
+    }
+
     pub fn close_workspace(&self, workspace_id: Uuid) -> Result<(), WorkspaceError> {
         let mut guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
         let mut record = guard.records.get(&workspace_id).cloned().ok_or_else(|| {
@@ -1327,8 +1352,31 @@ pub async fn close_workspace(
             }
         }
     }
+    // Always reset stash flag on close so the workspace can be
+    // re-opened as a normal tab if the user opens it again later.
+    let _ = registry.update_profile(id, |p| p.stashed = false);
     registry
         .close_workspace(id)
+        .map_err(|e| WorkspaceErrorDto::from(&e))
+}
+
+#[tauri::command]
+pub async fn stash_workspace(
+    workspace_id: String,
+    registry: State<'_, WorkspaceRegistry>,
+) -> Result<(), WorkspaceErrorDto> {
+    let id = parse_workspace_id(&workspace_id)?;
+    registry.update_profile(id, |p| p.stashed = true)
+        .map_err(|e| WorkspaceErrorDto::from(&e))
+}
+
+#[tauri::command]
+pub async fn unstash_workspace(
+    workspace_id: String,
+    registry: State<'_, WorkspaceRegistry>,
+) -> Result<(), WorkspaceErrorDto> {
+    let id = parse_workspace_id(&workspace_id)?;
+    registry.update_profile(id, |p| p.stashed = false)
         .map_err(|e| WorkspaceErrorDto::from(&e))
 }
 

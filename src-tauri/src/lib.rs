@@ -920,6 +920,8 @@ pub fn run() {
             workspaces::register_remote_workspace,
             workspaces::open_workspace,
             workspaces::close_workspace,
+            workspaces::stash_workspace,
+            workspaces::unstash_workspace,
             workspaces::resolve_workspace_for_tab,
             workspace_launch_scheduler::request_workspace_auto_launch,
             ide_handoff::ide_get_preference,

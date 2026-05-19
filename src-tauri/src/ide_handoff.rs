@@ -238,6 +238,7 @@ pub fn which_in_path(command: &str) -> Option<PathBuf> {
     // stripped PATH that Tauri GUI processes inherit.
     #[cfg(target_os = "macos")]
     {
+        // Common Homebrew / user-install locations.
         let extra_dirs = [
             "/usr/local/bin",
             "/opt/homebrew/bin",
@@ -248,6 +249,23 @@ pub fn which_in_path(command: &str) -> Option<PathBuf> {
             let candidate = std::path::Path::new(dir).join(command);
             if is_executable(&candidate) {
                 return Some(candidate);
+            }
+        }
+        // macOS app-bundle CLI bins (installed under .app rather than
+        // symlinked into PATH). Map well-known IDE command names to the
+        // CLI binary inside their bundle.
+        let bundle_bins: &[(&str, &str)] = &[
+            ("cursor", "/Applications/Cursor.app/Contents/MacOS/cursor"),
+            ("code",   "/Applications/Visual Studio Code.app/Contents/MacOS/Electron"),
+            ("code",   "/Applications/VSCodium.app/Contents/MacOS/VSCodium"),
+            ("zed",    "/Applications/Zed.app/Contents/MacOS/zed"),
+        ];
+        for (cmd, path) in bundle_bins {
+            if *cmd == command {
+                let p = std::path::Path::new(path);
+                if is_executable(p) {
+                    return Some(p.to_path_buf());
+                }
             }
         }
     }

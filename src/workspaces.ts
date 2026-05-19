@@ -29,6 +29,7 @@ export type WorkspaceLocation =
 export interface WorkspaceProfile {
   autoLaunchClaude: boolean;
   claudeArgv: string[];
+  stashed?: boolean;
 }
 
 export interface WorkspaceRecord {
@@ -208,4 +209,12 @@ export async function requestWorkspaceAutoLaunch(
     workspaceId,
     tabId,
   });
+}
+
+export async function stashWorkspace(workspaceId: string): Promise<void> {
+  await invoke<void>("stash_workspace", { workspaceId });
+}
+
+export async function unstashWorkspace(workspaceId: string): Promise<void> {
+  await invoke<void>("unstash_workspace", { workspaceId });
 }
