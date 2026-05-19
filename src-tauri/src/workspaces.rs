@@ -770,6 +770,25 @@ impl WorkspaceRegistry {
         Ok(self.with_conversation_count(updated))
     }
 
+    /// Permanently remove a workspace record. Fails when the workspace
+    /// is still open (has an active tab) to prevent accidental deletion
+    /// of a session the user is working in.
+    pub fn delete_workspace(&self, workspace_id: Uuid) -> Result<(), WorkspaceError> {
+        let mut guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
+        let record = guard.records.get(&workspace_id).cloned().ok_or_else(|| {
+            WorkspaceError::NotFound {
+                workspace_id: workspace_id.to_string(),
+            }
+        })?;
+        if record.open_tab_id.is_some() {
+            return Err(WorkspaceError::AlreadyOpen {
+                existing_tab_id: record.open_tab_id.unwrap_or_default(),
+            });
+        }
+        guard.records.remove(&workspace_id);
+        Self::persist(&guard)
+    }
+
     /// Mutate the workspace's `profile` in-place and persist.
     /// The closure receives a mutable reference to the profile;
     /// whatever it sets is written to disk atomically.
@@ -1357,6 +1376,19 @@ pub async fn close_workspace(
     let _ = registry.update_profile(id, |p| p.stashed = false);
     registry
         .close_workspace(id)
+        .map_err(|e| WorkspaceErrorDto::from(&e))
+}
+
+/// Remove a workspace from the registry permanently. Fails when the
+/// workspace is still open (has an active tab) — the caller must
+/// close it first.
+#[tauri::command]
+pub async fn delete_workspace(
+    workspace_id: String,
+    registry: State<'_, WorkspaceRegistry>,
+) -> Result<(), WorkspaceErrorDto> {
+    let id = parse_workspace_id(&workspace_id)?;
+    registry.delete_workspace(id)
         .map_err(|e| WorkspaceErrorDto::from(&e))
 }
 

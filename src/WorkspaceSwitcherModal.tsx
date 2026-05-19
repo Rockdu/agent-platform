@@ -70,6 +70,7 @@ export interface WorkspaceSwitcherModalProps {
   /// workspace as a tab. The container is responsible for the
   /// `openWorkspace` call that follows.
   onAdopt: (workspace: WorkspaceRecord) => Promise<void> | void;
+  onDelete: (workspace: WorkspaceRecord) => Promise<void> | void;
   onClose: () => void;
 }
 
@@ -79,6 +80,7 @@ export function WorkspaceSwitcherModal({
   openWorkspaceIds,
   onPickExisting,
   onAdopt,
+  onDelete,
   onClose,
 }: WorkspaceSwitcherModalProps) {
   const [mode, setMode] = useState<SwitcherMode>("create");
@@ -342,6 +344,7 @@ export function WorkspaceSwitcherModal({
               onRowClick={onRowClick}
               onCursor={onCursor}
               onFinder={onFinder}
+              onDelete={onDelete}
               busy={busy}
             />
           )}
@@ -647,9 +650,11 @@ function RecentPane(props: {
   onRowClick: (w: WorkspaceRecord) => Promise<void> | void;
   onCursor: (path: string) => Promise<void> | void;
   onFinder: (path: string) => Promise<void> | void;
+  onDelete: (w: WorkspaceRecord) => Promise<void> | void;
   busy: boolean;
 }) {
-  const { workspaces, openWorkspaceIds, onRowClick, onCursor, onFinder, busy } = props;
+  const { workspaces, openWorkspaceIds, onRowClick, onCursor, onFinder, onDelete, busy } = props;
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   if (workspaces.length === 0) {
     return (
       <p className="workspace-switcher-modal__hint">
@@ -722,6 +727,43 @@ function RecentPane(props: {
                     >
                       Finder 中显示
                     </button>
+                    {/* Delete with double-confirm */}
+                    {confirmDeleteId === w.workspaceId ? (
+                      <>
+                        <button
+                          type="button"
+                          className="workspace-switcher-modal__row-action workspace-switcher-modal__row-action--danger"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setConfirmDeleteId(null);
+                            void onDelete(w);
+                          }}
+                          disabled={busy || openWorkspaceIds.has(w.workspaceId)}
+                        >
+                          确认删除
+                        </button>
+                        <button
+                          type="button"
+                          className="workspace-switcher-modal__row-action"
+                          onClick={(e) => { e.stopPropagation(); setConfirmDeleteId(null); }}
+                        >
+                          取消
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="workspace-switcher-modal__row-action workspace-switcher-modal__row-action--delete"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setConfirmDeleteId(w.workspaceId);
+                        }}
+                        disabled={busy || openWorkspaceIds.has(w.workspaceId)}
+                        title={openWorkspaceIds.has(w.workspaceId) ? "请先关闭此工作区的 tab 再删除" : "从列表中删除此工作区"}
+                      >
+                        删除
+                      </button>
+                    )}
                   </>
                 );
               })()}

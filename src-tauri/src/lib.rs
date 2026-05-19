@@ -372,10 +372,48 @@ impl LaunchExecutor for RealLaunchExecutor {
                 terminal_mesh_core::transport::WorkspaceLocation::Local { path } => path.clone(),
                 terminal_mesh_core::transport::WorkspaceLocation::Remote { .. } => None,
             };
+            // Wrap local workspace launches in tmux so the claude
+            // session survives app restarts. `tmux new-session -A`
+            // creates the session on first launch and reattaches to
+            // an existing one on restart (if claude is still running).
+            // SSH/Docker remote workspaces use the remote host's own
+            // process model and don't get tmux wrapping here.
+            let tmux_wrapped = matches!(
+                routing,
+                workspace_launch_scheduler::TransportRouting::Local
+            ) && crate::ide_handoff::which_in_path("tmux").is_some();
+
+            let (launch_command, launch_args) = if tmux_wrapped {
+                let tmux_path = crate::ide_handoff::which_in_path("tmux").unwrap();
+                // Stable session name derived from the workspace UUID.
+                // Uses the first 16 hex chars (64-bit collision space)
+                // to stay well within tmux's name-length limits.
+                let uuid_hex = workspace_id.simple().to_string();
+                let session = format!("ap-{}", &uuid_hex[..16]);
+                let claude_cmd = auto_launch_command_for_routing(routing, &path)
+                    .display()
+                    .to_string();
+                let mut args = vec![
+                    "new-session".to_string(),
+                    "-A".to_string(), // attach if exists, create if not
+                    "-s".to_string(),
+                    session,
+                    "--".to_string(), // end of tmux options
+                    claude_cmd,
+                ];
+                args.extend(launch.claude_argv.iter().cloned());
+                (tmux_path, args)
+            } else {
+                (
+                    auto_launch_command_for_routing(routing, &path),
+                    launch.claude_argv.clone(),
+                )
+            };
+
             let spec = terminal_mesh_core::TerminalSpec {
                 terminal_id: uuid::Uuid::new_v4(),
-                command: auto_launch_command_for_routing(routing, &path),
-                args: launch.claude_argv.clone(),
+                command: launch_command,
+                args: launch_args,
                 cwd: cwd_for_spec,
                 env: Vec::new(),
                 cols: 80,
@@ -922,6 +960,7 @@ pub fn run() {
             workspaces::close_workspace,
             workspaces::stash_workspace,
             workspaces::unstash_workspace,
+            workspaces::delete_workspace,
             workspaces::resolve_workspace_for_tab,
             workspace_launch_scheduler::request_workspace_auto_launch,
             ide_handoff::ide_get_preference,

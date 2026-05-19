@@ -1043,3 +1043,21 @@
   color: #fff;
   border-color: #888;
 }
+
+/* Workspace delete button — muted until the double-confirm shows */
+.workspace-switcher-modal__row-action--delete {
+  color: #c0392b;
+  border-color: #c0392b44;
+  opacity: 0.7;
+}
+.workspace-switcher-modal__row-action--delete:hover:not(:disabled) {
+  opacity: 1;
+}
+.workspace-switcher-modal__row-action--danger {
+  color: #fff;
+  background: #c0392b;
+  border-color: #c0392b;
+}
+.workspace-switcher-modal__row-action--danger:hover:not(:disabled) {
+  background: #e74c3c;
+}

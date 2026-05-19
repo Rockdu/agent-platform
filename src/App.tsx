@@ -50,6 +50,7 @@ import {
 } from "./orchestrator";
 import {
   closeWorkspace,
+  deleteWorkspace,
   stashWorkspace,
   unstashWorkspace,
   isAutoLaunchErrorDto,
@@ -1902,6 +1903,14 @@ function MultiTerminalContainer() {
         openWorkspaceIds={openWorkspaceIds}
         onPickExisting={onPickExistingFromModal}
         onAdopt={adoptWorkspaceTab}
+        onDelete={async (w) => {
+          try {
+            await deleteWorkspace(w.workspaceId);
+            void refreshWorkspaces();
+          } catch (err) {
+            if (isWorkspaceErrorDto(err)) setError(err);
+          }
+        }}
         onClose={() => setActiveModal(null)}
       />
     </section>

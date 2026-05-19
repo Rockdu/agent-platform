@@ -218,3 +218,7 @@ export async function stashWorkspace(workspaceId: string): Promise<void> {
 export async function unstashWorkspace(workspaceId: string): Promise<void> {
   await invoke<void>("unstash_workspace", { workspaceId });
 }
+
+export async function deleteWorkspace(workspaceId: string): Promise<void> {
+  await invoke<void>("delete_workspace", { workspaceId });
+}
