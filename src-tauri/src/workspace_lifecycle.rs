@@ -243,12 +243,12 @@ pub fn apply_attention_to_snapshot(
         snap.status = TabStatus::Done;
         snap.done_reason = Some(reason);
         snap.agent_busy = false;
-    } else if matches!(kind, AttentionKind::PromptWaiting) {
-        // PromptWaiting fires after 1 s of no new output (quiescence
-        // mode — no shell-prompt regex required). When the terminal
-        // goes quiet, the agent has finished its current response;
-        // clear agent_busy so the tab moves to 完成区 (waiting for
-        // the next instruction).
+    } else if matches!(kind, AttentionKind::PromptWaiting) && snap.agent_busy {
+        // PromptWaiting fires after 5 s of no output (quiescence).
+        // Only clear agent_busy when it was already set (i.e. the user
+        // submitted a task and Claude has now gone quiet long enough to
+        // be considered done). The 5 s debounce in the actor ensures we
+        // don't trigger during Claude's normal "thinking" pauses.
         snap.agent_busy = false;
     }
 }
