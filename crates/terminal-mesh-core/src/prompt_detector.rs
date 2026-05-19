@@ -22,6 +22,20 @@ pub struct PromptDetector {
 }
 
 impl PromptDetector {
+    /// Pure quiescence detector — no regex required. Any output chunk
+    /// resets the debounce timer; after `debounce` ms of silence the
+    /// detector fires `PromptWaiting`. Works for any terminal program
+    /// (shells, Claude Code TUI, etc.) because it relies only on the
+    /// absence of output, not on a specific prompt string.
+    pub fn quiescence() -> Self {
+        Self {
+            regexes: vec![],
+            debounce: DEFAULT_DEBOUNCE,
+            matching_since: None,
+            fired_for_current_match: false,
+        }
+    }
+
     /// Default bash/zsh prompt regexes per spec: `\$\s*$` and `%\s*$`.
     pub fn default_bash_zsh() -> Self {
         let regexes = vec![
@@ -50,20 +64,22 @@ impl PromptDetector {
         self
     }
 
-    /// Observe a fresh ring-buffer tail snapshot. Per spec, EVERY
-    /// output arrival counts as activity that resets the 1-second
-    /// debounce window — even output that still leaves the tail
-    /// matching a prompt. Otherwise prompt-output-prompt cycles could
-    /// fire prematurely against the older timestamp.
+    /// Observe a fresh ring-buffer tail snapshot. In quiescence mode
+    /// (no regexes) every output arrival resets the debounce timer.
+    /// In regex mode, output that matches a prompt pattern starts the
+    /// timer; output that does not match cancels it.
     pub fn on_output(&mut self, tail: &str, now: Instant) {
-        let matches = self.regexes.iter().any(|re| re.is_match(tail));
-        if matches {
+        let start_debounce = if self.regexes.is_empty() {
+            true // quiescence: any output counts
+        } else {
+            self.regexes.iter().any(|re| re.is_match(tail))
+        };
+        if start_debounce {
             self.matching_since = Some(now);
-            self.fired_for_current_match = false;
         } else {
             self.matching_since = None;
-            self.fired_for_current_match = false;
         }
+        self.fired_for_current_match = false;
     }
 
     /// Tick the detector with no new output. Returns `Some(())` once

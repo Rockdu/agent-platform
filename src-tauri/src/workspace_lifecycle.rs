@@ -238,11 +238,14 @@ pub fn apply_attention_to_snapshot(
         snap.status = TabStatus::Done;
         snap.done_reason = Some(reason);
         snap.agent_busy = false;
+    } else if matches!(kind, AttentionKind::PromptWaiting) {
+        // PromptWaiting fires after 1 s of no new output (quiescence
+        // mode — no shell-prompt regex required). When the terminal
+        // goes quiet, the agent has finished its current response;
+        // clear agent_busy so the tab moves to 完成区 (waiting for
+        // the next instruction).
+        snap.agent_busy = false;
     }
-    // PromptWaiting is NOT used for agent_busy: that signal is based
-    // on shell prompt heuristics ($ / %) which never fire for Claude
-    // Code's TUI. agent_busy is driven purely by user stdin direction:
-    // set to true on user-initiated stdin, false on Done transition.
 }
 
 /// Registry-side half of the notification path: classify, mutate the

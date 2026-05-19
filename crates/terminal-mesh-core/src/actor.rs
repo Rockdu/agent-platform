@@ -284,7 +284,11 @@ async fn processor_task(
     let mut writer: Option<Box<dyn TransportStdinSink>> = Some(writer_in);
     let mut ring = RingBuffer::new();
     let mut osc = OscAttentionParser::new();
-    let mut prompt = PromptDetector::default_bash_zsh();
+    // Quiescence mode: fire PromptWaiting after 1 s of no new output.
+    // This works for Claude Code's TUI (no shell-style $ prompt) and
+    // regular shells alike — once output stops arriving, the agent
+    // has finished its current task or is waiting for input.
+    let mut prompt = PromptDetector::quiescence();
     let mut tick = tokio::time::interval(PROMPT_TICK_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut shutdown_requested = false;
