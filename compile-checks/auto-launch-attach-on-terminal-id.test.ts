@@ -53,7 +53,7 @@ function placeholderSnapshot(): WorkspaceLifecycleSnapshot {
     doneReason: null,
     lastActivityAtUnixMs: 1_000,
     pendingLaunch: true,
-    promptVisible: false,
+    agentBusy: false,
   };
 }
 
@@ -66,7 +66,7 @@ function realSnapshot(): WorkspaceLifecycleSnapshot {
     doneReason: null,
     lastActivityAtUnixMs: 2_000,
     pendingLaunch: false,
-    promptVisible: false,
+    agentBusy: false,
   };
 }
 

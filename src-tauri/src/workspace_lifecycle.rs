@@ -88,7 +88,7 @@ pub struct WorkspaceLifecycleSnapshot {
     /// terminal at the prompt is "done with its current task" even
     /// while `status == Running`, so it belongs in 完成区.
     #[serde(default)]
-    pub prompt_visible: bool,
+    pub agent_busy: bool,
 }
 
 impl WorkspaceLifecycleSnapshot {
@@ -133,7 +133,7 @@ impl WorkspaceLifecycleSnapshot {
             done_reason: None,
             last_activity_at_unix_ms: now_unix_ms(),
             pending_launch: false,
-            prompt_visible: false,
+            agent_busy: false,
         }
     }
 }
@@ -237,10 +237,12 @@ pub fn apply_attention_to_snapshot(
     if let Some(reason) = done_reason_from_attention(kind) {
         snap.status = TabStatus::Done;
         snap.done_reason = Some(reason);
-        snap.prompt_visible = false;
-    } else if matches!(kind, AttentionKind::PromptWaiting) {
-        snap.prompt_visible = true;
+        snap.agent_busy = false;
     }
+    // PromptWaiting is NOT used for agent_busy: that signal is based
+    // on shell prompt heuristics ($ / %) which never fire for Claude
+    // Code's TUI. agent_busy is driven purely by user stdin direction:
+    // set to true on user-initiated stdin, false on Done transition.
 }
 
 /// Registry-side half of the notification path: classify, mutate the
@@ -269,31 +271,33 @@ pub fn update_snapshot_for_attention(
 /// timestamp. Returns `true` if the snapshot actually changed,
 /// `false` if it was already `Running`. Used by the user-initiated
 /// stdin path to resume a Done tab without recreating its session.
+/// Pure mutator called on user-initiated stdin. Sets `agent_busy =
+/// true` (the user just submitted a task → terminal moves to 运行区).
+/// Also transitions Done → Running when applicable. Returns `true`
+/// when the snapshot actually changed and an event should be emitted.
 pub fn resume_running_from_done(
     snap: &mut WorkspaceLifecycleSnapshot,
     now_unix_ms: i64,
 ) -> bool {
-    // Clear prompt_visible on every user-initiated stdin regardless
-    // of the current status: once the user submits input, the prompt
-    // is consumed and the terminal transitions to "busy".
-    snap.prompt_visible = false;
-    match snap.status {
-        TabStatus::Done => {
-            snap.status = TabStatus::Running;
-            snap.done_reason = None;
-            snap.last_activity_at_unix_ms = now_unix_ms;
-            true
-        }
-        TabStatus::Running => false,
+    let mut changed = false;
+    // Mark agent busy: user submitted input → agent is now working.
+    if !snap.agent_busy {
+        snap.agent_busy = true;
+        changed = true;
     }
+    // Transition Done → Running when applicable.
+    if matches!(snap.status, TabStatus::Done) {
+        snap.status = TabStatus::Running;
+        snap.done_reason = None;
+        snap.last_activity_at_unix_ms = now_unix_ms;
+        changed = true;
+    }
+    changed
 }
 
-/// Registry-side half of the user-stdin path: apply
-/// `resume_running_from_done` under the retained-snapshot lock and
-/// return the new snapshot if a transition actually fired. Returns
-/// `None` when no mutation should fire (snapshot already Running, or
-/// the retained record is gone because the tab was fully cleared via
-/// `forget`).
+/// Registry-side half of the user-stdin path: set `agent_busy = true`
+/// and transition Done → Running if needed. Emits a lifecycle event
+/// whenever either change fires so the frontend rail can update.
 pub fn update_snapshot_for_user_stdin(
     registry: &crate::terminal_mesh::TerminalMeshRegistry,
     terminal_id: Uuid,
@@ -301,13 +305,7 @@ pub fn update_snapshot_for_user_stdin(
     let now = now_unix_ms();
     let mut changed = false;
     let updated = registry.update_snapshot(terminal_id, |snap| {
-        let was_prompt_visible = snap.prompt_visible;
-        let status_changed = resume_running_from_done(snap, now);
-        // Emit whenever status changed (Done→Running) OR prompt_visible
-        // was cleared (Running at prompt → Running busy): a Running
-        // terminal that was showing a prompt just received user input
-        // and must move from 完成区 back to 运行区.
-        changed = status_changed || was_prompt_visible;
+        changed = resume_running_from_done(snap, now);
     })?;
     if changed {
         Some(updated)
@@ -574,20 +572,21 @@ mod tests {
     }
 
     #[test]
-    fn resume_running_from_done_is_noop_for_running_snapshot_and_returns_false() {
+    fn resume_running_from_done_sets_agent_busy_for_running_snapshot() {
         let mut snap = WorkspaceLifecycleSnapshot::fresh_local(TabKind::Workspace);
         let baseline = snap.last_activity_at_unix_ms;
         assert!(matches!(snap.status, TabStatus::Running));
+        assert!(!snap.agent_busy, "fresh terminal is idle");
 
         let did = resume_running_from_done(&mut snap, baseline + 9_999);
 
-        assert!(!did, "no transition when already Running");
+        // Running tab with agent_busy=false → sets busy, returns true (changed).
+        assert!(did, "setting agent_busy counts as a change");
         assert!(matches!(snap.status, TabStatus::Running));
-        assert!(snap.done_reason.is_none());
-        assert_eq!(
-            snap.last_activity_at_unix_ms, baseline,
-            "no-op must NOT bump activity for an already-Running tab"
-        );
+        assert!(snap.agent_busy, "must be marked busy after user stdin");
+        // Activity timestamp is NOT bumped for already-Running tabs
+        // (the timestamp is only bumped on Done→Running transition).
+        assert_eq!(snap.last_activity_at_unix_ms, baseline);
     }
 
     #[test]
@@ -616,8 +615,11 @@ mod tests {
         assert!(updated.done_reason.is_none());
     }
 
+    /// First user-stdin on a Running-but-idle terminal sets agent_busy
+    /// and emits (returns Some). Second call is a true no-op (already
+    /// busy) and returns None.
     #[test]
-    fn update_snapshot_for_user_stdin_returns_none_when_already_running() {
+    fn update_snapshot_for_user_stdin_marks_busy_on_idle_running_tab() {
         use crate::terminal_mesh::TerminalMeshRegistry;
         use terminal_mesh_core::ActorCommand;
         use tokio::sync::mpsc;
@@ -627,16 +629,17 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<ActorCommand>(1);
         let scrollback = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         registry.record(id, tx, scrollback, None, TabKind::Workspace, None, TransportKind::Local);
-        let baseline = registry.snapshot_for_terminal(id).expect("recorded");
 
+        // First user stdin: idle Running → busy Running. Emits.
         let result = update_snapshot_for_user_stdin(&registry, id);
-        assert!(result.is_none(), "no-op when already Running");
+        assert!(result.is_some(), "first stdin on idle tab must emit");
+        let snap = result.unwrap();
+        assert!(snap.agent_busy);
+        assert!(matches!(snap.status, TabStatus::Running));
 
-        let after = registry.snapshot_for_terminal(id).expect("still present");
-        assert_eq!(
-            baseline.last_activity_at_unix_ms, after.last_activity_at_unix_ms,
-            "Running tab activity must NOT be bumped by user stdin"
-        );
+        // Second user stdin: already busy → no change, no emit.
+        let result2 = update_snapshot_for_user_stdin(&registry, id);
+        assert!(result2.is_none(), "already busy: no-op, no emit");
     }
 
     #[test]

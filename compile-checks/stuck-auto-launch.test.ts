@@ -27,7 +27,7 @@ function mkSnapshot(
     doneReason,
     lastActivityAtUnixMs: 0,
     pendingLaunch: false,
-    promptVisible: false,
+    agentBusy: false,
   };
 }
 

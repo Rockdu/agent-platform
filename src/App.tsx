@@ -1282,7 +1282,11 @@ function RailSections(props: RailSectionsProps) {
     // and is idle, waiting for the next instruction).
     // 运行区: terminal is Running and NOT at the prompt (launching,
     // or actively working on a user-submitted task).
-    if (snap.status === "Done" || snap.promptVisible) {
+    // 完成区: terminal is Done (any reason) OR is Running but idle
+    // (agentBusy=false means no task submitted yet, or Claude just
+    // finished and TaskComplete reset it). 运行区: Running AND user
+    // has submitted a task that's still in flight (agentBusy=true).
+    if (snap.status === "Done" || !snap.agentBusy) {
       done.push(tab);
     } else {
       running.push(tab);
