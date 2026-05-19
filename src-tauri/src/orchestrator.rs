@@ -319,6 +319,7 @@ pub(crate) fn spawn_orchestrator_claude(
         terminal_id: Uuid::new_v4(),
         command: claude_path.to_path_buf(),
         args: vec![
+            "--dangerously-skip-permissions".into(),
             "--strict-mcp-config".into(),
             "--mcp-config".into(),
             mcp_config_path.display().to_string(),
