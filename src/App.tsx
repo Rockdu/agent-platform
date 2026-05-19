@@ -1316,9 +1316,10 @@ function RailSections(props: RailSectionsProps) {
   };
   // 运行区: FIFO — earliest activity first (oldest task at top).
   running.sort(byActivity);
-  // 完成区: most recently finished at top so the next agent to
-  // dispatch to is immediately visible.
-  done.sort((a, b) => -byActivity(a, b));
+  // 完成区: oldest-completed first, newest at the bottom.
+  // Most recently returned tab appears last — easier to see
+  // what just finished without disrupting the existing order.
+  done.sort(byActivity);
 
   const renderRow = (tab: OpenTab, isStashed: boolean) => {
     const snap = snapshotByTabId[tab.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
@@ -1468,6 +1469,22 @@ function MultiTerminalContainer() {
   // On a clean tab-close the backend clears openTabId, so only workspaces
   // that were open when the app last quit (or crashed) are restored.
   // tmux -A in the auto-launch command reattaches to any surviving session.
+  // Listen for workspaces opened by Claude via the MCP tool
+  // `agent_platform.open_workspace`. The backend emits this event
+  // after registering/opening the workspace; the frontend adopts it
+  // as a new tab (same flow as the recent-list picker).
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void listen<WorkspaceRecord>("workspace://agent-opened", (event) => {
+      if (adoptWorkspaceTabRef.current) {
+        void adoptWorkspaceTabRef.current(event.payload);
+      }
+    }).then((fn) => { unlisten = fn; });
+    return () => { if (unlisten) unlisten(); };
+  // adoptWorkspaceTabRef is stable; run once on mount.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const sessionRestoredRef = useRef(false);
   // Stable ref to adoptWorkspaceTab so the restoration effect doesn't
   // depend on the callback's identity (avoids re-running after each render).
@@ -1569,18 +1586,24 @@ function MultiTerminalContainer() {
     for (const tab of tabs) {
       const prev = prevSnapshotRef.current[tab.tabId];
       const curr = snapshotByTabId[tab.tabId];
-      if (!curr) continue;
-      // Fire when the tab just received a TaskComplete done reason
-      // (was Running/busy, now Done with TaskComplete).
-      if (
+      if (!curr || !prev) continue;
+
+      // Show toast when: TaskComplete fires, OR agent goes from busy→idle
+      // (agentBusy true→false means Claude finished a round of work).
+      const wasWorking = prev.agentBusy;
+      const taskComplete =
         curr.status === "Done" &&
         curr.doneReason?.kind === "TaskComplete" &&
-        prev &&
-        (prev.status !== "Done" || prev.doneReason?.kind !== "TaskComplete")
-      ) {
-        const summary = curr.doneReason.kind === "TaskComplete"
-          ? curr.doneReason.summary
-          : undefined;
+        (prev.status !== "Done" || prev.doneReason?.kind !== "TaskComplete");
+      const wentIdle =
+        prev.agentBusy && !curr.agentBusy && curr.status !== "Done";
+
+      if (taskComplete || wentIdle) {
+        void wasWorking; // suppress unused warning
+        const summary =
+          curr.doneReason?.kind === "TaskComplete"
+            ? curr.doneReason.summary
+            : undefined;
         if (completionToastTimerRef.current) {
           clearTimeout(completionToastTimerRef.current);
         }

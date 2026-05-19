@@ -29,6 +29,7 @@
 //! `mcp_stdio::encode_message` / `decode_line`).
 
 use std::path::{Path, PathBuf};
+use tauri::Emitter;
 
 use mcp_stdio::{
     decode_line, encode_message, ClientId, JsonRpcError, JsonRpcId, JsonRpcMessage,
@@ -67,9 +68,10 @@ pub struct HostRpcState {
     pub orchestrator: OrchestratorState,
     pub mount_registry: MountRegistry,
     pub terminal_registry: TerminalMeshRegistry,
-    /// Shared with Tauri's app.manage handle (Arc-backed); used by
-    /// `handle_list_tabs` to resolve friendly workspace names.
     pub workspaces: crate::workspaces::WorkspaceRegistry,
+    /// Needed to emit `workspace://agent-opened` when a Claude
+    /// session calls `agentPlatform.openWorkspace`.
+    pub app_handle: tauri::AppHandle,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,6 +120,102 @@ struct ListTabsParams {
 #[serde(rename_all = "camelCase")]
 struct ListTabsResult {
     tabs: Vec<TerminalListTabsEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenWorkspaceParams {
+    client_id: String,
+    /// Local filesystem path to open. Must be an absolute directory.
+    path: String,
+    /// Optional friendly name. Defaults to the last path component.
+    name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenWorkspaceResult {
+    workspace_id: String,
+    tab_id: String,
+    name: String,
+}
+
+/// Handle `agentPlatform.openWorkspace`: register (or find) a local
+/// workspace, open it under a new tab, and emit an event so the
+/// frontend can adopt the tab and trigger auto-launch.
+///
+/// Any caller with a valid `clientId` (ordinary workspace Claudes
+/// included) may call this — the Unix socket is already local-only.
+fn handle_open_workspace(
+    state: &HostRpcState,
+    params: OpenWorkspaceParams,
+) -> Result<Value, JsonRpcError> {
+    // Validate the caller has a parseable clientId (basic sanity check).
+    ClientId::parse(&params.client_id).map_err(|e| JsonRpcError {
+        code: ERR_INVALID_CLIENT_ID,
+        message: format!("invalid clientId: {e:?}"),
+        data: None,
+    })?;
+
+    let path = std::path::Path::new(&params.path);
+    // Must be an absolute canonical local path.
+    if !path.is_absolute() {
+        return Err(JsonRpcError {
+            code: ERR_INVALID_PARAMS,
+            message: "path must be absolute".into(),
+            data: None,
+        });
+    }
+    if !path.is_dir() {
+        return Err(JsonRpcError {
+            code: ERR_INVALID_PARAMS,
+            message: format!("not a directory: {}", params.path),
+            data: None,
+        });
+    }
+
+    // Find existing workspace for this path or register a new one.
+    let name = params.name.unwrap_or_else(|| {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace")
+            .to_string()
+    });
+
+    let record = state
+        .workspaces
+        .find_or_register_local(path, &name)
+        .map_err(|e| JsonRpcError {
+            code: ERR_INVALID_PARAMS,
+            message: format!("workspace error: {e}"),
+            data: None,
+        })?;
+
+    let workspace_id = record.workspace_id;
+    let tab_id = workspace_id.to_string();
+
+    // Open the workspace (set open_tab_id atomically).
+    let opened = state
+        .workspaces
+        .open_workspace(workspace_id, &tab_id)
+        .map_err(|e| JsonRpcError {
+            code: ERR_INVALID_PARAMS,
+            message: format!("{e}"),
+            data: None,
+        })?;
+
+    // Emit an event so the frontend adopts this workspace as a new tab
+    // and triggers auto-launch (with tmux + --continue).
+    if let Err(e) = state.app_handle.emit("workspace://agent-opened", &opened) {
+        tracing::warn!(error = %e, "failed to emit workspace://agent-opened");
+    }
+
+    Ok(serde_json::to_value(OpenWorkspaceResult {
+        workspace_id: workspace_id.to_string(),
+        tab_id,
+        name: opened.name,
+    })
+    .expect("serialize"))
 }
 
 /// Prepare the socket directory under `${app_data}/host-rpc/`. Returns
@@ -281,6 +379,15 @@ pub fn dispatch_method(
                     data: None,
                 })?;
             handle_list_tabs(state, parsed)
+        }
+        "agentPlatform.openWorkspace" => {
+            let parsed: OpenWorkspaceParams =
+                serde_json::from_value(params).map_err(|e| JsonRpcError {
+                    code: ERR_INVALID_PARAMS,
+                    message: format!("invalid params: {e}"),
+                    data: None,
+                })?;
+            handle_open_workspace(state, parsed)
         }
         other => Err(JsonRpcError {
             code: ERR_METHOD_NOT_FOUND,

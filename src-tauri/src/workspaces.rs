@@ -770,6 +770,32 @@ impl WorkspaceRegistry {
         Ok(self.with_conversation_count(updated))
     }
 
+    /// Find a workspace by its local path, or register a new one.
+    /// Used by the `agentPlatform.openWorkspace` MCP tool so Claude
+    /// can open workspaces without going through the UI.
+    pub fn find_or_register_local(
+        &self,
+        path: &std::path::Path,
+        name: &str,
+    ) -> Result<WorkspaceRecord, WorkspaceError> {
+        // Check for an existing workspace at this canonical path.
+        let canonical = std::fs::canonicalize(path).map_err(|_| WorkspaceError::InvalidName {
+            reason: format!("cannot resolve path: {}", path.display()),
+        })?;
+        {
+            let guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
+            for rec in guard.records.values() {
+                if let WorkspaceLocation::Local { path: ref p } = rec.location {
+                    if *p == canonical {
+                        return Ok(self.with_conversation_count(rec.clone()));
+                    }
+                }
+            }
+        }
+        // Not found — register it.
+        self.register_workspace(path, true)
+    }
+
     /// Permanently remove a workspace record. Fails when the workspace
     /// is still open (has an active tab) to prevent accidental deletion
     /// of a session the user is working in.

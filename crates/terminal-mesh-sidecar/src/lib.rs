@@ -128,6 +128,24 @@ pub fn tools_list_response() -> Value {
                     "type": "object",
                     "properties": {}
                 }
+            },
+            {
+                "name": "agent_platform.open_workspace",
+                "description": "Open a local workspace directory as a new agent tab. Creates the workspace record if it does not exist, then auto-launches Claude Code inside it. Returns the workspace_id and tab_id.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute local filesystem path to the workspace directory"
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Friendly display name (defaults to the last path component)"
+                        }
+                    },
+                    "required": ["path"]
+                }
             }
         ]
     })
@@ -214,6 +232,20 @@ pub fn build_bridge_request(
             Ok(JsonRpcMessage::request(
                 request_id,
                 "terminalMesh.listTabs",
+                Some(params),
+            ))
+        }
+        "agent_platform.open_workspace" => {
+            // Forward path + name directly; the host handler validates them.
+            let params = serde_json::to_value(serde_json::json!({
+                "clientId": client_id,
+                "path":    tool_args.get("path").cloned().unwrap_or(Value::Null),
+                "name":    tool_args.get("name").cloned(),
+            }))
+            .expect("bridge params serialize");
+            Ok(JsonRpcMessage::request(
+                request_id,
+                "agentPlatform.openWorkspace",
                 Some(params),
             ))
         }

@@ -12,6 +12,7 @@ mod host_rpc;
 mod notification;
 mod generated;
 mod ide_handoff;
+mod sshfs_mount;
 mod logging;
 mod mcp_config;
 mod orchestrator;
@@ -400,13 +401,19 @@ impl LaunchExecutor for RealLaunchExecutor {
                     session,
                     "--".to_string(), // end of tmux options
                     claude_cmd,
+                    // --continue resumes the last conversation for
+                    // this workspace directory; gracefully starts fresh
+                    // when no prior session exists.
+                    "--continue".to_string(),
                 ];
                 args.extend(launch.claude_argv.iter().cloned());
                 (tmux_path, args)
             } else {
+                let mut claude_args = vec!["--continue".to_string()];
+                claude_args.extend(launch.claude_argv.iter().cloned());
                 (
                     auto_launch_command_for_routing(routing, &path),
-                    launch.claude_argv.clone(),
+                    claude_args,
                 )
             };
 
@@ -825,6 +832,7 @@ pub fn run() {
                                     mount_registry: mount_registry_handle,
                                     terminal_registry: terminal_registry_handle,
                                     workspaces: workspaces_handle,
+                                    app_handle: app.handle().clone(),
                                 },
                             );
                             tracing::info!(host_rpc_sock = %p.display(), "host_rpc bridge spawned");
