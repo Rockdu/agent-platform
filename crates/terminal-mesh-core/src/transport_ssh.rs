@@ -172,12 +172,17 @@ pub fn build_ssh_argv(
         "StrictHostKeyChecking=accept-new".into(),
         "-o".into(),
         "ConnectTimeout=10".into(),
-        "-p".into(),
-        port.to_string(),
-        // `--` ends option parsing so no later argv slot (the
-        // destination or the remote command) can be reinterpreted
-        // as a `-`-prefixed option even if validation is bypassed
-        // by a future caller.
+    ]);
+    // Only pass -p when explicitly set in the workspace. If port is
+    // null we omit -p so that ~/.ssh/config Port settings are not
+    // overridden (many servers use non-standard ports configured there).
+    if let Some(p) = location.port {
+        opts.push("-p".into());
+        opts.push(p.to_string());
+    }
+    opts.extend([
+        // `--` ends option parsing so no later argv slot can be
+        // reinterpreted as an option.
         "--".into(),
         location.user_host(),
         compose_remote_command(wrapper_script),
@@ -1442,15 +1447,31 @@ mod tests {
     }
 
     #[test]
-    fn build_ssh_argv_defaults_port_22_when_none() {
+    fn build_ssh_argv_omits_port_when_null() {
+        // When port is None we omit -p so ~/.ssh/config Port is not
+        // overridden (servers often use non-standard ports there).
         let argv = build_ssh_argv(
             Path::new("/tmp/cm/abc.sock"),
             &loc(None, "h", None, "/srv"),
             "x",
         )
         .expect("argv builds");
+        assert!(
+            !argv.contains(&"-p".to_string()),
+            "-p must be absent when port is None; argv={argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_ssh_argv_includes_explicit_port() {
+        let argv = build_ssh_argv(
+            Path::new("/tmp/cm/abc.sock"),
+            &loc(None, "h", Some(2222), "/srv"),
+            "x",
+        )
+        .expect("argv builds");
         let dash_p = argv.iter().position(|a| a == "-p").expect("has -p");
-        assert_eq!(argv[dash_p + 1], "22");
+        assert_eq!(argv[dash_p + 1], "2222");
     }
 
     #[test]
