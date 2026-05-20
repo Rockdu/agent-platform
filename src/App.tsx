@@ -1296,11 +1296,13 @@ interface RailSectionsProps {
   onStash: (tabId: string) => void;
   onUnstash: (tabId: string) => void;
   onResume: (tabId: string) => void;
+  onReorder: (tabId: string, afterTabId: string | null) => void;
   snapshotByTabId: Readonly<Record<string, WorkspaceLifecycleSnapshot>>;
 }
 
 function RailSections(props: RailSectionsProps) {
-  const { tabs, activeId, stashedTabIds, onSelect, onClose, onStash, onUnstash, onResume, snapshotByTabId } = props;
+  const { tabs, activeId, stashedTabIds, onSelect, onClose, onStash, onUnstash, onResume, onReorder, snapshotByTabId } = props;
+  const dragTabIdRef = useRef<string | null>(null);
 
   const running: OpenTab[] = [];
   const done: OpenTab[] = [];
@@ -1338,17 +1340,29 @@ function RailSections(props: RailSectionsProps) {
     const snap = snapshotByTabId[tab.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
     const resumeOffered = !isStashed && canOfferResumeFromDone(snap);
     return (
-      <WorkspaceRailRow
+      <div
         key={tab.tabId}
-        tab={tab}
-        snapshot={snap}
-        isActive={activeId === tab.tabId}
-        onSelect={onSelect}
-        onClose={onClose}
-        doneAffordance={resumeOffered ? () => onResume(tab.tabId) : undefined}
-        stashAffordance={isStashed ? undefined : () => onStash(tab.tabId)}
-        unstashAffordance={isStashed ? () => onUnstash(tab.tabId) : undefined}
-      />
+        draggable
+        onDragStart={() => { dragTabIdRef.current = tab.tabId; }}
+        onDragOver={(e) => { e.preventDefault(); }}
+        onDrop={() => {
+          const from = dragTabIdRef.current;
+          if (from && from !== tab.tabId) onReorder(from, tab.tabId);
+          dragTabIdRef.current = null;
+        }}
+        style={{ opacity: dragTabIdRef.current === tab.tabId ? 0.5 : 1 }}
+      >
+        <WorkspaceRailRow
+          tab={tab}
+          snapshot={snap}
+          isActive={activeId === tab.tabId}
+          onSelect={onSelect}
+          onClose={onClose}
+          doneAffordance={resumeOffered ? () => onResume(tab.tabId) : undefined}
+          stashAffordance={isStashed ? undefined : () => onStash(tab.tabId)}
+          unstashAffordance={isStashed ? () => onUnstash(tab.tabId) : undefined}
+        />
+      </div>
     );
   };
 
@@ -1528,14 +1542,15 @@ function MultiTerminalContainer() {
     if (workspaces.length === 0) return;
     if (!adoptWorkspaceTabRef.current) return;
     sessionRestoredRef.current = true;
-    // Restore all workspaces on restart — including ones the user
-    // closed with ×. The × button closes the PTY session but the
-    // workspace remains in the registry; on restart the user expects
-    // to see all their workspaces back. Stashed workspaces go into
-    // 暂存区 rather than being auto-adopted as active tabs.
+    // Only restore workspaces that had an open tab when the app last
+    // quit (openTabId is set). Workspaces where the user explicitly
+    // clicked × (which calls close_workspace → clears openTabId) are
+    // left closed. Stashed workspaces are also restored but go into 暂存区.
     const adopt = adoptWorkspaceTabRef.current;
     for (const w of workspaces) {
-      void adopt(w);
+      if (w.openTabId != null || w.profile.stashed) {
+        void adopt(w);
+      }
     }
   }, [workspaces]);
 
@@ -1577,6 +1592,23 @@ function MultiTerminalContainer() {
       return committed;
     });
   }, [snapshotByTabId, terminalIdByTabId]);
+
+  const reorderTab = useCallback(
+    (tabId: string, afterTabId: string | null) => {
+      if (!afterTabId) return;
+      setTabs((prev) => {
+        const from = prev.findIndex((t) => t.tabId === tabId);
+        const to = prev.findIndex((t) => t.tabId === afterTabId);
+        if (from === -1 || to === -1 || from === to) return prev;
+        const next = [...prev];
+        const [moved] = next.splice(from, 1);
+        next.splice(to, 0, moved);
+        tabsRef.current = next;
+        return next;
+      });
+    },
+    [],
+  );
 
   const stashTab = useCallback(
     async (tabId: string) => {
@@ -1925,6 +1957,7 @@ function MultiTerminalContainer() {
           onClose={(id) => void closeTab(id)}
           onStash={(id) => void stashTab(id)}
           onUnstash={(id) => void unstashTab(id)}
+          onReorder={reorderTab}
           onResume={focusTerminal}
           snapshotByTabId={snapshotByTabId}
         />

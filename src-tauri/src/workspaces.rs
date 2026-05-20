@@ -776,7 +776,7 @@ impl WorkspaceRegistry {
     pub fn find_or_register_local(
         &self,
         path: &std::path::Path,
-        name: &str,
+        _name: &str,
     ) -> Result<WorkspaceRecord, WorkspaceError> {
         // Check for an existing workspace at this canonical path.
         let canonical = std::fs::canonicalize(path).map_err(|_| WorkspaceError::InvalidName {

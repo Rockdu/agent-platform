@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Optional SSHFS mount support for remote SSH workspaces.
 //!
 //! When `sshfs` + macFUSE are available, mounts the remote workspace

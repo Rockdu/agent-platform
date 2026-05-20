@@ -201,7 +201,7 @@ fn handle_open_workspace(
 
     // Detect SSH or SSH+Docker path format
     let record = if let Some((user, host, port, remote_path)) = parse_ssh_path(path_str) {
-        use crate::workspaces::{SshLocation, ContainerLocation, validate_canonical_remote_path};
+        use crate::workspaces::{SshLocation, validate_canonical_remote_path};
 
         // Check for Docker suffix: /remote/path#container-id or
         // /remote/path#container-id:/cwd-in-container

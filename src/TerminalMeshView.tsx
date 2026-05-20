@@ -135,12 +135,15 @@ export function TerminalMeshView({
     setIdeError(null);
     try {
       if (isRemote && workspaceLocation?.kind === "remote") {
-        const { ssh } = workspaceLocation;
+        const { ssh, container } = workspaceLocation;
+        // For Docker: use the CWD inside the container as the path,
+        // falling back to the host canonical path.
+        const remotePath = container?.cwdInContainer ?? ssh.canonicalRemotePath;
         await openRemoteWorkspaceInIde({
           sshUser: ssh.user,
           sshHost: ssh.host,
           sshPort: ssh.port,
-          remotePath: ssh.canonicalRemotePath,
+          remotePath,
         });
       } else if (!isRemote && cwd) {
         await openWorkspaceInIde(cwd);

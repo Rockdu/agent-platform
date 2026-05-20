@@ -146,7 +146,7 @@ pub fn build_ssh_argv(
         validate_ssh_destination_fragment(user, "user")?;
     }
     validate_ssh_destination_fragment(&location.host, "host")?;
-    let port = location.port.unwrap_or(22);
+    let _port = location.port.unwrap_or(22);
     // Build SSH options. We deliberately do NOT override IdentityAgent
     // so that ~/.ssh/config settings (UseKeychain, IdentityFile, etc.)
     // are respected. If SSH_AUTH_SOCK is available in the environment

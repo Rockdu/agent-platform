@@ -56,6 +56,7 @@ fn which_brew() -> Option<PathBuf> {
     crate::ide_handoff::which_in_path("brew")
 }
 
+#[allow(dead_code)]
 fn brew_list_version(package: &str) -> Option<String> {
     let brew = which_brew()?;
     let out = Command::new(&brew)
