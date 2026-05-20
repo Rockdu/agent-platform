@@ -4,14 +4,6 @@
 //!   - Homebrew     (package manager)
 //!   - tmux         (session persistence)
 //!   - Claude Code  (core AI agent)
-//!
-//! Optional (remote workspace SSHFS mounting):
-//!   - FUSE-T       (kext-less FUSE: brew install --cask fuse-t)
-//!   - fuse-t-sshfs (sshfs via FUSE-T: brew install fuse-t-sshfs)
-//!
-//! FUSE-T is the modern macOS FUSE implementation that does NOT need
-//! a kernel-extension approval (unlike the deprecated macFUSE). It
-//! works on macOS 12+ entirely in userspace.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -27,8 +19,6 @@ pub enum DepKind {
     Homebrew,
     Tmux,
     Claude,
-    FuseT,
-    FuseTSshfs,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,23 +67,6 @@ fn brew_list_version(package: &str) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-fn brew_cask_installed(cask: &str) -> bool {
-    let Some(brew) = which_brew() else { return false };
-    let out = Command::new(&brew)
-        .args(["list", "--cask", cask])
-        .env("HOMEBREW_NO_ENV_HINTS", "1")
-        .output()
-        .ok();
-    out.map(|o| o.status.success()).unwrap_or(false)
-}
-
-fn fuse_t_installed() -> bool {
-    // FUSE-T installs a library at /usr/local/lib/libfuse-t.dylib or similar.
-    Path::new("/usr/local/lib/libfuse-t.dylib").exists()
-        || Path::new("/opt/homebrew/lib/libfuse-t.dylib").exists()
-        || brew_cask_installed("fuse-t")
-}
-
 fn simple_version(cmd: &str, arg: &str) -> Option<String> {
     let out = Command::new(cmd).arg(arg).output().ok()?;
     let s = String::from_utf8_lossy(&out.stdout)
@@ -133,13 +106,6 @@ pub fn check_all() -> Vec<DepInfo> {
         || Path::new("/opt/homebrew/bin/claude").exists();
     let claude_ver = simple_version("claude", "--version");
 
-    let fuse_t_ok = fuse_t_installed();
-    let fuse_t_ver = if fuse_t_ok { Some("已安装".into()) } else { None };
-
-    let sshfs_ok = crate::ide_handoff::which_in_path("sshfs").is_some()
-        || brew_list_version("fuse-t-sshfs").is_some();
-    let sshfs_ver = brew_list_version("fuse-t-sshfs");
-
     vec![
         DepInfo {
             kind: DepKind::Homebrew,
@@ -168,24 +134,6 @@ pub fn check_all() -> Vec<DepInfo> {
             required: true,
             post_install_note: None,
         },
-        DepInfo {
-            kind: DepKind::FuseT,
-            label: "FUSE-T".into(),
-            description: "用户态 FUSE 实现，无需内核扩展审批，支持 SSHFS 挂载远程目录".into(),
-            installed: fuse_t_ok,
-            version: fuse_t_ver,
-            required: false,
-            post_install_note: None,
-        },
-        DepInfo {
-            kind: DepKind::FuseTSshfs,
-            label: "fuse-t-sshfs".into(),
-            description: "基于 FUSE-T 的 SSHFS，让远程工作区在本地运行 claude（需要先装 FUSE-T）".into(),
-            installed: sshfs_ok,
-            version: sshfs_ver,
-            required: false,
-            post_install_note: None,
-        },
     ]
 }
 
@@ -209,12 +157,9 @@ pub async fn install_dependency(kind: DepKind) -> InstallResult {
 
     let kind_clone = kind.clone();
     let (success, output) = tokio::task::spawn_blocking(move || match kind_clone {
-        DepKind::Homebrew   => install_homebrew(),
-        DepKind::Tmux       => brew_install("tmux", false),
-        DepKind::Claude     => brew_install("claude", false),
-        // fuse-t is a cask that may need sudo; open Terminal for it.
-        DepKind::FuseT      => brew_install_cask_via_terminal("fuse-t"),
-        DepKind::FuseTSshfs => install_fuse_t_sshfs(),
+        DepKind::Homebrew => install_homebrew(),
+        DepKind::Tmux     => brew_install("tmux", false),
+        DepKind::Claude   => brew_install("claude", false),
     })
     .await
     .unwrap_or_else(|e| (false, format!("task panicked: {e}")));
@@ -222,10 +167,6 @@ pub async fn install_dependency(kind: DepKind) -> InstallResult {
     InstallResult { kind, success, output, post_install_note: post_note }
 }
 
-/// Run `brew install [--cask] <package>` headlessly.
-/// Regular packages (tmux, fuse-t-sshfs) don't need sudo, so this
-/// works fine. Cask packages (fuse-t) may require sudo — call
-/// `brew_install_cask_via_terminal` for those instead.
 fn brew_install(package: &str, is_cask: bool) -> (bool, String) {
     let Some(brew) = which_brew() else {
         return (false, "Homebrew 未安装，请先安装 Homebrew".into());
@@ -248,40 +189,6 @@ fn brew_install(package: &str, is_cask: bool) -> (bool, String) {
         }
         Err(e) => (false, format!("spawn failed: {e}")),
     }
-}
-
-/// Install a cask that may require sudo by opening a Terminal window.
-/// Returns immediately; the user completes the install in Terminal.
-/// The frontend must poll `get_dependency_status` to detect completion.
-fn brew_install_cask_via_terminal(cask: &str) -> (bool, String) {
-    let Some(brew) = which_brew() else {
-        return (false, "Homebrew 未安装，请先安装 Homebrew".into());
-    };
-    let cmd = format!(
-        "{} install --cask {} && echo '✓ {} 安装完成'",
-        brew.display(), cask, cask
-    );
-    let result = Command::new("/usr/bin/osascript")
-        .args(["-e", &format!(r#"tell application "Terminal" to do script "{cmd}""#)])
-        .output();
-    match result {
-        Ok(o) if o.status.success() => (
-            true,
-            format!("已在 Terminal 中运行安装命令。完成后请回到 app 点「刷新状态」确认。"),
-        ),
-        _ => {
-            // Fallback: try headless (NONINTERACTIVE might work without sudo on newer macOS)
-            brew_install(cask, true)
-        }
-    }
-}
-
-/// Install fuse-t-sshfs. Requires FUSE-T to be installed first.
-fn install_fuse_t_sshfs() -> (bool, String) {
-    if !fuse_t_installed() {
-        return (false, "请先安装 FUSE-T（无需内核扩展审批），再安装 fuse-t-sshfs".into());
-    }
-    brew_install("fuse-t-sshfs", false)
 }
 
 fn install_homebrew() -> (bool, String) {
