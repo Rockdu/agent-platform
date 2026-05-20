@@ -411,16 +411,13 @@ impl LaunchExecutor for RealLaunchExecutor {
                     session,
                     "--".to_string(), // end of tmux options
                     claude_cmd,
-                    "--continue".to_string(),
                 ];
                 args.extend(launch.claude_argv.iter().cloned());
                 (tmux_path, args)
             } else {
-                let mut claude_args = vec!["--continue".to_string()];
-                claude_args.extend(launch.claude_argv.iter().cloned());
                 (
                     auto_launch_command_for_routing(routing, &path),
-                    claude_args,
+                    launch.claude_argv.clone(),
                 )
             };
 
@@ -449,7 +446,9 @@ impl LaunchExecutor for RealLaunchExecutor {
                     )
                 }
                 workspace_launch_scheduler::TransportRouting::Ssh => {
+                    eprintln!("[DEBUG-SSH] attempting SSH auto-launch for workspace={workspace_id} tab={tab_id} app_data={:?}", app_data_root_for_transport);
                     let Some(app_data) = app_data_root_for_transport.as_ref() else {
+                        eprintln!("[DEBUG-SSH] FAIL: app_data_root not available");
                         tracing::error!(
                             %workspace_id,
                             %tab_id,

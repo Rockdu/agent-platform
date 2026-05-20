@@ -147,10 +147,21 @@ pub fn build_ssh_argv(
     }
     validate_ssh_destination_fragment(&location.host, "host")?;
     let port = location.port.unwrap_or(22);
+    // Forward the SSH agent socket so keys loaded in the user's
+    // keychain / ssh-agent are available inside Tauri. Tauri GUI
+    // processes may not inherit SSH_AUTH_SOCK from the shell, but
+    // ForwardAgent=yes lets the remote side use the local agent.
+    // For the LOCAL ssh auth, we use IdentityAgent=SSH_AUTH_SOCK
+    // to ensure the agent socket path from the environment is used.
+    let agent_sock = std::env::var("SSH_AUTH_SOCK")
+        .map(|s| format!("IdentityAgent={s}"))
+        .unwrap_or_else(|_| "IdentityAgent=none".to_string());
     Ok(vec![
         "-tt".into(),
         "-o".into(),
         "BatchMode=yes".into(),
+        "-o".into(),
+        agent_sock,
         "-o".into(),
         "ControlMaster=auto".into(),
         "-o".into(),
