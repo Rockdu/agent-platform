@@ -526,10 +526,16 @@ impl SentinelParser {
 // ControlMaster directory init + stale cleanup — spec §4.2
 // ---------------------------------------------------------------------------
 
-/// Create `${app_data}/ssh-cm/` with mode `0700` and verify it is
-/// owned by the current user. Returns the directory path.
-pub fn init_control_master_dir(app_data: &Path) -> Result<PathBuf, TransportError> {
-    let dir = app_data.join("ssh-cm");
+/// Create the ControlMaster socket directory with mode `0700` and
+/// verify it is owned by the current user. Returns the directory path.
+///
+/// Uses `~/.ssh/ap-cm/` instead of `${app_data}/ssh-cm/` to avoid
+/// spaces in the path (e.g. macOS "Application Support"). SSH's `-o`
+/// option parsing splits on spaces, so a ControlPath with a space in
+/// it silently truncates and causes "extra arguments at end of line".
+pub fn init_control_master_dir(_app_data: &Path) -> Result<PathBuf, TransportError> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let dir = std::path::PathBuf::from(home).join(".ssh").join("ap-cm");
     std::fs::create_dir_all(&dir).map_err(|e| TransportError::SshControlPathInvalid {
         path: dir.clone(),
         message: format!("create_dir_all: {e}"),
