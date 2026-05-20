@@ -494,6 +494,87 @@ pub fn ide_open_remote_workspace(
     open_with(&pref.ide_command, &args).map_err(|e| IdeHandoffErrorDto::from(&e))
 }
 
+/// Open a running Docker container in Cursor/VS Code using the Dev Containers
+/// extension. For a container on a remote SSH host, set DOCKER_HOST=ssh://host
+/// so the local Docker client tunnels to the remote daemon via SSH, then use
+/// the `attached-container` URI scheme which the Dev Containers extension
+/// handles regardless of where the daemon is.
+///
+/// URI: vscode-remote://attached-container+HEX_JSON/path_in_container
+/// where HEX_JSON = hex-encode({"containerName":"/container_name"})
+#[tauri::command]
+pub fn ide_open_docker_workspace(
+    // SSH host to tunnel Docker through (if container is remote). None for local Docker.
+    ssh_user: Option<String>,
+    ssh_host: Option<String>,
+    ssh_port: Option<u16>,
+    container_id: String,
+    cwd_in_container: String,
+    store: State<'_, IdePreferenceStore>,
+) -> Result<(), IdeHandoffErrorDto> {
+    let pref = store.snapshot();
+
+    // Build DOCKER_HOST for remote SSH tunneling.
+    let docker_host = ssh_host.as_ref().map(|host| {
+        match (ssh_user.as_deref(), ssh_port) {
+            (Some(u), Some(p)) => format!("ssh://{u}@{host}:{p}"),
+            (Some(u), None)    => format!("ssh://{u}@{host}"),
+            (None, Some(p))    => format!("ssh://{host}:{p}"),
+            (None, None)       => format!("ssh://{host}"),
+        }
+    });
+
+    // Build the attached-container URI.
+    // Hex-encode {"containerName":"/container_id"} — this is the format
+    // the Dev Containers extension expects to identify the container.
+    let container_json = format!(r#"{{"containerName":"/{container_id}"}}"#);
+    let hex_config: String = container_json.bytes()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let folder_uri = format!("vscode-remote://attached-container+{hex_config}{cwd_in_container}");
+
+    // Find the IDE binary — prefer the CLI binary over `open -a` so we
+    // can pass environment variables (DOCKER_HOST) that the app inherits.
+    let ide_bin = which_in_path(&pref.ide_command).or_else(|| {
+        // macOS app bundle fallback
+        #[cfg(target_os = "macos")]
+        {
+            let bundles: &[(&str, &str)] = &[
+                ("cursor", "/Applications/Cursor.app/Contents/MacOS/cursor"),
+                ("code",   "/Applications/Visual Studio Code.app/Contents/MacOS/Electron"),
+            ];
+            bundles.iter()
+                .find(|(cmd, _)| *cmd == pref.ide_command.as_str())
+                .and_then(|(_, path)| {
+                    let p = std::path::Path::new(path);
+                    if is_executable(p) { Some(p.to_path_buf()) } else { None }
+                })
+        }
+        #[cfg(not(target_os = "macos"))]
+        { None }
+    });
+
+    let Some(bin) = ide_bin else {
+        return Err(IdeHandoffErrorDto::from(&IdeHandoffError::IdeNotInPath {
+            command: pref.ide_command.clone(),
+        }));
+    };
+
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("--folder-uri").arg(&folder_uri)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(dh) = docker_host {
+        cmd.env("DOCKER_HOST", dh);
+    }
+    cmd.spawn().map_err(|e| IdeHandoffErrorDto::from(&IdeHandoffError::SpawnFailed {
+        command: bin.display().to_string(),
+        message: e.to_string(),
+    }))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn ide_reveal_in_finder(workspace_path: String) -> Result<(), IdeHandoffErrorDto> {
     reveal_in_finder(Path::new(&workspace_path)).map_err(|e| IdeHandoffErrorDto::from(&e))

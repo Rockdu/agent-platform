@@ -41,6 +41,26 @@ export async function openWorkspaceInIde(workspacePath: string): Promise<void> {
 
 /// Open a remote SSH workspace in Cursor / VS Code via the
 /// `vscode-remote://ssh-remote+[user@]host[:port]/path` URI scheme.
+/// Open a Docker container workspace in Cursor/VS Code using the Dev Containers
+/// extension. For remote containers, sets DOCKER_HOST=ssh://host so the local
+/// Docker client tunnels to the remote daemon — then uses the attached-container
+/// URI scheme for direct one-step container attachment.
+export async function openDockerWorkspaceInIde(params: {
+  sshUser: string | null;
+  sshHost: string | null;
+  sshPort: number | null;
+  containerId: string;
+  cwdInContainer: string;
+}): Promise<void> {
+  await invoke<void>("ide_open_docker_workspace", {
+    sshUser: params.sshUser,
+    sshHost: params.sshHost,
+    sshPort: params.sshPort,
+    containerId: params.containerId,
+    cwdInContainer: params.cwdInContainer,
+  });
+}
+
 export async function openRemoteWorkspaceInIde(params: {
   sshUser: string | null;
   sshHost: string;

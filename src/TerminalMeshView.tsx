@@ -14,6 +14,7 @@ import {
 } from "./terminal-mesh";
 import {
   isIdeHandoffErrorDto,
+  openDockerWorkspaceInIde,
   openWorkspaceInIde,
   openRemoteWorkspaceInIde,
   revealWorkspaceInFinder,
@@ -136,15 +137,25 @@ export function TerminalMeshView({
     try {
       if (isRemote && workspaceLocation?.kind === "remote") {
         const { ssh, container } = workspaceLocation;
-        // For Docker: use the CWD inside the container as the path,
-        // falling back to the host canonical path.
-        const remotePath = container?.cwdInContainer ?? ssh.canonicalRemotePath;
-        await openRemoteWorkspaceInIde({
-          sshUser: ssh.user,
-          sshHost: ssh.host,
-          sshPort: ssh.port,
-          remotePath,
-        });
+        if (container) {
+          // Docker container: use DOCKER_HOST=ssh://host + attached-container URI.
+          // The Dev Containers extension tunnels directly into the container
+          // regardless of whether it is local or on a remote SSH host.
+          await openDockerWorkspaceInIde({
+            sshUser: ssh.user,
+            sshHost: ssh.host,         // null → local Docker
+            sshPort: ssh.port,
+            containerId: container.containerId,
+            cwdInContainer: container.cwdInContainer ?? ssh.canonicalRemotePath,
+          });
+        } else {
+          await openRemoteWorkspaceInIde({
+            sshUser: ssh.user,
+            sshHost: ssh.host,
+            sshPort: ssh.port,
+            remotePath: ssh.canonicalRemotePath,
+          });
+        }
       } else if (!isRemote && cwd) {
         await openWorkspaceInIde(cwd);
       }
