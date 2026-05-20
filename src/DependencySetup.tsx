@@ -73,12 +73,37 @@ export function DependencySetupView({ onAllInstalled }: { onAllInstalled?: () =>
     [refresh],
   );
 
+  // installAll runs a fresh sequential install queue, bypassing the
+  // shared `install` helper so setInstalling never races with the loop.
   const installAll = useCallback(async () => {
-    const missing = deps.filter((d) => !d.installed);
-    for (const dep of missing) {
-      await install(dep.kind);
+    // Capture the list at click time (before any installs).
+    const queue = deps.filter((d) => !d.installed).map((d) => d.kind);
+    if (queue.length === 0) return;
+    for (const kind of queue) {
+      setInstalling(kind);
+      try {
+        const result = await installDependency(kind);
+        setResults((prev) => ({ ...prev, [kind]: result }));
+        // Refresh dep status after each install so subsequent deps
+        // (e.g. sshfs after macFUSE) see the updated state.
+        const updated = await getDependencyStatus();
+        setDeps(updated);
+      } catch (err) {
+        setResults((prev) => ({
+          ...prev,
+          [kind]: {
+            kind,
+            success: false,
+            output: String(err),
+            postInstallNote: null,
+          },
+        }));
+      }
     }
-  }, [deps, install]);
+    setInstalling(null);
+    // Final refresh to sync version strings and overall status.
+    await refresh();
+  }, [deps, refresh]);
 
   if (loading) {
     return <div className="dep-setup__loading">检查依赖中…</div>;

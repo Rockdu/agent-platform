@@ -127,8 +127,11 @@ pub fn check_all() -> Vec<DepInfo> {
     let claude_ver = simple_version("claude", "--version");
 
     let macfuse_ok = macfuse_installed();
-    let sshfs_ok = crate::ide_handoff::which_in_path("sshfs").is_some();
-    let sshfs_ver = brew_list_version("sshfs");
+    // Check both the standard sshfs and the macOS gromgit variant.
+    let sshfs_ok = crate::ide_handoff::which_in_path("sshfs").is_some()
+        || brew_list_version("gromgit/fuse/sshfs-mac").is_some();
+    let sshfs_ver = brew_list_version("gromgit/fuse/sshfs-mac")
+        .or_else(|| brew_list_version("sshfs"));
 
     vec![
         DepInfo {
@@ -199,13 +202,20 @@ pub async fn install_dependency(kind: DepKind) -> InstallResult {
         .find(|d| d.kind == kind)
         .and_then(|d| d.post_install_note.clone());
 
-    let (success, output) = match kind {
+    // Run the blocking brew command on the thread pool so we don't
+    // block the Tokio async executor (brew can take several minutes).
+    let kind_clone = kind.clone();
+    let (success, output) = tokio::task::spawn_blocking(move || match kind_clone {
         DepKind::Homebrew => install_homebrew(),
         DepKind::Tmux     => brew_install("tmux", false),
         DepKind::Claude   => brew_install("claude", false),
         DepKind::MacFuse  => brew_install("macfuse", true),
-        DepKind::Sshfs    => brew_install("sshfs", false),
-    };
+        // On macOS, the standard `brew install sshfs` fails (Linux only).
+        // Use the gromgit/fuse tap which provides a macOS-native build.
+        DepKind::Sshfs    => install_sshfs_macos(),
+    })
+    .await
+    .unwrap_or_else(|e| (false, format!("task panicked: {e}")));
 
     InstallResult { kind, success, output, post_install_note: post_note }
 }
@@ -215,6 +225,7 @@ fn brew_install(package: &str, is_cask: bool) -> (bool, String) {
         return (false, "Homebrew 未安装，请先安装 Homebrew".into());
     };
     let mut cmd = Command::new(&brew);
+    cmd.env("HOMEBREW_NO_ENV_HINTS", "1"); // suppress env hint noise
     if is_cask {
         cmd.args(["install", "--cask", package]);
     } else {
@@ -227,6 +238,49 @@ fn brew_install(package: &str, is_cask: bool) -> (bool, String) {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let combined = format!("{stdout}{stderr}").trim().to_string();
             (out.status.success(), combined)
+        }
+        Err(e) => (false, format!("spawn failed: {e}")),
+    }
+}
+
+/// On macOS, sshfs from Homebrew core requires Linux.
+/// Use the gromgit/fuse tap which maintains a macOS-native sshfs build.
+fn install_sshfs_macos() -> (bool, String) {
+    let Some(brew) = which_brew() else {
+        return (false, "Homebrew 未安装，请先安装 Homebrew".into());
+    };
+    if !macfuse_installed() {
+        return (false, "请先安装 macFUSE，然后允许内核扩展并重启，再安装 sshfs".into());
+    }
+    // 1. Add the tap
+    let tap = Command::new(&brew)
+        .args(["tap", "gromgit/fuse"])
+        .env("HOMEBREW_NO_ENV_HINTS", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    let tap_ok = tap.as_ref().map(|o| o.status.success()).unwrap_or(false);
+    if !tap_ok {
+        let err = tap.map(|o| {
+            let s = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let r = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            format!("{s}{r}")
+        }).unwrap_or_else(|e| e.to_string());
+        return (false, format!("brew tap gromgit/fuse 失败: {err}"));
+    }
+    // 2. Install sshfs-mac from the tap
+    let out = Command::new(&brew)
+        .args(["install", "gromgit/fuse/sshfs-mac"])
+        .env("HOMEBREW_NO_ENV_HINTS", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    match out {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let combined = format!("{stdout}{stderr}").trim().to_string();
+            (o.status.success(), combined)
         }
         Err(e) => (false, format!("spawn failed: {e}")),
     }
