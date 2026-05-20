@@ -1542,15 +1542,13 @@ function MultiTerminalContainer() {
     if (workspaces.length === 0) return;
     if (!adoptWorkspaceTabRef.current) return;
     sessionRestoredRef.current = true;
-    // Only restore workspaces that had an open tab when the app last
-    // quit (openTabId is set). Workspaces where the user explicitly
-    // clicked × (which calls close_workspace → clears openTabId) are
-    // left closed. Stashed workspaces are also restored but go into 暂存区.
+    // Restore all workspaces on startup. The × button closes the PTY
+    // session but the workspace stays in the registry (it's still your
+    // project). If you want a workspace to never come back, delete it.
+    // Stashed workspaces are also restored (they go into 暂存区).
     const adopt = adoptWorkspaceTabRef.current;
     for (const w of workspaces) {
-      if (w.openTabId != null || w.profile.stashed) {
-        void adopt(w);
-      }
+      void adopt(w);
     }
   }, [workspaces]);
 
