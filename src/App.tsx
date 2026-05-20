@@ -1482,6 +1482,27 @@ function MultiTerminalContainer() {
   // On a clean tab-close the backend clears openTabId, so only workspaces
   // that were open when the app last quit (or crashed) are restored.
   // tmux -A in the auto-launch command reattaches to any surviving session.
+  // Show the real error from failed auto-launches instead of
+  // the generic "asyncSpawnFailed → Disconnected".
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void listen<{ tabId: string; error: string }>(
+      "workspace://launch-error",
+      (event) => {
+        const { tabId, error } = event.payload;
+        setAutoLaunchErrorByTabId((prev) => ({
+          ...prev,
+          [tabId]: {
+            kind: "asyncSpawnFailed",
+            transportKind: "detail",
+            doneReason: error,
+          },
+        }));
+      },
+    ).then((fn) => { unlisten = fn; });
+    return () => { if (unlisten) unlisten(); };
+  }, []);
+
   // Listen for workspaces opened by Claude via the MCP tool
   // `agent_platform.open_workspace`. The backend emits this event
   // after registering/opening the workspace; the frontend adopts it

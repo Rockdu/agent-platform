@@ -624,18 +624,20 @@ impl LaunchExecutor for RealLaunchExecutor {
                     }
                 }
                 Err(err) => {
+                    let err_msg = err.to_string();
                     tracing::error!(
                         %workspace_id,
                         %tab_id,
-                        %err,
+                        error = %err_msg,
                         "auto-launch spawn failed"
                     );
-                    // The spawn itself failed (transport-level or
-                    // PTY-allocation error). Mirror the surface
-                    // behavior so the React tab stops waiting and
-                    // moves to Done. Local routing also benefits
-                    // because `spawn_into_registry` can fail (rare,
-                    // but possible for /bin/zsh missing etc.).
+                    // Emit the real error so the frontend can display it
+                    // instead of the generic "asyncSpawnFailed → Disconnected".
+                    use tauri::Emitter;
+                    let _ = app.emit("workspace://launch-error", serde_json::json!({
+                        "tabId": tab_id,
+                        "error": err_msg,
+                    }));
                     let kind = match routing {
                         workspace_launch_scheduler::TransportRouting::Local =>
                             crate::workspace_lifecycle::TransportKind::Local,
