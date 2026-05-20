@@ -1302,55 +1302,100 @@ interface RailSectionsProps {
 
 function RailSections(props: RailSectionsProps) {
   const { tabs, activeId, stashedTabIds, onSelect, onClose, onStash, onUnstash, onResume, onReorder, snapshotByTabId } = props;
-  const dragTabIdRef = useRef<string | null>(null);
+  // useState so drag state changes trigger re-renders (opacity, drop targets).
+  const [dragTabId, setDragTabId] = useState<string | null>(null);
+  // Per-section manual order. null = not yet manually reordered → use FIFO.
+  // Once set, manual order takes precedence so drag reorders aren't reverted.
+  const [sectionOrder, setSectionOrder] = useState<{
+    running: string[] | null;
+    done: string[] | null;
+    stashed: string[] | null;
+  }>({ running: null, done: null, stashed: null });
+  // Which section a dragged tab belongs to (so cross-section drops are rejected).
+  const dragSectionRef = useRef<"running" | "done" | "stashed" | null>(null);
 
-  const running: OpenTab[] = [];
-  const done: OpenTab[] = [];
-  const stashed: OpenTab[] = [];
+  const runningRaw: OpenTab[] = [];
+  const doneRaw: OpenTab[] = [];
+  const stashedRaw: OpenTab[] = [];
   for (const tab of tabs) {
     if (stashedTabIds.has(tab.tabId)) {
-      stashed.push(tab);
+      stashedRaw.push(tab);
       continue;
     }
     const snap = snapshotByTabId[tab.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
     if (snap.tabKind !== "Workspace") continue;
     if (snap.status === "Done" || !snap.agentBusy) {
-      done.push(tab);
+      doneRaw.push(tab);
     } else {
-      running.push(tab);
+      runningRaw.push(tab);
     }
   }
-  // FIFO ordering: ascending by signal arrival timestamp. Tabs whose
-  // snapshot has not yet been fetched fall back to lastActivity = 0,
-  // sorting them to the top of Running — they will jump into position
-  // once the bootstrap fetch resolves.
   const byActivity = (a: OpenTab, b: OpenTab): number => {
     const sa = snapshotByTabId[a.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
     const sb = snapshotByTabId[b.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
     return sa.lastActivityAtUnixMs - sb.lastActivityAtUnixMs;
   };
-  // 运行区: FIFO — earliest activity first (oldest task at top).
-  running.sort(byActivity);
-  // 完成区: oldest-completed first, newest at the bottom.
-  // Most recently returned tab appears last — easier to see
-  // what just finished without disrupting the existing order.
-  done.sort(byActivity);
+  // Apply section order: use manual order if set, otherwise FIFO sort.
+  const applyOrder = (raw: OpenTab[], order: string[] | null): OpenTab[] => {
+    if (!order) return [...raw].sort(byActivity);
+    const byId = new Map(raw.map((t) => [t.tabId, t]));
+    const ordered = order.flatMap((id) => { const t = byId.get(id); return t ? [t] : []; });
+    // Append any tabs not yet in order (newly added).
+    const inOrder = new Set(order);
+    for (const t of raw) { if (!inOrder.has(t.tabId)) ordered.push(t); }
+    return ordered;
+  };
+  const running = applyOrder(runningRaw, sectionOrder.running);
+  const done    = applyOrder(doneRaw,    sectionOrder.done);
+  const stashed = applyOrder(stashedRaw, sectionOrder.stashed);
 
-  const renderRow = (tab: OpenTab, isStashed: boolean) => {
+  const sectionOf = (tabId: string): "running" | "done" | "stashed" | null => {
+    if (runningRaw.some((t) => t.tabId === tabId)) return "running";
+    if (doneRaw.some((t)    => t.tabId === tabId)) return "done";
+    if (stashedRaw.some((t) => t.tabId === tabId)) return "stashed";
+    return null;
+  };
+
+  const renderRow = (tab: OpenTab, isStashed: boolean, section: "running" | "done" | "stashed") => {
     const snap = snapshotByTabId[tab.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
     const resumeOffered = !isStashed && canOfferResumeFromDone(snap);
     return (
       <div
         key={tab.tabId}
         draggable
-        onDragStart={() => { dragTabIdRef.current = tab.tabId; }}
+        onDragStart={() => {
+          setDragTabId(tab.tabId);
+          dragSectionRef.current = sectionOf(tab.tabId);
+        }}
+        onDragEnd={() => {
+          setDragTabId(null);
+          dragSectionRef.current = null;
+        }}
         onDragOver={(e) => { e.preventDefault(); }}
         onDrop={() => {
-          const from = dragTabIdRef.current;
-          if (from && from !== tab.tabId) onReorder(from, tab.tabId);
-          dragTabIdRef.current = null;
+          const from = dragTabId;
+          const fromSection = dragSectionRef.current;
+          setDragTabId(null);
+          dragSectionRef.current = null;
+          // Reject cross-section drops.
+          if (!from || from === tab.tabId || fromSection !== section) return;
+          onReorder(from, tab.tabId);
+          // Store the new order for this section so FIFO sort doesn't revert it.
+          setSectionOrder((prev) => {
+            const currentList = section === "running" ? running
+              : section === "done" ? done
+              : stashed;
+            const ids = currentList.map((t) => t.tabId);
+            const fromIdx = ids.indexOf(from);
+            const toIdx = ids.indexOf(tab.tabId);
+            if (fromIdx === -1 || toIdx === -1) return prev;
+            const next = [...ids];
+            const [moved] = next.splice(fromIdx, 1);
+            next.splice(toIdx, 0, moved);
+            return { ...prev, [section]: next };
+          });
         }}
-        style={{ opacity: dragTabIdRef.current === tab.tabId ? 0.5 : 1 }}
+        style={{ opacity: dragTabId === tab.tabId ? 0.5 : 1 }}
       >
         <WorkspaceRailRow
           tab={tab}
@@ -1373,14 +1418,14 @@ function RailSections(props: RailSectionsProps) {
           <span className="rail-section__label">完成区</span>
           <span className="rail-section__count">{done.length}</span>
         </header>
-        {done.map((t) => renderRow(t, false))}
+        {done.map((t) => renderRow(t, false, "done"))}
       </section>
       <section className="rail-section rail-section--running">
         <header className="rail-section__header">
           <span className="rail-section__label">运行区</span>
           <span className="rail-section__count">{running.length}</span>
         </header>
-        {running.map((t) => renderRow(t, false))}
+        {running.map((t) => renderRow(t, false, "running"))}
       </section>
       {stashed.length > 0 && (
         <section className="rail-section rail-section--stashed">
@@ -1388,7 +1433,7 @@ function RailSections(props: RailSectionsProps) {
             <span className="rail-section__label">暂存区</span>
             <span className="rail-section__count">{stashed.length}</span>
           </header>
-          {stashed.map((t) => renderRow(t, true))}
+          {stashed.map((t) => renderRow(t, true, "stashed"))}
         </section>
       )}
     </>
@@ -1542,13 +1587,12 @@ function MultiTerminalContainer() {
     if (workspaces.length === 0) return;
     if (!adoptWorkspaceTabRef.current) return;
     sessionRestoredRef.current = true;
-    // Restore all workspaces on startup. The × button closes the PTY
-    // session but the workspace stays in the registry (it's still your
-    // project). If you want a workspace to never come back, delete it.
-    // Stashed workspaces are also restored (they go into 暂存区).
+    // Only restore workspaces whose tab was open when the app last quit.
+    // × clears openTabId in the backend, so those workspaces stay in the
+    // registry (switcher list) but do NOT reopen automatically on restart.
     const adopt = adoptWorkspaceTabRef.current;
     for (const w of workspaces) {
-      void adopt(w);
+      if (w.openTabId != null) void adopt(w);
     }
   }, [workspaces]);
 
