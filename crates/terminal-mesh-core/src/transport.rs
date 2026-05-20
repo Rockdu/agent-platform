@@ -146,7 +146,7 @@ pub enum TransportError {
         message: String,
     },
     #[allow(dead_code)]
-    #[error("ssh shell did not start for {host}:{port} (ssh_exit={ssh_exit:?})")]
+    #[error("ssh shell did not start for {host}:{port} (ssh_exit={ssh_exit:?}): {stderr_tail}")]
     SshShellDidNotStart {
         host: String,
         port: u16,
