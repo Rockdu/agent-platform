@@ -127,10 +127,11 @@ struct ListTabsResult {
 struct OpenWorkspaceParams {
     client_id: String,
     /// Path to open. Formats supported:
-    ///   /local/path              → local workspace
-    ///   user@host:/remote/path  → SSH remote
-    ///   user@host:22:/path      → SSH remote with port
-    ///   host:/remote/path       → SSH remote (no user)
+    ///   /local/path                           → local workspace
+    ///   user@host:/remote/path               → SSH bare machine
+    ///   user@host:22:/path                   → SSH with port
+    ///   user@host:/path#container-id         → Docker container on SSH host
+    ///   user@host:/path#container-id:/cwd    → Docker with working dir in container
     path: String,
     /// Optional friendly name. Defaults to the last path component.
     name: Option<String>,
@@ -198,24 +199,46 @@ fn handle_open_workspace(
 
     let path_str = params.path.trim();
 
-    // Detect SSH path format: [user@]host:/remote/path
+    // Detect SSH or SSH+Docker path format
     let record = if let Some((user, host, port, remote_path)) = parse_ssh_path(path_str) {
-        use crate::workspaces::{SshLocation, validate_canonical_remote_path};
-        validate_canonical_remote_path(&remote_path).map_err(|e| JsonRpcError {
+        use crate::workspaces::{SshLocation, ContainerLocation, validate_canonical_remote_path};
+
+        // Check for Docker suffix: /remote/path#container-id or
+        // /remote/path#container-id:/cwd-in-container
+        let (actual_remote_path, container) = if let Some(hash) = remote_path.find('#') {
+            let rpath = remote_path[..hash].to_string();
+            let docker_part = &remote_path[hash + 1..];
+            let (container_id, cwd_in_container) = if let Some(colon) = docker_part.find(':') {
+                (docker_part[..colon].to_string(), Some(docker_part[colon + 1..].to_string()))
+            } else {
+                (docker_part.to_string(), None)
+            };
+            let c = crate::workspaces::ContainerLocation { container_id, cwd_in_container };
+            (rpath, Some(c))
+        } else {
+            (remote_path, None)
+        };
+
+        validate_canonical_remote_path(&actual_remote_path).map_err(|e| JsonRpcError {
             code: ERR_INVALID_PARAMS,
             message: format!("{e}"),
             data: None,
         })?;
         let name = params.name.unwrap_or_else(|| {
-            std::path::Path::new(&remote_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("remote-workspace")
-                .to_string()
+            // For Docker, prefer container-id as name; else last path component.
+            container.as_ref()
+                .map(|c| c.container_id.clone())
+                .or_else(|| {
+                    std::path::Path::new(&actual_remote_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| "remote-workspace".to_string())
         });
-        let ssh = SshLocation { user, host, port, canonical_remote_path: remote_path };
+        let ssh = SshLocation { user, host, port, canonical_remote_path: actual_remote_path };
         state.workspaces
-            .register_remote_workspace(&name, ssh, None, true)
+            .register_remote_workspace(&name, ssh, container, true)
             .or_else(|e| {
                 // If already registered, look it up instead of failing.
                 if matches!(e, crate::workspaces::WorkspaceError::CanonicalDuplicate { .. }) {

@@ -137,7 +137,7 @@ pub fn tools_list_response() -> Value {
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Path to open. Formats: '/local/path' for local, 'user@host:/remote/path' for SSH remote, 'user@host:22:/path' for SSH with port, 'host:/path' for SSH without user."
+                            "description": "Path to open. Formats:\n'/local/path' — local\n'user@host:/remote/path' — SSH remote\n'user@host:22:/path' — SSH with port\n'user@host:/path#container-id' — Docker container on SSH host\n'user@host:/path#container-id:/cwd' — Docker with working dir"
                         },
                         "name": {
                             "type": "string",
