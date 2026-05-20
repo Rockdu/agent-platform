@@ -169,8 +169,12 @@ pub fn compose_docker_remote_command(
     optional_exec: Option<&crate::transport::ShellCommand>,
 ) -> String {
     let inner = build_docker_wrapper_script(session_id, canonical_remote_path, optional_exec);
+    // Use -i (keep stdin open) without -t (no container TTY allocation).
+    // The PTY is already provided by the SSH transport layer; adding -t
+    // in docker exec causes "the input device is not a TTY" failures on
+    // hosts where the Docker daemon refuses TTY allocation inside exec.
     format!(
-        "docker exec -it {container} /bin/sh -lc {inner_quoted}",
+        "docker exec -i {container} /bin/sh -lc {inner_quoted}",
         container = shell_single_quote(container_id),
         inner_quoted = shell_single_quote(&inner),
     )
