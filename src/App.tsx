@@ -1302,7 +1302,9 @@ interface RailSectionsProps {
 
 function RailSections(props: RailSectionsProps) {
   const { tabs, activeId, stashedTabIds, onSelect, onClose, onStash, onUnstash, onResume, onReorder, snapshotByTabId } = props;
-  // useState so drag state changes trigger re-renders (opacity, drop targets).
+  // dragTabIdRef: source of truth for drag handlers (ref avoids stale closures).
+  // dragTabId state: mirrors the ref, exists only to trigger opacity re-renders.
+  const dragTabIdRef = useRef<string | null>(null);
   const [dragTabId, setDragTabId] = useState<string | null>(null);
   // Per-section manual order. null = not yet manually reordered → use FIFO.
   // Once set, manual order takes precedence so drag reorders aren't reverted.
@@ -1364,17 +1366,23 @@ function RailSections(props: RailSectionsProps) {
         key={tab.tabId}
         draggable
         onDragStart={() => {
+          dragTabIdRef.current = tab.tabId;
           setDragTabId(tab.tabId);
           dragSectionRef.current = sectionOf(tab.tabId);
         }}
         onDragEnd={() => {
+          dragTabIdRef.current = null;
           setDragTabId(null);
           dragSectionRef.current = null;
         }}
         onDragOver={(e) => { e.preventDefault(); }}
         onDrop={() => {
-          const from = dragTabId;
+          // Read from ref (not state) to avoid stale closure issues:
+          // the drop handler's closure may have been created before the
+          // dragStart state update flushed to a new render.
+          const from = dragTabIdRef.current;
           const fromSection = dragSectionRef.current;
+          dragTabIdRef.current = null;
           setDragTabId(null);
           dragSectionRef.current = null;
           // Reject cross-section drops.
@@ -1395,7 +1403,7 @@ function RailSections(props: RailSectionsProps) {
             return { ...prev, [section]: next };
           });
         }}
-        style={{ opacity: dragTabId === tab.tabId ? 0.5 : 1 }}
+        style={{ opacity: dragTabId === tab.tabId ? 0.4 : 1 }}
       >
         <WorkspaceRailRow
           tab={tab}
@@ -1588,11 +1596,13 @@ function MultiTerminalContainer() {
     if (!adoptWorkspaceTabRef.current) return;
     sessionRestoredRef.current = true;
     // Only restore workspaces whose tab was open when the app last quit.
-    // × clears openTabId in the backend, so those workspaces stay in the
-    // registry (switcher list) but do NOT reopen automatically on restart.
+    // profile.restoreOnStartup is a persistent flag: set by open_workspace,
+    // cleared by close_workspace (× button). Unlike openTabId it is NOT
+    // wiped on backend startup, so it reliably identifies which workspaces
+    // were open versus which were explicitly × closed.
     const adopt = adoptWorkspaceTabRef.current;
     for (const w of workspaces) {
-      if (w.openTabId != null) void adopt(w);
+      if (w.profile.restoreOnStartup) void adopt(w);
     }
   }, [workspaces]);
 

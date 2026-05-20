@@ -30,6 +30,7 @@ export interface WorkspaceProfile {
   autoLaunchClaude: boolean;
   claudeArgv: string[];
   stashed?: boolean;
+  restoreOnStartup?: boolean;
 }
 
 export interface WorkspaceRecord {

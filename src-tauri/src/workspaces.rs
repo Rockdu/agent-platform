@@ -74,6 +74,13 @@ pub struct WorkspaceProfile {
     /// auto-focus routing. Defaults to `false` for existing records.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stashed: bool,
+    /// Persistent session-restore signal. Set to `true` by `open_workspace`
+    /// and `false` by `close_workspace` (the × button). Unlike `open_tab_id`
+    /// this is NOT cleared on backend startup, so it survives across restarts
+    /// and tells the frontend which workspaces were open when the app last quit
+    /// (as opposed to ones the user explicitly closed with ×).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restore_on_startup: bool,
 }
 
 impl WorkspaceProfile {
@@ -82,6 +89,7 @@ impl WorkspaceProfile {
             auto_launch_claude: true,
             claude_argv: vec!["--dangerously-skip-permissions".to_string()],
             stashed: false,
+            restore_on_startup: false,
         }
     }
 }
@@ -425,6 +433,17 @@ impl WorkspaceRegistry {
                                 // path that would otherwise return
                                 // `AlreadyOpen` for a stale tab id
                                 // from the previous launch.
+                                //
+                                // Migration: records written before
+                                // `restore_on_startup` existed have
+                                // the field default-false but may have
+                                // a non-null `open_tab_id` from the
+                                // previous session. Promote them so the
+                                // first restart after the upgrade still
+                                // restores those workspaces.
+                                if r.open_tab_id.is_some() && !r.profile.restore_on_startup {
+                                    r.profile.restore_on_startup = true;
+                                }
                                 r.open_tab_id = None;
                                 Some((r.workspace_id, r))
                             }
@@ -760,9 +779,12 @@ impl WorkspaceRegistry {
             }
         }
         let now = now_rfc3339();
+        let mut profile = record.profile.clone();
+        profile.restore_on_startup = true;
         let updated = WorkspaceRecord {
             open_tab_id: Some(tab_id.to_string()),
             last_used_at: now,
+            profile,
             ..record
         };
         guard.records.insert(workspace_id, updated.clone());
@@ -842,6 +864,7 @@ impl WorkspaceRegistry {
             }
         })?;
         record.open_tab_id = None;
+        record.profile.restore_on_startup = false;
         guard.records.insert(workspace_id, record);
         Self::persist(&guard)?;
         Ok(())
@@ -2226,6 +2249,8 @@ mod tests {
             profile: WorkspaceProfile {
                 auto_launch_claude: false,
                 claude_argv: vec!["--print".into(), "hello".into()],
+                stashed: false,
+                restore_on_startup: false,
             },
             created_at: "2026-01-01T00:00:00Z".into(),
             last_used_at: "2026-01-02T00:00:00Z".into(),

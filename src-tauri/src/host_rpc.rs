@@ -71,7 +71,7 @@ pub struct HostRpcState {
     pub workspaces: crate::workspaces::WorkspaceRegistry,
     /// Needed to emit `workspace://agent-opened` when a Claude
     /// session calls `agentPlatform.openWorkspace`.
-    pub app_handle: tauri::AppHandle,
+    pub app_handle: Option<tauri::AppHandle>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -301,8 +301,10 @@ fn handle_open_workspace(
 
     // Emit an event so the frontend adopts this workspace as a new tab
     // and triggers auto-launch (with tmux + --continue).
-    if let Err(e) = state.app_handle.emit("workspace://agent-opened", &opened) {
-        tracing::warn!(error = %e, "failed to emit workspace://agent-opened");
+    if let Some(ref handle) = state.app_handle {
+        if let Err(e) = handle.emit("workspace://agent-opened", &opened) {
+            tracing::warn!(error = %e, "failed to emit workspace://agent-opened");
+        }
     }
 
     Ok(serde_json::to_value(OpenWorkspaceResult {
@@ -717,6 +719,7 @@ mod tests {
                 std::path::PathBuf::from("/tmp/host-rpc-test"),
                 None,
             ),
+            app_handle: None,
         };
         (state, resp.handle)
     }
@@ -1013,6 +1016,7 @@ mod tests {
                 std::path::PathBuf::from("/tmp/host-rpc-test"),
                 None,
             ),
+            app_handle: None,
         };
         (state, ws_tab_a, ws_tab_b, resp.handle)
     }
@@ -1076,6 +1080,7 @@ mod tests {
                 std::path::PathBuf::from("/tmp/host-rpc-spoof-test"),
                 None,
             ),
+            app_handle: None,
         };
 
         // Spoof the orchestrator's tab id from a regular client

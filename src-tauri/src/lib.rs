@@ -840,7 +840,7 @@ pub fn run() {
                                     mount_registry: mount_registry_handle,
                                     terminal_registry: terminal_registry_handle,
                                     workspaces: workspaces_handle,
-                                    app_handle: app.handle().clone(),
+                                    app_handle: Some(app.handle().clone()),
                                 },
                             );
                             tracing::info!(host_rpc_sock = %p.display(), "host_rpc bridge spawned");
