@@ -147,21 +147,21 @@ pub fn build_ssh_argv(
     }
     validate_ssh_destination_fragment(&location.host, "host")?;
     let port = location.port.unwrap_or(22);
-    // Forward the SSH agent socket so keys loaded in the user's
-    // keychain / ssh-agent are available inside Tauri. Tauri GUI
-    // processes may not inherit SSH_AUTH_SOCK from the shell, but
-    // ForwardAgent=yes lets the remote side use the local agent.
-    // For the LOCAL ssh auth, we use IdentityAgent=SSH_AUTH_SOCK
-    // to ensure the agent socket path from the environment is used.
-    let agent_sock = std::env::var("SSH_AUTH_SOCK")
-        .map(|s| format!("IdentityAgent={s}"))
-        .unwrap_or_else(|_| "IdentityAgent=none".to_string());
-    Ok(vec![
+    // Build SSH options. We deliberately do NOT override IdentityAgent
+    // so that ~/.ssh/config settings (UseKeychain, IdentityFile, etc.)
+    // are respected. If SSH_AUTH_SOCK is available in the environment
+    // we pass it explicitly so Tauri GUI processes (which may not
+    // inherit it from the shell) can still use the user's key agent.
+    let mut opts: Vec<String> = vec![
         "-tt".into(),
         "-o".into(),
         "BatchMode=yes".into(),
-        "-o".into(),
-        agent_sock,
+    ];
+    if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
+        opts.push("-o".into());
+        opts.push(format!("IdentityAgent={sock}"));
+    }
+    opts.extend([
         "-o".into(),
         "ControlMaster=auto".into(),
         "-o".into(),
@@ -181,7 +181,8 @@ pub fn build_ssh_argv(
         "--".into(),
         location.user_host(),
         compose_remote_command(wrapper_script),
-    ])
+    ]);
+    Ok(opts)
 }
 
 /// Wrap a multi-line wrapper script in a single shell-safe
