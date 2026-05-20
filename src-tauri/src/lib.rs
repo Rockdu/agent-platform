@@ -395,16 +395,22 @@ impl LaunchExecutor for RealLaunchExecutor {
                 let claude_cmd = auto_launch_command_for_routing(routing, &path)
                     .display()
                     .to_string();
+                // Enable mouse scrollback before creating/attaching to
+                // the session. tmux chains commands separated by ";".
+                // Mouse mode lets the user scroll up through tmux's
+                // scrollback buffer with the mouse wheel.
                 let mut args = vec![
+                    "set-option".to_string(),
+                    "-g".to_string(),
+                    "mouse".to_string(),
+                    "on".to_string(),
+                    ";".to_string(),
                     "new-session".to_string(),
                     "-A".to_string(), // attach if exists, create if not
                     "-s".to_string(),
                     session,
                     "--".to_string(), // end of tmux options
                     claude_cmd,
-                    // --continue resumes the last conversation for
-                    // this workspace directory; gracefully starts fresh
-                    // when no prior session exists.
                     "--continue".to_string(),
                 ];
                 args.extend(launch.claude_argv.iter().cloned());
