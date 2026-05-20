@@ -191,8 +191,12 @@ pub fn check_all() -> Vec<DepInfo> {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn get_dependency_status() -> Vec<DepInfo> {
-    check_all()
+pub async fn get_dependency_status() -> Vec<DepInfo> {
+    // Run all subprocess checks (brew list, which, etc.) on the thread
+    // pool so the main async executor is not blocked during the scan.
+    tokio::task::spawn_blocking(check_all)
+        .await
+        .unwrap_or_default()
 }
 
 #[tauri::command]
