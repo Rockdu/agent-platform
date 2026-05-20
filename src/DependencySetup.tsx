@@ -32,6 +32,7 @@ function kindToRust(kind: string): string {
     Homebrew: "Homebrew",
     Claude: "Claude",
     Tmux: "Tmux",
+    DockerCli: "DockerCli",
     MacFuse: "MacFuse",
     Sshfs: "Sshfs",
   };

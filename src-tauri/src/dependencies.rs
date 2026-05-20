@@ -19,6 +19,10 @@ pub enum DepKind {
     Homebrew,
     Tmux,
     Claude,
+    /// Docker CLI (no daemon). Required for DOCKER_HOST=ssh:// tunneling so
+    /// the Dev Containers extension can open remote containers in Cursor.
+    /// Install: brew install docker  (just the CLI, not Docker Desktop)
+    DockerCli,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +103,9 @@ pub fn check_all() -> Vec<DepInfo> {
             })
     });
 
+    let docker_ok = crate::ide_handoff::which_in_path("docker").is_some();
+    let docker_ver = simple_version("docker", "--version");
+
     let tmux_ok = crate::ide_handoff::which_in_path("tmux").is_some();
     let tmux_ver = simple_version("tmux", "-V");
 
@@ -135,6 +142,15 @@ pub fn check_all() -> Vec<DepInfo> {
             required: true,
             post_install_note: None,
         },
+        DepInfo {
+            kind: DepKind::DockerCli,
+            label: "Docker CLI".into(),
+            description: "Docker 命令行工具（不需要 Docker Desktop）。让 Cursor 通过 SSH 直接 attach 进远端容器所必需".into(),
+            installed: docker_ok,
+            version: docker_ver,
+            required: false,
+            post_install_note: Some("安装后 Cursor 的「Cursor 中打开」按钮可直接连进远端 Docker 容器".into()),
+        },
     ]
 }
 
@@ -158,9 +174,10 @@ pub async fn install_dependency(kind: DepKind) -> InstallResult {
 
     let kind_clone = kind.clone();
     let (success, output) = tokio::task::spawn_blocking(move || match kind_clone {
-        DepKind::Homebrew => install_homebrew(),
-        DepKind::Tmux     => brew_install("tmux", false),
-        DepKind::Claude   => brew_install("claude", false),
+        DepKind::Homebrew   => install_homebrew(),
+        DepKind::Tmux       => brew_install("tmux", false),
+        DepKind::Claude     => brew_install("claude", false),
+        DepKind::DockerCli  => brew_install("docker", false),
     })
     .await
     .unwrap_or_else(|e| (false, format!("task panicked: {e}")));
