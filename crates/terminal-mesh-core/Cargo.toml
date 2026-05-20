@@ -27,6 +27,7 @@ portable-pty = "0.9"
 sha2 = "0.10"
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
 tracing = "0.1"
+glob = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 # Used for SIGKILL escalation when portable-pty's ChildKiller (SIGHUP)

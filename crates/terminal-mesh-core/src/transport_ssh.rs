@@ -157,9 +157,39 @@ pub fn build_ssh_argv(
         "-o".into(),
         "BatchMode=yes".into(),
     ];
-    if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
+    // Prefer the SSH agent socket from the environment. If not set
+    // (Tauri GUI processes often don't inherit it from the shell),
+    // fall back to the macOS-specific UseKeychain option which reads
+    // key passphrases directly from the macOS Keychain — no agent needed.
+    // Ensure the SSH agent is reachable. Tauri GUI processes often
+    // don't inherit SSH_AUTH_SOCK from the shell. Try three sources:
+    // 1. $SSH_AUTH_SOCK from environment (set when launched from terminal)
+    // 2. macOS launchd agent glob (always available on macOS)
+    // 3. UseKeychain=yes (reads passphrase directly from macOS Keychain)
+    let agent_sock = std::env::var("SSH_AUTH_SOCK").ok().or_else(|| {
+        #[cfg(target_os = "macos")]
+        {
+            // The macOS SSH agent socket lives at a launchd-managed path.
+            // Glob it so GUI apps can reach the agent without SSH_AUTH_SOCK.
+            glob::glob("/private/tmp/com.apple.launchd.*/Listeners")
+                .ok()
+                .and_then(|mut it| it.next())
+                .and_then(|r| r.ok())
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+        }
+        #[cfg(not(target_os = "macos"))]
+        { None }
+    });
+    if let Some(sock) = agent_sock {
         opts.push("-o".into());
         opts.push(format!("IdentityAgent={sock}"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // UseKeychain=yes lets SSH retrieve passphrases from the macOS
+        // Keychain even without an agent socket.
+        opts.push("-o".into());
+        opts.push("UseKeychain=yes".into());
     }
     opts.extend([
         "-o".into(),
