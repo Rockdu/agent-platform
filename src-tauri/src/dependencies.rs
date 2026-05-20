@@ -212,7 +212,8 @@ pub async fn install_dependency(kind: DepKind) -> InstallResult {
         DepKind::Homebrew   => install_homebrew(),
         DepKind::Tmux       => brew_install("tmux", false),
         DepKind::Claude     => brew_install("claude", false),
-        DepKind::FuseT      => brew_install("fuse-t", true),
+        // fuse-t is a cask that may need sudo; open Terminal for it.
+        DepKind::FuseT      => brew_install_cask_via_terminal("fuse-t"),
         DepKind::FuseTSshfs => install_fuse_t_sshfs(),
     })
     .await
@@ -221,12 +222,17 @@ pub async fn install_dependency(kind: DepKind) -> InstallResult {
     InstallResult { kind, success, output, post_install_note: post_note }
 }
 
+/// Run `brew install [--cask] <package>` headlessly.
+/// Regular packages (tmux, fuse-t-sshfs) don't need sudo, so this
+/// works fine. Cask packages (fuse-t) may require sudo — call
+/// `brew_install_cask_via_terminal` for those instead.
 fn brew_install(package: &str, is_cask: bool) -> (bool, String) {
     let Some(brew) = which_brew() else {
         return (false, "Homebrew 未安装，请先安装 Homebrew".into());
     };
     let mut cmd = Command::new(&brew);
-    cmd.env("HOMEBREW_NO_ENV_HINTS", "1");
+    cmd.env("HOMEBREW_NO_ENV_HINTS", "1")
+       .env("NONINTERACTIVE", "1"); // suppress interactive prompts
     if is_cask {
         cmd.args(["install", "--cask", package]);
     } else {
@@ -241,6 +247,32 @@ fn brew_install(package: &str, is_cask: bool) -> (bool, String) {
             (out.status.success(), combined)
         }
         Err(e) => (false, format!("spawn failed: {e}")),
+    }
+}
+
+/// Install a cask that may require sudo by opening a Terminal window.
+/// Returns immediately; the user completes the install in Terminal.
+/// The frontend must poll `get_dependency_status` to detect completion.
+fn brew_install_cask_via_terminal(cask: &str) -> (bool, String) {
+    let Some(brew) = which_brew() else {
+        return (false, "Homebrew 未安装，请先安装 Homebrew".into());
+    };
+    let cmd = format!(
+        "{} install --cask {} && echo '✓ {} 安装完成'",
+        brew.display(), cask, cask
+    );
+    let result = Command::new("/usr/bin/osascript")
+        .args(["-e", &format!(r#"tell application "Terminal" to do script "{cmd}""#)])
+        .output();
+    match result {
+        Ok(o) if o.status.success() => (
+            true,
+            format!("已在 Terminal 中运行安装命令。完成后请回到 app 点「刷新状态」确认。"),
+        ),
+        _ => {
+            // Fallback: try headless (NONINTERACTIVE might work without sudo on newer macOS)
+            brew_install(cask, true)
+        }
     }
 }
 

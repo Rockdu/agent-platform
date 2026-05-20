@@ -59,6 +59,15 @@ export function DependencySetupView({ onAllInstalled }: { onAllInstalled?: () =>
     void refresh();
   }, [refresh]);
 
+  // Auto-poll every 3 s while an install is in progress so the
+  // status updates without needing a tab switch (e.g. cask installs
+  // that run in Terminal; we detect completion via polling).
+  useEffect(() => {
+    if (installing === null) return;
+    const id = setInterval(() => { void refresh(); }, 3000);
+    return () => clearInterval(id);
+  }, [installing, refresh]);
+
   const install = useCallback(
     async (kind: string) => {
       setInstalling(kind);
@@ -182,21 +191,36 @@ export function DependencySetupView({ onAllInstalled }: { onAllInstalled?: () =>
         })}
       </ul>
 
-      {anyMissing && (
-        <footer className="dep-setup__footer">
+      <footer className="dep-setup__footer">
+        <div className="dep-setup__footer-row">
+          {anyMissing && (
+            <button
+              type="button"
+              className="dep-setup__install-all-btn"
+              onClick={() => void installAll()}
+              disabled={installing !== null}
+            >
+              {installing !== null
+                ? `正在安装：${installing}…`
+                : "一键安装全部缺少的依赖"}
+            </button>
+          )}
           <button
             type="button"
-            className="dep-setup__install-all-btn"
-            onClick={() => void installAll()}
-            disabled={installing !== null}
+            className="dep-setup__refresh-btn"
+            onClick={() => void refresh()}
+            disabled={loading}
           >
-            {installing !== null ? "安装中…" : "一键安装全部缺少的依赖"}
+            ↻ 刷新状态
           </button>
+        </div>
+        {anyMissing && (
           <p className="dep-setup__hint">
-            需要已安装 Homebrew。macFUSE 安装后需在「系统设置 → 隐私与安全性」中允许内核扩展。
+            FUSE-T 安装时会打开 Terminal 窗口，在里面完成后点「刷新状态」确认。
+            其余依赖在后台安装，每 3 秒自动刷新。
           </p>
-        </footer>
-      )}
+        )}
+      </footer>
     </div>
   );
 }

@@ -1179,3 +1179,32 @@
   color: #666;
   line-height: 1.5;
 }
+.dep-setup__footer-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.dep-setup__install-all-btn {
+  flex: 1;
+  padding: 10px 0;
+  background: #1565c0;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.dep-setup__install-all-btn:hover:not(:disabled) { background: #1976d2; }
+.dep-setup__install-all-btn:disabled { opacity: 0.6; cursor: default; }
+.dep-setup__refresh-btn {
+  flex-shrink: 0;
+  padding: 10px 16px;
+  background: #333;
+  color: #ccc;
+  border: 1px solid #555;
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.dep-setup__refresh-btn:hover:not(:disabled) { background: #3a3a3a; color: #fff; }
+.dep-setup__refresh-btn:disabled { opacity: 0.5; }

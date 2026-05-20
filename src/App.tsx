@@ -305,9 +305,11 @@ export default function App() {
       </nav>
 
       <main className="tab-body">
-        {active.kind === "host" && active.id === "setup" && (
+        {/* DependencySetupView stays mounted so install state
+            (progress, results) survives switching to other tabs. */}
+        <div style={{ display: active.kind === "host" && active.id === "setup" ? "block" : "none" }}>
           <DependencySetupView />
-        )}
+        </div>
         {active.kind === "host" && active.id !== "setup" && (
           <OrchestratorPlaceholder
             agentPlatformPath={
