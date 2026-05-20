@@ -671,8 +671,8 @@ mod tests {
     fn compose_docker_remote_command_starts_with_docker_exec() {
         let cmd = compose_docker_remote_command("my-container", "sess-1", Some("/srv"), None);
         assert!(
-            cmd.starts_with("docker exec -it 'my-container' /bin/sh -lc '"),
-            "cmd should start with docker exec -it; got {cmd}"
+            cmd.starts_with("docker exec -i 'my-container' /bin/sh -lc '"),
+            "cmd should start with docker exec -i (no -t); got {cmd}"
         );
         assert!(cmd.ends_with('\''), "cmd should end with closing quote");
     }
