@@ -65,6 +65,7 @@ import {
   type WorkspaceRecord,
 } from "./workspaces";
 import { WorkspaceSwitcherModal } from "./WorkspaceSwitcherModal";
+import { DependencySetupView } from "./DependencySetup";
 import {
   notificationGetPermissionState,
   type PermissionStateDto,
@@ -96,7 +97,7 @@ type BootstrapState =
 // Host-owned tab identifiers. The orchestrator is host-owned and fixed
 // leftmost (not a plugin per the contract). Regular plugin tabs come from
 // PLUGIN_TABS (generated from plugins/*/plugin.toml).
-type HostTabId = "orchestrator";
+type HostTabId = "orchestrator" | "setup";
 type ActiveTab = { kind: "host"; id: HostTabId } | { kind: "plugin"; pluginId: string };
 
 const ORCHESTRATOR: { id: HostTabId; label: string; icon: string } = {
@@ -294,10 +295,20 @@ export default function App() {
             onClick={() => setActive({ kind: "plugin", pluginId: tab.pluginId })}
           />
         ))}
+        <TabButton
+          icon="⚙"
+          label="依赖"
+          privileged={false}
+          isActive={active.kind === "host" && active.id === "setup"}
+          onClick={() => setActive({ kind: "host", id: "setup" })}
+        />
       </nav>
 
       <main className="tab-body">
-        {active.kind === "host" && (
+        {active.kind === "host" && active.id === "setup" && (
+          <DependencySetupView />
+        )}
+        {active.kind === "host" && active.id !== "setup" && (
           <OrchestratorPlaceholder
             agentPlatformPath={
               bootstrap.kind === "ok" ? bootstrap.paths.agent_platform : null

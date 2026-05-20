@@ -1061,3 +1061,121 @@
 .workspace-switcher-modal__row-action--danger:hover:not(:disabled) {
   background: #e74c3c;
 }
+
+/* ── Dependency Setup Screen ───────────────────────────── */
+.dep-setup {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 24px 20px;
+  color: #e0e0e0;
+}
+.dep-setup__loading { padding: 32px; text-align: center; color: #888; }
+.dep-setup__header { margin-bottom: 20px; }
+.dep-setup__header h2 { margin: 0 0 6px; font-size: 18px; }
+.dep-setup__subtitle { margin: 0; font-size: 13px; color: #aaa; }
+
+.dep-setup__list {
+  list-style: none;
+  margin: 0 0 20px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.dep-setup__item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: #252525;
+  border: 1px solid #333;
+}
+.dep-setup__item--ok      { border-color: #2a4a2a; background: #1e2e1e; }
+.dep-setup__item--missing  { border-color: #4a2a2a; background: #2e1e1e; }
+.dep-setup__item--optional { border-color: #333; }
+
+.dep-setup__item-left { display: flex; align-items: flex-start; gap: 12px; flex: 1; min-width: 0; }
+.dep-setup__status {
+  font-size: 16px;
+  margin-top: 1px;
+  flex-shrink: 0;
+  width: 20px;
+  text-align: center;
+}
+.dep-setup__item--ok .dep-setup__status { color: #4caf50; }
+.dep-setup__item--missing .dep-setup__status { color: #e53935; }
+.dep-setup__item--optional .dep-setup__status { color: #666; }
+
+.dep-setup__name {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 3px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.dep-setup__badge {
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: 10px;
+}
+.dep-setup__badge--required { background: #4a2a2a; color: #ff8a80; }
+.dep-setup__badge--optional { background: #333; color: #888; }
+.dep-setup__desc { font-size: 12px; color: #888; line-height: 1.5; }
+.dep-setup__version { font-size: 11px; color: #4caf50; margin-top: 3px; }
+.dep-setup__output {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: #aaa;
+  background: #1a1a1a;
+  padding: 6px 8px;
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 120px;
+  overflow-y: auto;
+}
+.dep-setup__note {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #ffb300;
+  background: #2a2200;
+  padding: 6px 8px;
+  border-radius: 4px;
+}
+
+.dep-setup__install-btn {
+  flex-shrink: 0;
+  padding: 5px 14px;
+  border: 1px solid #555;
+  background: #333;
+  color: #e0e0e0;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.dep-setup__install-btn:hover:not(:disabled) { background: #444; }
+.dep-setup__install-btn:disabled { opacity: 0.5; cursor: default; }
+
+.dep-setup__footer { margin-top: 4px; }
+.dep-setup__install-all-btn {
+  width: 100%;
+  padding: 10px 0;
+  background: #1565c0;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.dep-setup__install-all-btn:hover:not(:disabled) { background: #1976d2; }
+.dep-setup__install-all-btn:disabled { opacity: 0.5; cursor: default; }
+.dep-setup__hint {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: #666;
+  line-height: 1.5;
+}

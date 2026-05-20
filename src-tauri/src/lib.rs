@@ -11,6 +11,7 @@ mod dispatcher;
 mod host_rpc;
 mod notification;
 mod generated;
+mod dependencies;
 mod ide_handoff;
 mod sshfs_mount;
 mod logging;
@@ -969,6 +970,8 @@ pub fn run() {
             workspaces::stash_workspace,
             workspaces::unstash_workspace,
             workspaces::delete_workspace,
+            dependencies::get_dependency_status,
+            dependencies::install_dependency,
             workspaces::resolve_workspace_for_tab,
             workspace_launch_scheduler::request_workspace_auto_launch,
             ide_handoff::ide_get_preference,

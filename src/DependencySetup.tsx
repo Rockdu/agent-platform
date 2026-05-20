@@ -1,0 +1,177 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+
+interface DepInfo {
+  kind: string;
+  label: string;
+  description: string;
+  installed: boolean;
+  version: string | null;
+  required: boolean;
+  postInstallNote: string | null;
+}
+
+interface InstallResult {
+  kind: string;
+  success: boolean;
+  output: string;
+  postInstallNote: string | null;
+}
+
+async function getDependencyStatus(): Promise<DepInfo[]> {
+  return invoke<DepInfo[]>("get_dependency_status");
+}
+
+async function installDependency(kind: string): Promise<InstallResult> {
+  return invoke<InstallResult>("install_dependency", { kind: kindToRust(kind) });
+}
+
+// Map camelCase frontend kind → Rust enum variant name
+function kindToRust(kind: string): string {
+  const map: Record<string, string> = {
+    Homebrew: "Homebrew",
+    Claude: "Claude",
+    Tmux: "Tmux",
+    MacFuse: "MacFuse",
+    Sshfs: "Sshfs",
+  };
+  return map[kind] ?? kind;
+}
+
+export function DependencySetupView({ onAllInstalled }: { onAllInstalled?: () => void }) {
+  const [deps, setDeps] = useState<DepInfo[]>([]);
+  const [installing, setInstalling] = useState<string | null>(null);
+  const [results, setResults] = useState<Record<string, InstallResult>>({});
+  const [loading, setLoading] = useState(true);
+  const onAllInstalledRef = useRef(onAllInstalled);
+  onAllInstalledRef.current = onAllInstalled;
+
+  const refresh = useCallback(async () => {
+    const list = await getDependencyStatus();
+    setDeps(list);
+    setLoading(false);
+    if (list.every((d) => !d.required || d.installed)) {
+      onAllInstalledRef.current?.();
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const install = useCallback(
+    async (kind: string) => {
+      setInstalling(kind);
+      try {
+        const result = await installDependency(kind);
+        setResults((prev) => ({ ...prev, [kind]: result }));
+        await refresh();
+      } finally {
+        setInstalling(null);
+      }
+    },
+    [refresh],
+  );
+
+  const installAll = useCallback(async () => {
+    const missing = deps.filter((d) => !d.installed);
+    for (const dep of missing) {
+      await install(dep.kind);
+    }
+  }, [deps, install]);
+
+  if (loading) {
+    return <div className="dep-setup__loading">检查依赖中…</div>;
+  }
+
+  const allOk = deps.every((d) => d.installed);
+  const requiredMissing = deps.filter((d) => d.required && !d.installed);
+  const anyMissing = deps.some((d) => !d.installed);
+
+  return (
+    <div className="dep-setup">
+      <header className="dep-setup__header">
+        <h2>环境依赖</h2>
+        <p className="dep-setup__subtitle">
+          {allOk
+            ? "所有依赖已安装 ✓"
+            : requiredMissing.length > 0
+              ? `缺少 ${requiredMissing.length} 个必要依赖`
+              : "可选依赖未安装（部分功能不可用）"}
+        </p>
+      </header>
+
+      <ul className="dep-setup__list">
+        {deps.map((dep) => {
+          const result = results[dep.kind];
+          const busy = installing === dep.kind;
+          return (
+            <li
+              key={dep.kind}
+              className={`dep-setup__item ${dep.installed ? "dep-setup__item--ok" : dep.required ? "dep-setup__item--missing" : "dep-setup__item--optional"}`}
+            >
+              <div className="dep-setup__item-left">
+                <span className="dep-setup__status">
+                  {dep.installed ? "✓" : dep.required ? "✗" : "–"}
+                </span>
+                <div>
+                  <div className="dep-setup__name">
+                    {dep.label}
+                    {dep.required && (
+                      <span className="dep-setup__badge dep-setup__badge--required">
+                        必须
+                      </span>
+                    )}
+                    {!dep.required && (
+                      <span className="dep-setup__badge dep-setup__badge--optional">
+                        可选
+                      </span>
+                    )}
+                  </div>
+                  <div className="dep-setup__desc">{dep.description}</div>
+                  {dep.version && (
+                    <div className="dep-setup__version">{dep.version}</div>
+                  )}
+                  {result && (
+                    <pre className="dep-setup__output">{result.output}</pre>
+                  )}
+                  {result?.postInstallNote && (
+                    <div className="dep-setup__note">
+                      ⚠ {result.postInstallNote}
+                    </div>
+                  )}
+                </div>
+              </div>
+              {!dep.installed && (
+                <button
+                  type="button"
+                  className="dep-setup__install-btn"
+                  onClick={() => void install(dep.kind)}
+                  disabled={busy || installing !== null}
+                >
+                  {busy ? "安装中…" : "安装"}
+                </button>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+
+      {anyMissing && (
+        <footer className="dep-setup__footer">
+          <button
+            type="button"
+            className="dep-setup__install-all-btn"
+            onClick={() => void installAll()}
+            disabled={installing !== null}
+          >
+            {installing !== null ? "安装中…" : "一键安装全部缺少的依赖"}
+          </button>
+          <p className="dep-setup__hint">
+            需要已安装 Homebrew。macFUSE 安装后需在「系统设置 → 隐私与安全性」中允许内核扩展。
+          </p>
+        </footer>
+      )}
+    </div>
+  );
+}
