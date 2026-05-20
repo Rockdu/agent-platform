@@ -126,7 +126,11 @@ struct ListTabsResult {
 #[serde(rename_all = "camelCase")]
 struct OpenWorkspaceParams {
     client_id: String,
-    /// Local filesystem path to open. Must be an absolute directory.
+    /// Path to open. Formats supported:
+    ///   /local/path              → local workspace
+    ///   user@host:/remote/path  → SSH remote
+    ///   user@host:22:/path      → SSH remote with port
+    ///   host:/remote/path       → SSH remote (no user)
     path: String,
     /// Optional friendly name. Defaults to the last path component.
     name: Option<String>,
@@ -146,50 +150,118 @@ struct OpenWorkspaceResult {
 ///
 /// Any caller with a valid `clientId` (ordinary workspace Claudes
 /// included) may call this — the Unix socket is already local-only.
+/// Parse `user@host:/path`, `user@host:22:/path`, or `host:/path`
+/// into (user, host, port, remote_path). Returns None if the path
+/// doesn't look like an SSH target (no colon after the host part).
+fn parse_ssh_path(s: &str) -> Option<(Option<String>, String, Option<u16>, String)> {
+    // Must contain a colon not at position 0, and the colon must be
+    // followed by a '/' (the remote path starts with /).
+    // Pattern: [user@]host[:port]:/remote/path
+    let colon_slash = s.find(":/")?;
+    let before = &s[..colon_slash];
+    let remote_path = s[colon_slash + 1..].to_string(); // includes leading /
+
+    // Split before into [user@]host[:port]
+    let (user, host_port) = if let Some(at) = before.find('@') {
+        (Some(before[..at].to_string()), &before[at + 1..])
+    } else {
+        (None, before)
+    };
+
+    let (host, port) = if let Some(colon) = host_port.rfind(':') {
+        // Check if the part after the colon looks like a port number
+        let maybe_port = &host_port[colon + 1..];
+        if let Ok(p) = maybe_port.parse::<u16>() {
+            (host_port[..colon].to_string(), Some(p))
+        } else {
+            (host_port.to_string(), None)
+        }
+    } else {
+        (host_port.to_string(), None)
+    };
+
+    if host.is_empty() || remote_path.is_empty() {
+        return None;
+    }
+    Some((user, host, port, remote_path))
+}
+
 fn handle_open_workspace(
     state: &HostRpcState,
     params: OpenWorkspaceParams,
 ) -> Result<Value, JsonRpcError> {
-    // Validate the caller has a parseable clientId (basic sanity check).
     ClientId::parse(&params.client_id).map_err(|e| JsonRpcError {
         code: ERR_INVALID_CLIENT_ID,
         message: format!("invalid clientId: {e:?}"),
         data: None,
     })?;
 
-    let path = std::path::Path::new(&params.path);
-    // Must be an absolute canonical local path.
-    if !path.is_absolute() {
-        return Err(JsonRpcError {
-            code: ERR_INVALID_PARAMS,
-            message: "path must be absolute".into(),
-            data: None,
-        });
-    }
-    if !path.is_dir() {
-        return Err(JsonRpcError {
-            code: ERR_INVALID_PARAMS,
-            message: format!("not a directory: {}", params.path),
-            data: None,
-        });
-    }
+    let path_str = params.path.trim();
 
-    // Find existing workspace for this path or register a new one.
-    let name = params.name.unwrap_or_else(|| {
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("workspace")
-            .to_string()
-    });
-
-    let record = state
-        .workspaces
-        .find_or_register_local(path, &name)
-        .map_err(|e| JsonRpcError {
+    // Detect SSH path format: [user@]host:/remote/path
+    let record = if let Some((user, host, port, remote_path)) = parse_ssh_path(path_str) {
+        use crate::workspaces::{SshLocation, validate_canonical_remote_path};
+        validate_canonical_remote_path(&remote_path).map_err(|e| JsonRpcError {
             code: ERR_INVALID_PARAMS,
-            message: format!("workspace error: {e}"),
+            message: format!("{e}"),
             data: None,
         })?;
+        let name = params.name.unwrap_or_else(|| {
+            std::path::Path::new(&remote_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("remote-workspace")
+                .to_string()
+        });
+        let ssh = SshLocation { user, host, port, canonical_remote_path: remote_path };
+        state.workspaces
+            .register_remote_workspace(&name, ssh, None, true)
+            .or_else(|e| {
+                // If already registered, look it up instead of failing.
+                if matches!(e, crate::workspaces::WorkspaceError::CanonicalDuplicate { .. }) {
+                    if let crate::workspaces::WorkspaceError::CanonicalDuplicate { existing_workspace_id, .. } = e {
+                        state.workspaces.find_by_id(existing_workspace_id)
+                            .ok_or_else(|| crate::workspaces::WorkspaceError::NotFound {
+                                workspace_id: existing_workspace_id.to_string(),
+                            })
+                    } else { Err(e) }
+                } else { Err(e) }
+            })
+            .map_err(|e| JsonRpcError {
+                code: ERR_INVALID_PARAMS,
+                message: format!("workspace error: {e}"),
+                data: None,
+            })?
+    } else {
+        // Local path
+        let path = std::path::Path::new(path_str);
+        if !path.is_absolute() {
+            return Err(JsonRpcError {
+                code: ERR_INVALID_PARAMS,
+                message: "path must be absolute or SSH format (user@host:/path)".into(),
+                data: None,
+            });
+        }
+        if !path.is_dir() {
+            return Err(JsonRpcError {
+                code: ERR_INVALID_PARAMS,
+                message: format!("not a directory: {path_str}"),
+                data: None,
+            });
+        }
+        let name = params.name.unwrap_or_else(|| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("workspace")
+                .to_string()
+        });
+        state.workspaces.find_or_register_local(path, &name)
+            .map_err(|e| JsonRpcError {
+                code: ERR_INVALID_PARAMS,
+                message: format!("workspace error: {e}"),
+                data: None,
+            })?
+    };
 
     let workspace_id = record.workspace_id;
     let tab_id = workspace_id.to_string();

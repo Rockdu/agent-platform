@@ -131,13 +131,13 @@ pub fn tools_list_response() -> Value {
             },
             {
                 "name": "agent_platform.open_workspace",
-                "description": "Open a local workspace directory as a new agent tab. Creates the workspace record if it does not exist, then auto-launches Claude Code inside it. Returns the workspace_id and tab_id.",
+                "description": "Open a workspace as a new agent tab and auto-launch Claude Code inside it. Supports local paths and remote SSH machines. Returns workspace_id and tab_id.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Absolute local filesystem path to the workspace directory"
+                            "description": "Path to open. Formats: '/local/path' for local, 'user@host:/remote/path' for SSH remote, 'user@host:22:/path' for SSH with port, 'host:/path' for SSH without user."
                         },
                         "name": {
                             "type": "string",
