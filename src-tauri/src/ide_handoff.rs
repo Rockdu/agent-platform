@@ -560,11 +560,25 @@ pub fn ide_open_docker_workspace(
         }));
     };
 
+    // On macOS, environment variables set on a spawned process are NOT
+    // propagated through Electron's internal subprocess chain (the Dev
+    // Containers extension spawns `docker` via Node.js, which resets the
+    // env from the launchd session). Use `launchctl setenv` to inject
+    // DOCKER_HOST into the GUI session environment so all GUI apps and
+    // their subprocesses (including Cursor's extension host) can see it.
+    #[cfg(target_os = "macos")]
+    if let Some(ref dh) = docker_host {
+        let _ = std::process::Command::new("launchctl")
+            .args(["setenv", "DOCKER_HOST", dh])
+            .status();
+    }
+
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg("--folder-uri").arg(&folder_uri)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // Also set on the spawned process as a belt-and-suspenders fallback.
     if let Some(dh) = docker_host {
         cmd.env("DOCKER_HOST", dh);
     }
