@@ -996,6 +996,7 @@ pub fn run() {
             workspaces::close_workspace,
             workspaces::stash_workspace,
             workspaces::unstash_workspace,
+            workspaces::rename_workspace,
             workspaces::delete_workspace,
             dependencies::get_dependency_status,
             dependencies::install_dependency,

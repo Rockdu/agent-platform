@@ -339,6 +339,14 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.rail-row__label--editing {
+  cursor: text;
+  outline: none;
+  border-bottom: 1px solid #888;
+  border-radius: 0;
+  padding: 0 2px;
+  background: rgba(255,255,255,0.06);
+}
 .rail-row__status-badge {
   flex: 0 0 auto;
   padding: 1px 6px;

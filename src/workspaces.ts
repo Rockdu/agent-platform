@@ -212,6 +212,10 @@ export async function requestWorkspaceAutoLaunch(
   });
 }
 
+export async function renameWorkspace(workspaceId: string, newName: string): Promise<void> {
+  await invoke<void>("rename_workspace", { workspaceId, newName });
+}
+
 export async function stashWorkspace(workspaceId: string): Promise<void> {
   await invoke<void>("stash_workspace", { workspaceId });
 }

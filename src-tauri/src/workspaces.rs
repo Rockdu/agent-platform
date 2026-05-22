@@ -196,6 +196,7 @@ pub enum WorkspaceError {
     /// identifies which input the frontend should highlight.
     #[error("remote field `{field}` invalid: {reason}")]
     RemoteFieldInvalid { field: String, reason: String },
+
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -856,6 +857,28 @@ impl WorkspaceRegistry {
         Self::persist(&guard)
     }
 
+    pub fn rename_workspace(
+        &self,
+        workspace_id: Uuid,
+        new_name: String,
+    ) -> Result<(), WorkspaceError> {
+        let trimmed = new_name.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(WorkspaceError::InvalidName {
+                reason: "workspace name must not be empty".to_string(),
+            });
+        }
+        let mut guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
+        let mut record = guard.records.get(&workspace_id).cloned().ok_or_else(|| {
+            WorkspaceError::NotFound {
+                workspace_id: workspace_id.to_string(),
+            }
+        })?;
+        record.name = trimmed;
+        guard.records.insert(workspace_id, record);
+        Self::persist(&guard)
+    }
+
     pub fn close_workspace(&self, workspace_id: Uuid) -> Result<(), WorkspaceError> {
         let mut guard = self.inner.lock().expect("WorkspaceRegistry poisoned");
         let mut record = guard.records.get(&workspace_id).cloned().ok_or_else(|| {
@@ -1448,6 +1471,18 @@ pub async fn stash_workspace(
 ) -> Result<(), WorkspaceErrorDto> {
     let id = parse_workspace_id(&workspace_id)?;
     registry.update_profile(id, |p| p.stashed = true)
+        .map_err(|e| WorkspaceErrorDto::from(&e))
+}
+
+#[tauri::command]
+pub async fn rename_workspace(
+    workspace_id: String,
+    new_name: String,
+    registry: State<'_, WorkspaceRegistry>,
+) -> Result<(), WorkspaceErrorDto> {
+    let id = parse_workspace_id(&workspace_id)?;
+    registry
+        .rename_workspace(id, new_name)
         .map_err(|e| WorkspaceErrorDto::from(&e))
 }
 

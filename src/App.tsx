@@ -51,6 +51,7 @@ import {
 import {
   closeWorkspace,
   deleteWorkspace,
+  renameWorkspace,
   stashWorkspace,
   unstashWorkspace,
   isAutoLaunchErrorDto,
@@ -1183,19 +1184,30 @@ interface WorkspaceRailRowProps {
   isActive: boolean;
   onSelect: (tabId: string) => void;
   onClose: (tabId: string) => void;
-  // When the row is in the Done section, the parent passes a resume
-  // handler that brings the tab back into focus; the user's first
-  // keystroke afterwards flows through `writeTerminalStdin(...,
-  // userInitiated=true)` and that is what actually transitions the
-  // snapshot back to Running. The click on its own does not mutate
-  // lifecycle.
+  onRename: (tabId: string, newName: string) => void;
   doneAffordance?: () => void;
   stashAffordance?: () => void;
   unstashAffordance?: () => void;
 }
 
 function WorkspaceRailRow(props: WorkspaceRailRowProps) {
-  const { tab, snapshot, isActive, onSelect, onClose, doneAffordance, stashAffordance, unstashAffordance } = props;
+  const { tab, snapshot, isActive, onSelect, onClose, onRename, doneAffordance, stashAffordance, unstashAffordance } = props;
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const startEdit = () => {
+    setDraft(tab.workspaceName);
+    setEditing(true);
+    // Focus after render
+    setTimeout(() => inputRef.current?.select(), 0);
+  };
+  const commitEdit = () => {
+    setEditing(false);
+    const trimmed = draft.trim();
+    if (trimmed && trimmed !== tab.workspaceName) onRename(tab.tabId, trimmed);
+  };
+  const cancelEdit = () => { setEditing(false); };
   const icon = transportKindIcon(snapshot.transportKind);
   const transportLabel = transportKindLabel(snapshot.transportKind);
   const isDone = snapshot.status === "Done";
@@ -1225,16 +1237,33 @@ function WorkspaceRailRow(props: WorkspaceRailRowProps) {
       >
         {icon}
       </span>
-      <button
-        type="button"
-        role="tab"
-        aria-selected={isActive}
-        className="rail-row__label"
-        onClick={() => onSelect(tab.tabId)}
-        title={rowTitle}
-      >
-        {tab.workspaceName}
-      </button>
+      {editing ? (
+        <input
+          ref={inputRef}
+          className="rail-row__label rail-row__label--editing"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commitEdit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") { e.preventDefault(); commitEdit(); }
+            if (e.key === "Escape") { e.preventDefault(); cancelEdit(); }
+          }}
+          onClick={(e) => e.stopPropagation()}
+          autoFocus
+        />
+      ) : (
+        <button
+          type="button"
+          role="tab"
+          aria-selected={isActive}
+          className="rail-row__label"
+          onClick={() => onSelect(tab.tabId)}
+          onDoubleClick={(e) => { e.stopPropagation(); startEdit(); }}
+          title={`${rowTitle}（双击重命名）`}
+        >
+          {tab.workspaceName}
+        </button>
+      )}
       <span
         className={`rail-row__status-badge rail-row__status-badge--${badge.modifier}`}
         aria-label={`状态：${badge.label}`}
@@ -1297,11 +1326,12 @@ interface RailSectionsProps {
   onUnstash: (tabId: string) => void;
   onResume: (tabId: string) => void;
   onReorder: (tabId: string, afterTabId: string | null) => void;
+  onRename: (tabId: string, newName: string) => void;
   snapshotByTabId: Readonly<Record<string, WorkspaceLifecycleSnapshot>>;
 }
 
 function RailSections(props: RailSectionsProps) {
-  const { tabs, activeId, stashedTabIds, onSelect, onClose, onStash, onUnstash, onResume, onReorder, snapshotByTabId } = props;
+  const { tabs, activeId, stashedTabIds, onSelect, onClose, onStash, onUnstash, onResume, onReorder, onRename, snapshotByTabId } = props;
   // dragTabIdRef: source of truth for drag handlers (ref avoids stale closures).
   // dragTabId state: mirrors the ref, exists only to trigger opacity re-renders.
   const dragTabIdRef = useRef<string | null>(null);
@@ -1362,6 +1392,7 @@ function RailSections(props: RailSectionsProps) {
     const snap = snapshotByTabId[tab.tabId] ?? DEFAULT_LIFECYCLE_SNAPSHOT;
     const resumeOffered = !isStashed && canOfferResumeFromDone(snap);
     return (
+
       <div
         key={tab.tabId}
         draggable
@@ -1411,6 +1442,7 @@ function RailSections(props: RailSectionsProps) {
           isActive={activeId === tab.tabId}
           onSelect={onSelect}
           onClose={onClose}
+          onRename={onRename}
           doneAffordance={resumeOffered ? () => onResume(tab.tabId) : undefined}
           stashAffordance={isStashed ? undefined : () => onStash(tab.tabId)}
           unstashAffordance={isStashed ? () => onUnstash(tab.tabId) : undefined}
@@ -1663,6 +1695,21 @@ function MultiTerminalContainer() {
       });
     },
     [],
+  );
+
+  const renameTab = useCallback(
+    (tabId: string, newName: string) => {
+      const target = tabs.find((t) => t.tabId === tabId);
+      if (!target) return;
+      void renameWorkspace(target.workspaceId, newName).then(() => {
+        setTabs((prev) =>
+          prev.map((t) =>
+            t.tabId === tabId ? { ...t, workspaceName: newName } : t,
+          ),
+        );
+      });
+    },
+    [tabs],
   );
 
   const stashTab = useCallback(
@@ -2026,6 +2073,7 @@ function MultiTerminalContainer() {
           onUnstash={(id) => void unstashTab(id)}
           onReorder={reorderTab}
           onResume={focusTerminal}
+          onRename={renameTab}
           snapshotByTabId={snapshotByTabId}
         />
         <button
