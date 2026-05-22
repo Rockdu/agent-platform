@@ -399,11 +399,31 @@ impl LaunchExecutor for RealLaunchExecutor {
                 // the session. tmux chains commands separated by ";".
                 // Mouse mode lets the user scroll up through tmux's
                 // scrollback buffer with the mouse wheel.
+                //
+                // Also bind copy-mode mouse drag to pbcopy so that
+                // selecting text with the mouse writes to the macOS
+                // system clipboard. Without this, tmux stores the
+                // selection in its internal buffer only, making it
+                // impossible to paste outside the terminal.
                 let mut args = vec![
                     "set-option".to_string(),
                     "-g".to_string(),
                     "mouse".to_string(),
                     "on".to_string(),
+                    ";".to_string(),
+                    // vi copy-mode (used when mode-keys is vi)
+                    "bind-key".to_string(),
+                    "-T".to_string(), "copy-mode-vi".to_string(),
+                    "MouseDragEnd1Pane".to_string(),
+                    "send-keys".to_string(), "-X".to_string(),
+                    "copy-pipe-and-cancel".to_string(), "pbcopy".to_string(),
+                    ";".to_string(),
+                    // emacs copy-mode (default mode-keys)
+                    "bind-key".to_string(),
+                    "-T".to_string(), "copy-mode".to_string(),
+                    "MouseDragEnd1Pane".to_string(),
+                    "send-keys".to_string(), "-X".to_string(),
+                    "copy-pipe-and-cancel".to_string(), "pbcopy".to_string(),
                     ";".to_string(),
                     "new-session".to_string(),
                     "-A".to_string(), // attach if exists, create if not
