@@ -2005,6 +2005,17 @@ function MultiTerminalContainer() {
         role="tablist"
         aria-orientation="vertical"
       >
+        <div className="terminal-mesh-container__rail-header">
+          <button
+            type="button"
+            className={`terminal-mesh-container__lock${focusLocked ? " terminal-mesh-container__lock--on" : ""}`}
+            onClick={() => setFocusLocked((v) => !v)}
+            title={focusLocked ? "锁定中：点击解除，自动跳到下一个终端" : "点击锁定：停留在当前终端"}
+            aria-label={focusLocked ? "解除锁定" : "锁定当前终端"}
+          >
+            {focusLocked ? "🔒" : "🔓"}
+          </button>
+        </div>
         <RailSections
           tabs={tabs}
           activeId={activeId}
@@ -2017,15 +2028,6 @@ function MultiTerminalContainer() {
           onResume={focusTerminal}
           snapshotByTabId={snapshotByTabId}
         />
-        <button
-          type="button"
-          className={`terminal-mesh-container__lock${focusLocked ? " terminal-mesh-container__lock--on" : ""}`}
-          onClick={() => setFocusLocked((v) => !v)}
-          title={focusLocked ? "锁定中：关闭后自动跳转下一个终端" : "开启锁定：停留在当前终端"}
-          aria-label={focusLocked ? "解除锁定" : "锁定当前终端"}
-        >
-          {focusLocked ? "🔒" : "🔓"}
-        </button>
         <button
           type="button"
           className="terminal-mesh-container__add"

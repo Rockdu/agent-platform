@@ -654,16 +654,21 @@
   font-size: 12px;
   border-top: 1px solid #1a1a1a;
 }
+.terminal-mesh-container__rail-header {
+  display: flex;
+  align-items: center;
+  padding: 4px 6px 2px;
+  flex: 0 0 auto;
+}
 .terminal-mesh-container__lock {
-  padding: 4px 8px;
+  padding: 2px 6px;
   background: transparent;
   border: 1px solid transparent;
   border-radius: 4px;
   cursor: pointer;
-  font-size: 14px;
-  flex: 0 0 auto;
-  opacity: 0.45;
-  transition: opacity 0.15s, border-color 0.15s;
+  font-size: 13px;
+  opacity: 0.4;
+  transition: opacity 0.15s, border-color 0.15s, background 0.15s;
 }
 .terminal-mesh-container__lock:hover {
   opacity: 0.85;
