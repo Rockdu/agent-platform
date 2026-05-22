@@ -654,6 +654,25 @@
   font-size: 12px;
   border-top: 1px solid #1a1a1a;
 }
+.terminal-mesh-container__lock {
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  flex: 0 0 auto;
+  opacity: 0.45;
+  transition: opacity 0.15s, border-color 0.15s;
+}
+.terminal-mesh-container__lock:hover {
+  opacity: 0.85;
+}
+.terminal-mesh-container__lock--on {
+  opacity: 1;
+  border-color: #e8a24a;
+  background: rgba(232, 162, 74, 0.12);
+}
 .terminal-mesh-container__add {
   margin-top: auto;
   padding: 6px 10px;

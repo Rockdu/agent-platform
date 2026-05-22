@@ -1494,6 +1494,9 @@ function MultiTerminalContainer() {
   const { snapshotByTabId, terminalIdByTabId } =
     useWorkspaceLifecycleStatuses(tabIds);
   const [active, setActive] = useState<string>("");
+  // When true, auto-focus after Enter is disabled: the view stays on the
+  // current terminal instead of jumping to the next idle workspace.
+  const [focusLocked, setFocusLocked] = useState(false);
   const [error, setError] = useState<WorkspaceErrorDto | null>(null);
   // Per-tab auto-launch error. Surfaces inside the workspace pane so
   // the user sees why claude failed to start instead of getting a
@@ -1955,6 +1958,7 @@ function MultiTerminalContainer() {
   // clicking. Wraps around; skips the current tab.
   const onTerminalSubmit = useCallback(
     (currentTabId: string) => {
+      if (focusLocked) return; // stay on current terminal
       const idle = tabs.filter(
         (t) => {
           if (t.tabId === currentTabId) return false;
@@ -1970,7 +1974,7 @@ function MultiTerminalContainer() {
         idle.find((t) => tabs.indexOf(t) > currentIndex) ?? idle[0];
       if (next) setActive(next.tabId);
     },
-    [tabs, snapshotByTabId, stashedTabIds],
+    [tabs, snapshotByTabId, stashedTabIds, focusLocked],
   );
 
   const openWorkspaceIds = new Set(tabs.map((t) => t.workspaceId));
@@ -2013,6 +2017,15 @@ function MultiTerminalContainer() {
           onResume={focusTerminal}
           snapshotByTabId={snapshotByTabId}
         />
+        <button
+          type="button"
+          className={`terminal-mesh-container__lock${focusLocked ? " terminal-mesh-container__lock--on" : ""}`}
+          onClick={() => setFocusLocked((v) => !v)}
+          title={focusLocked ? "锁定中：关闭后自动跳转下一个终端" : "开启锁定：停留在当前终端"}
+          aria-label={focusLocked ? "解除锁定" : "锁定当前终端"}
+        >
+          {focusLocked ? "🔒" : "🔓"}
+        </button>
         <button
           type="button"
           className="terminal-mesh-container__add"
