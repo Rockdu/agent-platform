@@ -218,6 +218,27 @@ export function TerminalMeshView({
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
       fontSize: 13,
       theme: { background: "#1e1e1e", foreground: "#d4d4d4" },
+      // Auto-copy on mouse selection (X11/Linux-style behaviour).
+      copyOnSelect: true,
+    });
+    // Intercept Cmd+C / Ctrl+Shift+C so they copy the selection instead of
+    // forwarding SIGINT, and Cmd+V / Ctrl+Shift+V to paste from clipboard.
+    // When nothing is selected, Cmd+C still falls through as SIGINT.
+    term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
+      if (e.type !== "keydown") return true;
+      const copy = (e.metaKey && e.key === "c") ||
+                   (e.ctrlKey && e.shiftKey && e.key === "C");
+      const paste = (e.metaKey && e.key === "v") ||
+                    (e.ctrlKey && e.shiftKey && e.key === "V");
+      if (copy && term.hasSelection()) {
+        void navigator.clipboard.writeText(term.getSelection());
+        return false; // don't send ^C to PTY
+      }
+      if (paste) {
+        void navigator.clipboard.readText().then((text) => { term.paste(text); });
+        return false;
+      }
+      return true;
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
