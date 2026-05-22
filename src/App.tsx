@@ -1529,6 +1529,11 @@ function MultiTerminalContainer() {
   // When true, auto-focus after Enter is disabled: the view stays on the
   // current terminal instead of jumping to the next idle workspace.
   const [focusLocked, setFocusLocked] = useState(false);
+  const [railWidth, setRailWidth] = useState<number>(() => {
+    const saved = localStorage.getItem("rail-width");
+    return saved ? Math.max(140, Math.min(480, parseInt(saved, 10))) : 200;
+  });
+  const railResizingRef = useRef(false);
   const [error, setError] = useState<WorkspaceErrorDto | null>(null);
   // Per-tab auto-launch error. Surfaces inside the workspace pane so
   // the user sees why claude failed to start instead of getting a
@@ -2051,7 +2056,30 @@ function MultiTerminalContainer() {
         className="terminal-mesh-container__rail"
         role="tablist"
         aria-orientation="vertical"
+        style={{ width: railWidth, flex: `0 0 ${railWidth}px` }}
       >
+        <div
+          className="terminal-mesh-container__rail-resize"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            railResizingRef.current = true;
+            const startX = e.clientX;
+            const startW = railWidth;
+            const onMove = (ev: MouseEvent) => {
+              if (!railResizingRef.current) return;
+              const next = Math.max(140, Math.min(480, startW + ev.clientX - startX));
+              setRailWidth(next);
+              localStorage.setItem("rail-width", String(next));
+            };
+            const onUp = () => {
+              railResizingRef.current = false;
+              window.removeEventListener("mousemove", onMove);
+              window.removeEventListener("mouseup", onUp);
+            };
+            window.addEventListener("mousemove", onMove);
+            window.addEventListener("mouseup", onUp);
+          }}
+        />
         <div className="terminal-mesh-container__rail-header">
           <button
             type="button"

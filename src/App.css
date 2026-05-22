@@ -292,8 +292,7 @@
   min-height: 0;
 }
 .terminal-mesh-container__rail {
-  width: 200px;
-  flex: 0 0 200px;
+  /* width + flex are set via inline style (user-resizable) */
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -302,6 +301,20 @@
   border-right: 1px solid #1a1a1a;
   overflow-y: auto;
   overflow-x: hidden;
+  position: relative;
+}
+.terminal-mesh-container__rail-resize {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 10;
+}
+.terminal-mesh-container__rail-resize:hover,
+.terminal-mesh-container__rail-resize:active {
+  background: rgba(255,255,255,0.15);
 }
 .terminal-mesh-container__rail-row {
   display: flex;
