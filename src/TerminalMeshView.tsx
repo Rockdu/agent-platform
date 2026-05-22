@@ -218,8 +218,11 @@ export function TerminalMeshView({
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
       fontSize: 13,
       theme: { background: "#1e1e1e", foreground: "#d4d4d4" },
-      // Auto-copy on mouse selection (X11/Linux-style behaviour).
-      copyOnSelect: true,
+    });
+    // Auto-copy on mouse selection (copyOnSelect was removed in xterm.js v5).
+    term.onSelectionChange(() => {
+      const sel = term.getSelection();
+      if (sel) void navigator.clipboard.writeText(sel);
     });
     // Intercept Cmd+C / Ctrl+Shift+C so they copy the selection instead of
     // forwarding SIGINT, and Cmd+V / Ctrl+Shift+V to paste from clipboard.
