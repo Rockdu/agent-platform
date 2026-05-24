@@ -192,6 +192,15 @@ pub struct OrchestratorBootstrap {
     /// only if the bridge failed to bind at bootstrap (logged; the
     /// orchestrator still launches but cross-tab read is disabled).
     pub host_rpc_sock: Option<PathBuf>,
+    /// Tauri's resource_dir for the packaged app — where
+    /// `bundle.externalBin` stages sidecars at
+    /// `<sidecar>-<triple>{exe_suffix}`. Threaded into mcp_config
+    /// generation so packaged orchestrator configs find the bundled
+    /// sidecars (in dev the source-tree `target/{debug,release}`
+    /// paths win first). `None` when `resource_dir()` is unavailable
+    /// (some dev/test environments) — the generator falls back to
+    /// dev paths only.
+    pub bundle_resource_root: Option<PathBuf>,
 }
 
 #[tauri::command]
@@ -250,6 +259,7 @@ pub async fn orchestrator_launch_claude(
     let agent_platform_root = bootstrap.agent_platform_root.clone();
     let app_data_root = bootstrap.app_data_root.clone();
     let host_rpc_sock = bootstrap.host_rpc_sock.clone();
+    let bundle_resource_root = bootstrap.bundle_resource_root.clone();
 
     let session = state
         .launch_locked(|| {
@@ -261,6 +271,7 @@ pub async fn orchestrator_launch_claude(
                 &app_data_root,
                 &claude_path,
                 host_rpc_sock.as_deref(),
+                bundle_resource_root.as_deref(),
             )
         })
         .map_err(|e| OrchestratorErrorDto::from(&e))?;
@@ -280,6 +291,7 @@ pub(crate) fn spawn_orchestrator_claude(
     app_data_root: &std::path::Path,
     claude_path: &std::path::Path,
     host_rpc_sock: Option<&std::path::Path>,
+    bundle_resource_root: Option<&std::path::Path>,
 ) -> Result<OrchestratorSession, OrchestratorError> {
     let tab_id = Uuid::new_v4().to_string();
     let workspace_root_for_dev_path = workspace_root_for_dev();
@@ -323,6 +335,7 @@ pub(crate) fn spawn_orchestrator_claude(
         host_rpc_sock,
         terminal_mesh_capability.as_deref(),
         papers_capability.as_deref(),
+        bundle_resource_root,
     )
     .map_err(|e| OrchestratorError::McpConfigFailed {
         message: e.to_string(),

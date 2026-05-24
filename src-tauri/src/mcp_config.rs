@@ -182,6 +182,7 @@ pub fn generate_config(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -214,6 +215,15 @@ pub fn generate_config_with_host_rpc_sock(
     // the clientId on every papers.* method, so a non-orchestrator
     // process with the socket path cannot forge `claude:<orch>:papers`.
     orchestrator_papers_capability: Option<&str>,
+    // Tauri's `resource_dir` for the packaged app. In production the
+    // sidecar binaries live there as `<sidecar>-<triple>{exe_suffix}`
+    // (Tauri's `bundle.externalBin` layout) and the source-tree
+    // `target/{debug,release}` candidates don't exist. Without this
+    // probe, packaged configs silently drop every plugin entry and
+    // the orchestrator loses MCP tools it advertises. `None` in dev
+    // / tests; production callers pass `app.path().resource_dir().ok()`
+    // (already plumbed through `OrchestratorBootstrap`).
+    bundle_resource_root: Option<&Path>,
 ) -> Result<McpConfigDocument, McpConfigError> {
     validate_tab_id(tab_id)?;
 
@@ -267,7 +277,21 @@ pub fn generate_config_with_host_rpc_sock(
             );
             continue;
         }
-        let candidates = resolve_expected_paths(workspace_root_for_dev, command_bin);
+        let mut candidates = resolve_expected_paths(workspace_root_for_dev, command_bin);
+        if let Some(bundle) = bundle_resource_root {
+            // Reuse the same Windows-aware probe set that
+            // `papers_sidecar_client::resolve_binary_path` uses. Same
+            // gap, same fix: a packaged Tauri app stages sidecars
+            // under the resource dir, NOT under `target/...`. Without
+            // this branch, every plugin entry in a packaged
+            // orchestrator config is silently dropped.
+            for name in crate::papers_sidecar_client::bundle_candidate_names(
+                command_bin,
+                std::env::consts::EXE_SUFFIX,
+            ) {
+                candidates.push(bundle.join(name));
+            }
+        }
         let Some(command_path) = candidates.iter().find(|p| p.exists()) else {
             tracing::warn!(
                 plugin_id = plugin_id,
@@ -532,6 +556,10 @@ pub async fn generate_mcp_config(
         // Same story for the orchestrator's papers capability —
         // regular tabs do not even spawn the papers sidecar.
         None,
+        // Packaged-app resource directory so the resolver finds
+        // bundled sidecars when source-tree `target/...` paths
+        // don't exist.
+        bootstrap.bundle_resource_root.as_deref(),
     )
     .map_err(|e| McpConfigErrorDto::from(&e))?;
     let final_path = write_atomic(&app_data, &tab_id, &doc).map_err(|e| McpConfigErrorDto::from(&e))?;
@@ -718,6 +746,7 @@ mod tests {
             Some(std::path::Path::new("/tmp/host.sock")),
             None,
             None,
+            None,
         )
         .expect("generate");
         let entry = doc
@@ -761,6 +790,7 @@ mod tests {
             app_data.path(),
             workspace_root.path(),
             Some(std::path::Path::new("/tmp/host-std.sock")),
+            None,
             None,
             None,
         )
@@ -965,6 +995,7 @@ mod tests {
             Some(std::path::Path::new("/tmp/host.sock")),
             Some("orch-handle-XYZ"),
             None,
+            None,
         )
         .expect("generate");
         let entry = doc
@@ -999,6 +1030,7 @@ mod tests {
             Some(std::path::Path::new("/tmp/host-std.sock")),
             Some("attacker-supplied-handle"),
             None,
+            None,
         )
         .expect("generate");
         let entry = doc
@@ -1028,6 +1060,7 @@ mod tests {
             app_data.path(),
             workspace_root.path(),
             Some(std::path::Path::new("/tmp/host.sock")),
+            None,
             None,
             None,
         )
@@ -1207,6 +1240,7 @@ mod tests {
             Some(std::path::Path::new("/tmp/host.sock")),
             None,
             None,
+            None,
         )
         .expect("generate");
         assert!(
@@ -1233,6 +1267,7 @@ mod tests {
             Some(std::path::Path::new("/tmp/host.sock")),
             None,
             Some("00000000-0000-0000-0000-000000000001"),
+            None,
         )
         .expect("generate");
         let entry = doc
@@ -1243,6 +1278,79 @@ mod tests {
             entry.env.get("PAPERS_CAPABILITY").map(String::as_str),
             Some("00000000-0000-0000-0000-000000000001"),
             "PAPERS_CAPABILITY env must be embedded in the papers entry"
+        );
+    }
+
+    #[test]
+    fn generate_orchestrator_config_finds_papers_sidecar_under_bundle_resource_root() {
+        // Regression: a packaged Tauri app stages every sidecar as
+        // `<sidecar>-<triple>{exe_suffix}` under the resource_dir;
+        // `target/{debug,release}/<sidecar>` does NOT exist in
+        // production. The previous resolver only probed those source-
+        // tree paths, so packaged orchestrator configs silently
+        // dropped every plugin entry (the "skipping plugin without a
+        // resolvable sidecar binary" warning fired) and the
+        // orchestrator never got the advertised papers MCP tools.
+        //
+        // The fix extends the candidate set with the bundle probes
+        // `papers_sidecar_client::bundle_candidate_names` builds. This
+        // test simulates a packaged app: no source-tree binaries
+        // (`workspace_root` is an empty tempdir), but the bundle
+        // resource root contains `papers-plugin-<triple>` plus the
+        // other sidecars. The papers entry MUST resolve to the
+        // bundle path.
+        let app_data = tempfile::TempDir::new().unwrap();
+        let workspace_root = tempfile::TempDir::new().unwrap();
+        let bundle = tempfile::TempDir::new().unwrap();
+        let workspace = make_workspace_dir();
+        // No source-tree binaries — only bundle staging. Mirrors the
+        // current host's triple so `EXE_SUFFIX` matches the test
+        // environment.
+        let suffix = std::env::consts::EXE_SUFFIX;
+        for sidecar in ["terminal-mesh-sidecar", "notes-plugin", "papers-plugin"] {
+            // Use the FIRST triple from BUNDLE_PROBE_TRIPLES that
+            // matches this host's OS so the suffix matches what
+            // bundle_candidate_names produces at runtime.
+            let triple = if cfg!(target_os = "macos") {
+                if cfg!(target_arch = "aarch64") {
+                    "aarch64-apple-darwin"
+                } else {
+                    "x86_64-apple-darwin"
+                }
+            } else if cfg!(target_os = "linux") {
+                if cfg!(target_arch = "aarch64") {
+                    "aarch64-unknown-linux-gnu"
+                } else {
+                    "x86_64-unknown-linux-gnu"
+                }
+            } else if cfg!(target_os = "windows") {
+                "x86_64-pc-windows-msvc"
+            } else {
+                "x86_64-unknown-linux-gnu"
+            };
+            let staged = bundle.path().join(format!("{sidecar}-{triple}{suffix}"));
+            std::fs::write(&staged, b"stub").unwrap();
+        }
+        let doc = generate_config_with_host_rpc_sock(
+            "tab-orch-bundled",
+            workspace.path(),
+            McpConfigKind::Orchestrator,
+            app_data.path(),
+            workspace_root.path(),
+            Some(std::path::Path::new("/tmp/host.sock")),
+            None,
+            Some("00000000-0000-0000-0000-0000000000bb"),
+            Some(bundle.path()),
+        )
+        .expect("generate must succeed when bundle_resource_root contains the binaries");
+        let entry = doc
+            .mcp_servers
+            .get("papers")
+            .expect("papers entry MUST resolve via bundle_resource_root in packaged builds");
+        assert!(
+            entry.command.starts_with(bundle.path().to_string_lossy().as_ref()),
+            "papers command must point at the bundle path, not a source-tree fallback; got: {}",
+            entry.command
         );
     }
 
@@ -1270,6 +1378,7 @@ mod tests {
             app_data.path(),
             workspace_root.path(),
             Some(std::path::Path::new("/tmp/host.sock")),
+            None,
             None,
             None,
         )

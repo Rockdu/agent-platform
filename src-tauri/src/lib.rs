@@ -949,6 +949,11 @@ pub fn run() {
                         agent_platform_root: paths.agent_platform.clone(),
                         app_data_root,
                         host_rpc_sock: host_rpc_sock_path,
+                        // Same source as PapersSidecarPaths above.
+                        // Packaged app: Tauri stages externalBin under
+                        // this directory; dev: None (the resolver
+                        // falls back to source-tree target/...).
+                        bundle_resource_root: app.path().resource_dir().ok(),
                     });
 
                     // Round 40 (task22): notification surface — wires
