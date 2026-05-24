@@ -77,6 +77,25 @@ pub fn should_backfill(now_unix_secs: u64, last_fired_unix_secs: Option<u64>) ->
     }
 }
 
+/// Returns true when the next scheduled fire would land on the same
+/// local calendar day as `now`, i.e. today's slot is still upcoming.
+/// In that case startup backfill must be skipped — otherwise the
+/// scheduler would backfill on startup (>20 h gap rule) and then
+/// also fire again at the daily slot a few minutes later, producing
+/// two arXiv fetches inside the rate-limit window.
+///
+/// `local_offset_secs` is the same UTC→local offset
+/// `duration_until_next_fire_local` uses.
+pub fn next_fire_on_same_local_day(
+    now_unix_secs: i64,
+    wait_until_next_secs: u64,
+    local_offset_secs: i64,
+) -> bool {
+    let now_local = now_unix_secs.saturating_add(local_offset_secs);
+    let next_local = now_local.saturating_add(wait_until_next_secs as i64);
+    now_local.div_euclid(86400) == next_local.div_euclid(86400)
+}
+
 /// Long-lived scheduler state held by the host. Cheap to clone — the
 /// store and atomic are wrapped in Arc.
 ///
@@ -130,16 +149,38 @@ impl PapersScheduler {
     }
 
     async fn run_loop(self) {
-        // Startup backfill: if we missed the last fire by more than the
-        // threshold, fire immediately. Then enter the daily-cycle loop.
+        // Startup backfill: if we missed the last fire by more than
+        // the threshold, fire immediately — UNLESS today's scheduled
+        // slot is still upcoming. Without the same-day check the
+        // following sequence produces two fetches inside the
+        // 3-second rate-limit window: yesterday's fire at 10:00,
+        // app starts today at 09:50, gap = 23h50m > 20h triggers
+        // backfill, loop then sleeps 10 minutes and fires again.
         let now_unix = unix_now_secs();
         let last = self.store.last_fired_at_unix().ok().flatten();
-        if should_backfill(now_unix, last) {
+        let offset = local_offset_seconds();
+        let wait_until_next = duration_until_next_fire_local(
+            now_unix as i64,
+            DAILY_FIRE_HOUR_LOCAL,
+            offset,
+        );
+        let same_day = next_fire_on_same_local_day(
+            now_unix as i64,
+            wait_until_next.as_secs(),
+            offset,
+        );
+        if should_backfill(now_unix, last) && !same_day {
             tracing::info!(
                 last_fired_at = ?last,
-                "papers-scheduler: triggering startup backfill (>20h since last fire)"
+                "papers-scheduler: triggering startup backfill (>20h since last fire and next slot is tomorrow)"
             );
             let _ = self.fire().await;
+        } else if should_backfill(now_unix, last) {
+            tracing::info!(
+                last_fired_at = ?last,
+                wait_secs = wait_until_next.as_secs(),
+                "papers-scheduler: skipping startup backfill — today's scheduled slot is still upcoming"
+            );
         }
         loop {
             let now = unix_now_secs() as i64;
@@ -368,5 +409,75 @@ mod tests {
         assert_eq!(parse_date_offset("-0500"), Some(-18000));
         assert_eq!(parse_date_offset("+0000"), Some(0));
         assert_eq!(parse_date_offset("UTC"), None);
+    }
+
+    #[test]
+    fn next_fire_same_day_when_today_slot_still_upcoming() {
+        // 09:50 UTC, target 10:00, +0 offset → wait 600s → same day.
+        let now_unix = 86_400_000 + 9 * 3600 + 50 * 60;
+        let wait =
+            duration_until_next_fire_local(now_unix, DAILY_FIRE_HOUR_LOCAL, 0).as_secs();
+        assert!(next_fire_on_same_local_day(now_unix, wait, 0));
+    }
+
+    #[test]
+    fn next_fire_different_day_when_today_slot_already_past() {
+        // 14:00 UTC, target 10:00, +0 offset → wait until tomorrow 10:00.
+        let now_unix = 86_400_000 + 14 * 3600;
+        let wait =
+            duration_until_next_fire_local(now_unix, DAILY_FIRE_HOUR_LOCAL, 0).as_secs();
+        assert!(!next_fire_on_same_local_day(now_unix, wait, 0));
+    }
+
+    #[test]
+    fn next_fire_same_day_check_respects_local_offset() {
+        // 02:00 UTC = 10:00 +0800 local. At exact equality
+        // `duration_until_next_fire_local` returns 86400 (full day,
+        // per the equality-spin guard). So next fire is "tomorrow"
+        // 10:00 local — different local day.
+        let now_unix = 86_400_000 + 2 * 3600;
+        let wait =
+            duration_until_next_fire_local(now_unix, DAILY_FIRE_HOUR_LOCAL, 8 * 3600).as_secs();
+        assert!(!next_fire_on_same_local_day(now_unix, wait, 8 * 3600));
+        // 01:00 UTC = 09:00 +0800 local → wait 3600s → same local day.
+        let now_earlier = 86_400_000 + 1 * 3600;
+        let wait_earlier =
+            duration_until_next_fire_local(now_earlier, DAILY_FIRE_HOUR_LOCAL, 8 * 3600).as_secs();
+        assert!(next_fire_on_same_local_day(
+            now_earlier,
+            wait_earlier,
+            8 * 3600
+        ));
+    }
+
+    #[test]
+    fn backfill_skipped_when_same_day_even_if_stale() {
+        // 09:50 today, last fire 23h50m ago → would normally backfill,
+        // but today's 10:00 slot is upcoming so skip.
+        let now = 86_400_000u64 + 9 * 3600 + 50 * 60;
+        let last = now - (23 * 3600 + 50 * 60);
+        assert!(should_backfill(now, Some(last)));
+        let wait =
+            duration_until_next_fire_local(now as i64, DAILY_FIRE_HOUR_LOCAL, 0).as_secs();
+        assert!(next_fire_on_same_local_day(now as i64, wait, 0));
+        // Composed predicate the loop uses: backfill && !same_day.
+        assert!(!(should_backfill(now, Some(last))
+            && !next_fire_on_same_local_day(now as i64, wait, 0)));
+    }
+
+    #[test]
+    fn backfill_fires_when_stale_and_next_fire_tomorrow() {
+        // 14:00 today, last fire 25h ago → backfill AND next fire is
+        // tomorrow → composed predicate fires backfill.
+        let now = 86_400_000u64 + 14 * 3600;
+        let last = now - 25 * 3600;
+        let wait =
+            duration_until_next_fire_local(now as i64, DAILY_FIRE_HOUR_LOCAL, 0).as_secs();
+        assert!(should_backfill(now, Some(last)));
+        assert!(!next_fire_on_same_local_day(now as i64, wait, 0));
+        assert!(
+            should_backfill(now, Some(last))
+                && !next_fire_on_same_local_day(now as i64, wait, 0)
+        );
     }
 }

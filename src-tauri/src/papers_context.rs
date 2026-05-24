@@ -49,19 +49,28 @@ const GIT_SPAWN_FLOOR_MS: u64 = 150;
 /// stale-filter behavior is unit-testable without time-mocking.
 ///
 /// Probe order:
-///   1. `<ws>/.claude` mtime — the documented signal.
-///   2. workspace directory mtime — fallback when `.claude/` doesn't
+///   1. Newest regular file mtime inside `<ws>/.claude` (capped at
+///      64 entries to bound IO). This catches the case where Claude
+///      appends to an existing `*.jsonl` — the file mtime bumps even
+///      though the directory entry list does not change, so the dir
+///      mtime alone would falsely report a long-lived active
+///      workspace as stale.
+///   2. `<ws>/.claude` directory mtime — fallback when the directory
+///      exists but cannot be scanned, or is empty.
+///   3. Workspace directory mtime — fallback when `.claude/` doesn't
 ///      exist (a freshly-created workspace still gets a chance to
 ///      contribute git history).
-///   3. If neither can be stat'd → return `true` (skip).
+///   4. If none can be stat'd → return `true` (skip).
 pub fn workspace_is_stale(ws: &Path, now: SystemTime, threshold_secs: u64) -> bool {
-    let probe = ws.join(".claude");
-    let mtime = match std::fs::metadata(&probe).and_then(|m| m.modified()) {
-        Ok(t) => t,
-        Err(_) => match std::fs::metadata(ws).and_then(|m| m.modified()) {
-            Ok(t) => t,
-            Err(_) => return true,
-        },
+    let mtime = newest_claude_file_mtime(ws)
+        .or_else(|| {
+            std::fs::metadata(ws.join(".claude"))
+                .and_then(|m| m.modified())
+                .ok()
+        })
+        .or_else(|| std::fs::metadata(ws).and_then(|m| m.modified()).ok());
+    let Some(mtime) = mtime else {
+        return true;
     };
     match now.duration_since(mtime) {
         Ok(age) => age.as_secs() > threshold_secs,
@@ -69,6 +78,30 @@ pub fn workspace_is_stale(ws: &Path, now: SystemTime, threshold_secs: u64) -> bo
         // a false negative than over-aggressive redaction here.
         Err(_) => false,
     }
+}
+
+/// Newest mtime among regular files inside `<ws>/.claude`, capped at
+/// 64 entries (mirroring the `count` cap in `extract_keywords_from_claude_dir`).
+/// Returns `None` when `.claude/` doesn't exist, can't be read, or
+/// contains no readable files.
+fn newest_claude_file_mtime(ws: &Path) -> Option<SystemTime> {
+    let claude = ws.join(".claude");
+    let entries = std::fs::read_dir(&claude).ok()?;
+    let mut newest: Option<SystemTime> = None;
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        count += 1;
+        if count > 64 {
+            break;
+        }
+        if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+            newest = Some(match newest {
+                Some(cur) if cur >= mtime => cur,
+                _ => mtime,
+            });
+        }
+    }
+    newest
 }
 
 /// Decides how to schedule the next `mine_git_commits` call given the
@@ -1074,6 +1107,58 @@ mod tests {
     }
 
     #[test]
+    fn workspace_is_stale_uses_newest_claude_file_when_dir_mtime_old() {
+        // Long-lived workspace regression: Claude appends to an
+        // existing `*.jsonl` inside `.claude/`, which bumps the
+        // file's mtime but not necessarily the directory entry
+        // list mtime. The probe must look at the newest FILE
+        // mtime, not just the dir mtime, or active workspaces
+        // get incorrectly skipped.
+        let tmp = TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let conv = claude.join("conv.jsonl");
+        fs::write(&conv, "fresh conversation content").unwrap();
+        // Backdate ONLY the directory mtime to 100 days ago.
+        let backdate = SystemTime::now() - Duration::from_secs(100 * 86400);
+        let ft = filetime::FileTime::from_system_time(backdate);
+        filetime::set_file_mtime(&claude, ft).expect("set_file_mtime on dir");
+        // Leave the file mtime fresh.
+        let now = SystemTime::now();
+        assert!(
+            !workspace_is_stale(tmp.path(), now, STALE_WORKSPACE_THRESHOLD_SECS),
+            "stale check must consult the newest file mtime, not just the dir mtime"
+        );
+    }
+
+    #[test]
+    fn workspace_is_stale_returns_true_when_all_claude_files_old() {
+        // Inverse of the above: every file inside `.claude/` is
+        // backdated past the threshold AND the dir itself is
+        // backdated → the workspace is correctly classified stale.
+        let tmp = TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        for name in ["a.jsonl", "b.jsonl"] {
+            let p = claude.join(name);
+            fs::write(&p, "old content").unwrap();
+        }
+        let backdate = SystemTime::now() - Duration::from_secs(100 * 86400);
+        let ft = filetime::FileTime::from_system_time(backdate);
+        filetime::set_file_mtime(claude.join("a.jsonl"), ft).expect("set_file_mtime a");
+        filetime::set_file_mtime(claude.join("b.jsonl"), ft).expect("set_file_mtime b");
+        filetime::set_file_mtime(&claude, ft).expect("set_file_mtime dir");
+        filetime::set_file_mtime(tmp.path(), ft).expect("set_file_mtime ws");
+
+        let now = SystemTime::now();
+        assert!(workspace_is_stale(
+            tmp.path(),
+            now,
+            STALE_WORKSPACE_THRESHOLD_SECS
+        ));
+    }
+
+    #[test]
     fn extract_workspace_keywords_skips_stale_workspace_entirely() {
         // One workspace with fresh `.claude` containing UNIQUE_FRESH
         // tokens; one workspace with `.claude` whose mtime is moved
@@ -1090,17 +1175,24 @@ mod tests {
             stale.path(),
             "transformerstale attentionstale diffusionstale",
         );
-        // Backdate the stale workspace's `.claude` mtime to 100 days ago.
+        // Backdate every mtime the stale-probe consults: every file
+        // inside `.claude/`, the `.claude/` dir itself, and the
+        // workspace dir. The newest-file probe is the primary signal,
+        // so the file mtimes are the load-bearing ones here.
         let claude_stale = stale.path().join(".claude");
         let backdate = SystemTime::now() - Duration::from_secs(100 * 86400);
         let file_time = filetime::FileTime::from_system_time(backdate);
-        filetime::set_file_mtime(&claude_stale, file_time).expect(
-            "set_file_mtime; if `filetime` crate is unavailable swap to a manual touch",
-        );
-
-        // Also backdate the stale workspace dir itself so the
-        // fallback in workspace_is_stale won't rescue it.
-        filetime::set_file_mtime(stale.path(), file_time).expect("set_file_mtime");
+        // Backdate every `.jsonl` inside `.claude/` first.
+        for entry in std::fs::read_dir(&claude_stale).unwrap().flatten() {
+            filetime::set_file_mtime(entry.path(), file_time)
+                .expect("set_file_mtime on .claude file");
+        }
+        filetime::set_file_mtime(&claude_stale, file_time)
+            .expect("set_file_mtime on .claude dir");
+        // Also backdate the workspace dir itself so the workspace-dir
+        // fallback in `workspace_is_stale` won't rescue it.
+        filetime::set_file_mtime(stale.path(), file_time)
+            .expect("set_file_mtime on workspace dir");
 
         let paths: Vec<&std::path::Path> = vec![fresh.path(), stale.path()];
         let tokens: Vec<String> = extract_workspace_keywords(&paths, 64 * 1024)
