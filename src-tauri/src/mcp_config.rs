@@ -247,6 +247,26 @@ pub fn generate_config_with_host_rpc_sock(
         {
             continue;
         }
+        // Defense-in-depth: the papers sidecar handles
+        // `papers.list_recent` / `papers.search` directly off SQLite and
+        // does NOT enforce `PAPERS_CAPABILITY` itself — only the host
+        // RPC bridge does. If an `Orchestrator`-shaped config is built
+        // without the host-minted capability (e.g. the public
+        // `generate_mcp_config` Tauri command always passes `None` for
+        // it), spawning the papers sidecar would give that Claude
+        // direct read access to the papers store without ever
+        // presenting an unforgeable token. Skip the entry instead so
+        // the orchestrator-only restriction cannot be bypassed.
+        if kind == McpConfigKind::Orchestrator
+            && plugin_id == "papers"
+            && orchestrator_papers_capability.is_none()
+        {
+            tracing::warn!(
+                tab_id = tab_id,
+                "mcp_config: skipping papers MCP server for orchestrator config — host-minted PAPERS_CAPABILITY absent"
+            );
+            continue;
+        }
         let candidates = resolve_expected_paths(workspace_root_for_dev, command_bin);
         let Some(command_path) = candidates.iter().find(|p| p.exists()) else {
             tracing::warn!(
@@ -1135,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_config_includes_papers_sidecar() {
+    fn orchestrator_config_includes_papers_sidecar_when_capability_present() {
         let app_data = tempfile::TempDir::new().unwrap();
         let workspace_root = tempfile::TempDir::new().unwrap();
         let workspace = make_workspace_dir();
@@ -1150,12 +1170,57 @@ mod tests {
             workspace_root.path(),
             Some(std::path::Path::new("/tmp/host.sock")),
             None,
+            Some("00000000-0000-0000-0000-000000000001"),
+        )
+        .expect("generate");
+        let entry = doc
+            .mcp_servers
+            .get("papers")
+            .expect("papers sidecar entry must be present when capability is supplied");
+        assert_eq!(
+            entry.env.get("PAPERS_CAPABILITY").map(String::as_str),
+            Some("00000000-0000-0000-0000-000000000001"),
+            "PAPERS_CAPABILITY env must be embedded in the papers entry"
+        );
+    }
+
+    #[test]
+    fn orchestrator_config_without_papers_capability_skips_papers_server() {
+        // Defense-in-depth: the public `generate_mcp_config` Tauri
+        // command always passes `None` for the papers capability. If an
+        // Orchestrator-shaped config from that path emitted the papers
+        // sidecar entry, the resulting Claude could call
+        // `papers.list_recent` / `papers.search` directly off SQLite —
+        // the sidecar does NOT enforce PAPERS_CAPABILITY on its tool
+        // surface. The generator must therefore skip the papers entry
+        // when the host-minted capability is absent so the
+        // orchestrator-only restriction cannot be bypassed.
+        let app_data = tempfile::TempDir::new().unwrap();
+        let workspace_root = tempfile::TempDir::new().unwrap();
+        let workspace = make_workspace_dir();
+        stub_sidecar_for(workspace_root.path(), "notes-plugin");
+        stub_sidecar_for(workspace_root.path(), "terminal-mesh-sidecar");
+        stub_sidecar_for(workspace_root.path(), "papers-plugin");
+        let doc = generate_config_with_host_rpc_sock(
+            "tab-orch-no-cap",
+            workspace.path(),
+            McpConfigKind::Orchestrator,
+            app_data.path(),
+            workspace_root.path(),
+            Some(std::path::Path::new("/tmp/host.sock")),
+            None,
             None,
         )
         .expect("generate");
         assert!(
-            doc.mcp_servers.contains_key("papers"),
-            "orchestrator config MUST include papers sidecar; got servers={:?}",
+            !doc.mcp_servers.contains_key("papers"),
+            "papers sidecar entry MUST be skipped when orchestrator_papers_capability is None; got servers={:?}",
+            doc.mcp_servers.keys().collect::<Vec<_>>()
+        );
+        // Other plugins still come through — only the papers entry is gated.
+        assert!(
+            doc.mcp_servers.contains_key("terminal-mesh"),
+            "terminal-mesh entry must still be emitted; got servers={:?}",
             doc.mcp_servers.keys().collect::<Vec<_>>()
         );
     }
