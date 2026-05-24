@@ -60,9 +60,20 @@ fn main() {
         if !target_dir.is_dir() {
             let _ = std::fs::create_dir_all(&target_dir);
         }
+        // Cargo emits `.exe` for any Windows target triple (msvc/gnu/uwp);
+        // Tauri's `bundle.externalBin` validation expects the staged
+        // name to carry the same suffix, so omitting it makes both the
+        // source-lookup and the staged-name lookup miss real binaries
+        // and panic after a successful `cargo build --release`.
+        let target_exe_suffix = if target_triple.contains("windows") {
+            ".exe"
+        } else {
+            ""
+        };
         for sidecar in BUNDLED_SIDECARS {
-            let canonical = target_dir.join(sidecar);
-            let suffixed = target_dir.join(format!("{sidecar}-{target_triple}"));
+            let canonical = target_dir.join(format!("{sidecar}{target_exe_suffix}"));
+            let suffixed =
+                target_dir.join(format!("{sidecar}-{target_triple}{target_exe_suffix}"));
             let needs_real = profile == "release";
             // If the suffixed file already exists, validate it for release.
             if suffixed.exists() {

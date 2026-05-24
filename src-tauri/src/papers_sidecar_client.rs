@@ -26,6 +26,23 @@ use crate::dev_diagnostics::resolve_expected_paths;
 const SIDECAR_BIN: &str = "papers-plugin";
 const CLIENT_ID: &str = "host_ui:papers";
 
+/// Tauri `bundle.externalBin` target triples we probe when looking up
+/// a packaged sidecar. Includes the Windows triples — without them a
+/// packaged Windows app reports `BinaryNotFound` for every scheduled
+/// or manual fetch even though the binary was bundled correctly. Each
+/// probe is also tried with `std::env::consts::EXE_SUFFIX` appended so
+/// a Windows runtime checks `.exe`-suffixed names while macOS/Linux
+/// keep checking extensionless names.
+const BUNDLE_PROBE_TRIPLES: &[&str] = &[
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-pc-windows-gnu",
+];
+
 #[derive(Debug, thiserror::Error)]
 pub enum SidecarClientError {
     #[error("papers-plugin binary not found: searched {searched}")]
@@ -44,6 +61,22 @@ pub enum SidecarClientError {
     NoResponse,
 }
 
+/// Build the set of filenames the resolver should check inside the
+/// packaged bundle resource root. Pure helper so the Windows / Unix
+/// behaviour is unit-testable without running on the target OS.
+///
+/// `exe_suffix` is normally `std::env::consts::EXE_SUFFIX` (`.exe` on
+/// Windows, empty elsewhere). Returns the canonical name plus every
+/// triple-suffixed name, all with `exe_suffix` appended.
+pub fn bundle_candidate_names(sidecar: &str, exe_suffix: &str) -> Vec<String> {
+    let mut names = Vec::with_capacity(1 + BUNDLE_PROBE_TRIPLES.len());
+    names.push(format!("{sidecar}{exe_suffix}"));
+    for triple in BUNDLE_PROBE_TRIPLES {
+        names.push(format!("{sidecar}-{triple}{exe_suffix}"));
+    }
+    names
+}
+
 /// Locate the papers-plugin binary. Resolution order:
 ///   1. `PAPERS_PLUGIN_BIN_OVERRIDE` env var (tests).
 ///   2. Dev source-tree paths under `binary_root` via
@@ -52,7 +85,9 @@ pub enum SidecarClientError {
 ///      NOT the user data dir — the latter has no `target/` tree.
 ///   3. Packaged-resource paths under `bundle_resource_root` if
 ///      provided — Tauri's `bundle.externalBin` lands sidecars there
-///      as `<name>-<target-triple>` with no extension on macOS.
+///      as `<name>-<target-triple>` (with `.exe` on Windows). The probe
+///      set is built by `bundle_candidate_names` so Windows-only
+///      filenames are also checked on a Windows runtime.
 pub fn resolve_binary_path(
     binary_root: &Path,
     bundle_resource_root: Option<&Path>,
@@ -65,19 +100,8 @@ pub fn resolve_binary_path(
     }
     let mut candidates: Vec<PathBuf> = resolve_expected_paths(binary_root, SIDECAR_BIN);
     if let Some(bundle) = bundle_resource_root {
-        // Tauri appends `-<target-triple>` to externalBin entries; we
-        // try the canonical name first (resource dir without the
-        // suffix) then a few common triples so a packaged build with
-        // a known triple succeeds without needing tauri runtime
-        // introspection here.
-        candidates.push(bundle.join(SIDECAR_BIN));
-        for triple in [
-            "aarch64-apple-darwin",
-            "x86_64-apple-darwin",
-            "x86_64-unknown-linux-gnu",
-            "aarch64-unknown-linux-gnu",
-        ] {
-            candidates.push(bundle.join(format!("{SIDECAR_BIN}-{triple}")));
+        for name in bundle_candidate_names(SIDECAR_BIN, std::env::consts::EXE_SUFFIX) {
+            candidates.push(bundle.join(name));
         }
     }
     for c in &candidates {
@@ -346,6 +370,70 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].arxiv_id, "2024.cross-process");
         assert_eq!(listed[0].source, "manual");
+    }
+
+    #[test]
+    fn bundle_resource_root_candidate_names_include_windows_triples_with_exe() {
+        // Regression: a packaged Windows app stages the sidecar as
+        // `papers-plugin-x86_64-pc-windows-msvc.exe`. The resolver
+        // never probed Windows triples nor appended `.exe`, so every
+        // scheduled or manual fetch reported BinaryNotFound. The probe
+        // set must include the canonical name + every supported triple
+        // (macOS / Linux / Windows), all with the provided exe suffix.
+        let names = bundle_candidate_names(SIDECAR_BIN, ".exe");
+        assert!(
+            names.contains(&"papers-plugin.exe".to_string()),
+            "canonical name with .exe missing from probe set: {names:?}"
+        );
+        for triple in [
+            "x86_64-pc-windows-msvc",
+            "aarch64-pc-windows-msvc",
+            "x86_64-pc-windows-gnu",
+        ] {
+            let expected = format!("papers-plugin-{triple}.exe");
+            assert!(
+                names.contains(&expected),
+                "Windows-named candidate `{expected}` missing from probe set: {names:?}"
+            );
+        }
+        // The macOS/Linux triples are still probed (with the .exe
+        // suffix in this branch; on a real Unix runtime the suffix
+        // would be empty — covered by the next test).
+        for triple in [
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+        ] {
+            let expected = format!("papers-plugin-{triple}.exe");
+            assert!(
+                names.contains(&expected),
+                "unix-triple candidate `{expected}` missing from probe set: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_resource_root_candidate_names_omit_exe_on_unix() {
+        // Regression guard: the existing macOS/Linux runtime probe
+        // set MUST stay extensionless when std::env::consts::EXE_SUFFIX
+        // is empty. The Windows-aware fix must not accidentally
+        // append `.exe` on Unix targets.
+        let names = bundle_candidate_names(SIDECAR_BIN, "");
+        assert!(
+            names.contains(&"papers-plugin".to_string()),
+            "canonical extensionless name missing from probe set: {names:?}"
+        );
+        assert!(
+            names.contains(&"papers-plugin-aarch64-apple-darwin".to_string()),
+            "expected extensionless macOS-triple candidate; got: {names:?}"
+        );
+        for name in &names {
+            assert!(
+                !name.ends_with(".exe"),
+                "no candidate may carry `.exe` when exe_suffix is empty; offender: {name}"
+            );
+        }
     }
 
     #[test]
