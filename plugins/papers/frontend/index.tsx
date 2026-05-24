@@ -27,7 +27,13 @@ interface CooldownState {
 }
 
 export default function PapersPanel() {
-  usePluginCapabilityValue();
+  // The capability handle is minted by the host when PluginRoot mounts
+  // this component and rotated on every remount. Every papers_*
+  // Tauri command requires it; without a valid handle the host
+  // rejects the call so other plugins cannot invoke the papers
+  // surface and bypass the user-confirmed opt-in flow.
+  const capabilityValue = usePluginCapabilityValue();
+  const capability = capabilityValue.capability;
   const [digest, setDigest] = useState<PaperRecord[]>([]);
   const [manual, setManual] = useState<PaperRecord[]>([]);
   const [query, setQuery] = useState("");
@@ -39,7 +45,10 @@ export default function PapersPanel() {
 
   const refreshDigest = useCallback(async () => {
     try {
-      const list = await invoke<PaperRecord[]>("papers_list_recent", { limit: 30 });
+      const list = await invoke<PaperRecord[]>("papers_list_recent", {
+        capability,
+        limit: 30,
+      });
       const scheduled = list.filter((p) => p.source !== "manual");
       const manualList = list.filter((p) => p.source === "manual");
       setDigest(scheduled);
@@ -48,25 +57,25 @@ export default function PapersPanel() {
     } catch (err) {
       setError(stringify(err));
     }
-  }, []);
+  }, [capability]);
 
   const refreshOptIn = useCallback(async () => {
     try {
-      const r = await invoke<OptInState>("papers_get_opt_in");
+      const r = await invoke<OptInState>("papers_get_opt_in", { capability });
       setOptIn(r.enabled);
     } catch (err) {
       setError(stringify(err));
     }
-  }, []);
+  }, [capability]);
 
   const refreshCooldown = useCallback(async () => {
     try {
-      const r = await invoke<CooldownState>("papers_get_cooldown_state");
+      const r = await invoke<CooldownState>("papers_get_cooldown_state", { capability });
       setCooldown(r);
     } catch (err) {
       setError(stringify(err));
     }
-  }, []);
+  }, [capability]);
 
   useEffect(() => {
     void refreshDigest();
@@ -99,7 +108,7 @@ export default function PapersPanel() {
   const setOptInEnabled = useCallback(
     async (enabled: boolean) => {
       try {
-        await invoke<void>("papers_set_opt_in", { enabled });
+        await invoke<void>("papers_set_opt_in", { capability, enabled });
         setOptIn(enabled);
         setInfo(
           enabled
@@ -110,7 +119,7 @@ export default function PapersPanel() {
         setError(stringify(err));
       }
     },
-    [],
+    [capability],
   );
 
   const onSearch = useCallback(async () => {
@@ -118,7 +127,7 @@ export default function PapersPanel() {
     setBusy(true);
     setInfo(null);
     try {
-      const results = await invoke<PaperRecord[]>("papers_search", { query });
+      const results = await invoke<PaperRecord[]>("papers_search", { capability, query });
       setManual((prev) => mergeUnique([...results, ...prev]));
       setInfo(`找到 ${results.length} 篇新论文`);
       setError(null);
@@ -128,14 +137,14 @@ export default function PapersPanel() {
       setBusy(false);
       void refreshCooldown();
     }
-  }, [query, busy, refreshCooldown]);
+  }, [capability, query, busy, refreshCooldown]);
 
   const onRefreshNow = useCallback(async () => {
     if (busy) return;
     setBusy(true);
     setInfo(null);
     try {
-      const count = await invoke<number>("papers_refresh_now");
+      const count = await invoke<number>("papers_refresh_now", { capability });
       setInfo(`已拉取 ${count} 篇论文`);
       await refreshDigest();
     } catch (err) {
@@ -144,12 +153,13 @@ export default function PapersPanel() {
       setBusy(false);
       void refreshCooldown();
     }
-  }, [busy, refreshDigest, refreshCooldown]);
+  }, [capability, busy, refreshDigest, refreshCooldown]);
 
   const onToggleStar = useCallback(
     async (arxivId: string, currentlyStarred: boolean) => {
       try {
         await invoke<void>("papers_toggle_star", {
+          capability,
           arxivId,
           starred: !currentlyStarred,
         });
@@ -158,19 +168,19 @@ export default function PapersPanel() {
         setError(stringify(err));
       }
     },
-    [refreshDigest],
+    [capability, refreshDigest],
   );
 
   const onMarkRead = useCallback(
     async (arxivId: string) => {
       try {
-        await invoke<void>("papers_mark_read", { arxivId });
+        await invoke<void>("papers_mark_read", { capability, arxivId });
         await refreshDigest();
       } catch (err) {
         setError(stringify(err));
       }
     },
-    [refreshDigest],
+    [capability, refreshDigest],
   );
 
   const cooldownDisabled = !!cooldown && cooldown.secondsUntilReady > 0;
