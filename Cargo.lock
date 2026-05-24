@@ -63,7 +63,6 @@ dependencies = [
  "plugin-codegen",
  "rand 0.8.6",
  "regex",
- "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_json",
