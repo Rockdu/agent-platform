@@ -131,12 +131,11 @@ pub fn tools_list_response() -> Value {
         "tools": [
             {
                 "name": "papers.fetch",
-                "description": "Fetch arXiv papers for a keyword query, deduplicate against the 7-day window, store in papers SQLite, and return new records. Respects 3s minimum between arXiv calls.",
+                "description": "Scheduler-driven arXiv fetch for the daily digest path. Deduplicates against the 7-day window, stores in papers SQLite, returns new records, and advances `last_fired_at` + clears `last_error`. Respects 3s minimum between arXiv calls. For ad-hoc or manual searches use `papers.search` instead — it shares the same opt-in / rate-limit / dedup pipeline but does NOT touch scheduler state, so it cannot suppress the next daily backfill.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "Space-separated keywords"},
-                        "source": {"type": "string", "enum": ["scheduled", "manual"], "default": "scheduled"}
+                        "query": {"type": "string", "description": "Space-separated keywords"}
                     },
                     "required": ["query"]
                 }
@@ -1049,17 +1048,21 @@ pub fn handle_tool_call(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            // The `source` argument was previously advertised on
+            // `papers.fetch`'s input schema, which let a caller pass
+            // `source: "manual"` and still trigger the
+            // ScheduledDigest path — silently suppressing the next
+            // backfill and wiping `last_error`. The source argument
+            // is now removed from the schema and any value a caller
+            // passes is ignored: `papers.fetch` is ALWAYS the
+            // scheduler-driven path and `papers.search` is ALWAYS
+            // the manual path. Tool name is the only routing input.
             let (source, purpose) = if tool_name == "papers.search" {
-                ("manual".to_string(), FetchPurpose::ManualSearch)
+                ("manual", FetchPurpose::ManualSearch)
             } else {
-                (
-                    args.get("source")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("scheduled")
-                        .to_string(),
-                    FetchPurpose::ScheduledDigest,
-                )
+                ("scheduled", FetchPurpose::ScheduledDigest)
             };
+            let source = source.to_string();
             let api_base = resolve_arxiv_api_base();
             fetch_papers_gated(store, arxiv_fetcher, &api_base, &query, &source, purpose).map(
                 |inserted| {
@@ -1824,5 +1827,78 @@ mod tests {
         assert!(resp.error.is_none());
         let r = resp.result.unwrap();
         assert_eq!(r["new_count"].as_i64().unwrap(), 1);
+    }
+
+    #[test]
+    fn papers_fetch_schema_does_not_advertise_source_argument() {
+        // Regression: previously `papers.fetch` advertised a `source`
+        // property on its input schema with values "scheduled" /
+        // "manual". A caller passing "manual" still triggered the
+        // ScheduledDigest path, which would suppress the next
+        // backfill. The argument is now removed from the schema and
+        // ignored at dispatch time.
+        let v = tools_list_response();
+        let tools = v.get("tools").and_then(|t| t.as_array()).unwrap();
+        let fetch_tool = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("papers.fetch"))
+            .expect("papers.fetch must still be advertised");
+        let properties = fetch_tool
+            .get("inputSchema")
+            .and_then(|s| s.get("properties"))
+            .and_then(|p| p.as_object())
+            .expect("input schema with properties");
+        assert!(
+            !properties.contains_key("source"),
+            "papers.fetch must not advertise a `source` argument; got: {:?}",
+            properties.keys().collect::<Vec<_>>()
+        );
+        assert!(properties.contains_key("query"));
+    }
+
+    #[test]
+    fn papers_fetch_ignores_caller_supplied_source_and_uses_scheduled_digest() {
+        // Even if a caller passes `source: "manual"` to papers.fetch
+        // (which the schema no longer advertises but which is still
+        // valid JSON), the dispatch MUST hardcode source="scheduled"
+        // and FetchPurpose::ScheduledDigest. The proof:
+        //   1. The inserted row's `source` is "scheduled", not "manual".
+        //   2. `last_fired_at` advanced (ManualSearch would have left
+        //      it untouched per the FetchPurpose split).
+        let (store, _t) = setup_store();
+        store.set_opt_in(true).unwrap();
+        let before_fired = store.last_fired_at_unix().unwrap();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: JsonRpcId::Number(42),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "papers.fetch",
+                "arguments": { "query": "transformers", "source": "manual" }
+            })),
+        };
+        let fetcher = |_url: &str| {
+            Ok::<String, ArxivError>(
+                r#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/forge.1</id><title>T</title><summary>S</summary><link href="http://arxiv.org/pdf/forge.1" type="application/pdf"/></entry></feed>"#
+                    .to_string(),
+            )
+        };
+        let resp = handle_mcp_message(JsonRpcMessage::Request(req), &store, &fetcher).unwrap();
+        assert!(resp.error.is_none());
+        let papers = resp.result.unwrap()["papers"].clone();
+        let arr = papers.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(
+            arr[0]["source"].as_str(),
+            Some("scheduled"),
+            "papers.fetch must stamp source=\"scheduled\" even when caller passes \"manual\""
+        );
+
+        let after_fired = store.last_fired_at_unix().unwrap();
+        assert!(after_fired.is_some());
+        assert!(
+            before_fired.is_none() || after_fired > before_fired,
+            "papers.fetch must advance last_fired_at (ScheduledDigest path); got before={before_fired:?} after={after_fired:?}"
+        );
     }
 }
