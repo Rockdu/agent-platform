@@ -36,27 +36,35 @@ fn main() {
     });
 
     // Stage `<sidecar>-<triple>` artefacts so tauri_build's
-    // `bundle.externalBin` check finds the expected name. Behaviour
-    // depends on the cargo PROFILE:
+    // `bundle.externalBin` check finds the expected name.
     //
-    // - debug: placeholders are acceptable. Developers run
+    // `tauri.conf.json::bundle.externalBin` hardcodes
+    // `../target/release/<sidecar>` (the path is NOT profile-templated)
+    // and `tauri_build::build()` validates that path on EVERY cargo
+    // profile, including debug. So the staging destination must be
+    // `target/release/<sidecar>-<triple>` regardless of profile —
+    // staging under `target/<profile>/` was a bug that made a clean
+    // debug `cargo check` fail with
+    // `resource path ../target/release/<sidecar>-<triple> doesn't exist`
+    // before any compilation began.
+    //
+    // The profile-dependent behaviour is preserved for strictness:
+    //
+    // - debug: zero-byte placeholders are acceptable. Developers run
     //   `cargo check` / `cargo test` against the host crate without
-    //   pre-building sidecars; the real `target/debug/<sidecar>` is
-    //   produced by `npm run build:sidecars:debug`. A zero-byte
-    //   placeholder lets the bundler-validation pass without
-    //   shipping any debug bundle.
+    //   pre-building sidecars. A zero-byte file at the externalBin
+    //   path satisfies Tauri's validation without packaging a debug
+    //   bundle (debug never builds bundles in this project).
     //
     // - release: zero-byte placeholders are REFUSED. A release build
     //   that ships a bundle MUST package real sidecars; otherwise
     //   the packaged app would crash the moment it spawns the
-    //   sidecar. We panic with a clear message pointing at the
-    //   `npm run build:sidecars:release` script that produces real
-    //   release binaries and stages the target-triple-suffixed
-    //   copies.
+    //   sidecar. Panic with a clear message pointing at the
+    //   `npm run build:sidecars:release` script.
     let target_triple = std::env::var("TARGET").unwrap_or_default();
     let profile = std::env::var("PROFILE").unwrap_or_default();
     if !target_triple.is_empty() {
-        let target_dir = workspace_root.join("target").join(&profile);
+        let target_dir = workspace_root.join("target").join("release");
         if !target_dir.is_dir() {
             let _ = std::fs::create_dir_all(&target_dir);
         }

@@ -1065,6 +1065,35 @@ mod tests {
     }
 
     #[test]
+    fn build_rs_stages_sidecar_placeholders_in_target_release_not_target_debug() {
+        // Regression: `tauri.conf.json::bundle.externalBin` hardcodes
+        // `../target/release/<sidecar>` and `tauri_build::build()`
+        // validates that path on every cargo profile, including debug.
+        // The previous build script joined `target_dir =
+        // workspace_root.join("target").join(&profile)`, so a clean
+        // `cargo check` failed before compiling with
+        // `resource path ../target/release/<sidecar>-<triple> doesn't exist`
+        // because debug placeholders landed under `target/debug/`.
+        // The staging directory MUST always be `target/release/`
+        // regardless of profile.
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("build.rs");
+        let body = std::fs::read_to_string(&script)
+            .unwrap_or_else(|e| panic!("read build.rs {}: {e}", script.display()));
+        // The staging directory must literally be "release". Searching
+        // for the exact join call rather than substring-matching
+        // "release" avoids false positives from comments.
+        assert!(
+            body.contains("workspace_root.join(\"target\").join(\"release\")"),
+            "build.rs must stage at target/release (the path bundle.externalBin validates), not target/<profile>"
+        );
+        assert!(
+            !body.contains("workspace_root.join(\"target\").join(&profile)"),
+            "build.rs must NOT stage at target/<profile> — that path is invisible to bundle.externalBin"
+        );
+    }
+
+    #[test]
     fn stage_release_sidecars_script_applies_windows_exe_suffix() {
         // Regression: on Windows hosts Cargo writes `<sidecar>.exe`
         // and Tauri's `bundle.externalBin` check expects
