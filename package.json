@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "predev": "cargo run --quiet -p plugin-codegen && npm run build:sidecars",
+    "predev": "cargo run --quiet -p plugin-codegen && npm run build:sidecars:debug",
     "build": "tsc -b && vite build",
-    "prebuild": "cargo run --quiet -p plugin-codegen && npm run build:sidecars",
-    "build:sidecars": "cargo build --quiet -p terminal-mesh-sidecar -p notes-plugin -p papers-plugin",
+    "prebuild": "cargo run --quiet -p plugin-codegen && npm run build:sidecars:release",
+    "build:sidecars": "npm run build:sidecars:debug",
+    "build:sidecars:debug": "cargo build --quiet -p terminal-mesh-sidecar -p notes-plugin -p papers-plugin",
+    "build:sidecars:release": "cargo build --release --quiet -p terminal-mesh-sidecar -p notes-plugin -p papers-plugin && node scripts/stage-release-sidecars.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

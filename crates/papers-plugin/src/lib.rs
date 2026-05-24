@@ -437,6 +437,10 @@ impl PapersStore {
 
     /// Check whether we are within the rate-limit window. Returns `Some(seconds_to_wait)`
     /// if the caller should wait, or `None` if it is safe to proceed.
+    ///
+    /// Prefer `try_touch_rate_limit()` for the gate-and-acquire flow —
+    /// this read-only helper exists for surfaces like the cooldown UI
+    /// that report remaining wait time without trying to acquire.
     pub fn rate_limit_wait(&self) -> Result<Option<u64>, ArxivError> {
         let guard = self.conn.lock().unwrap();
         let last_iso: Option<String> = guard
@@ -446,29 +450,55 @@ impl PapersStore {
                 |r| r.get(0),
             )
             .map_err(|e| ArxivError::Sqlite(format!("rate select: {e}")))?;
-        match last_iso {
-            None => Ok(None),
-            Some(s) => {
-                let last = parse_iso8601_to_unix(&s)?;
-                let now = unix_now_secs();
-                let delta = now.saturating_sub(last);
-                if delta >= RATE_LIMIT_SECONDS {
-                    Ok(None)
-                } else {
-                    Ok(Some(RATE_LIMIT_SECONDS - delta))
-                }
-            }
-        }
+        compute_rate_wait(last_iso.as_deref())
     }
 
-    pub fn touch_rate_limit(&self) -> Result<(), ArxivError> {
+    /// Atomic check-and-acquire: if the window has elapsed since the
+    /// last call, stamp the current time and return `Ok(())`. Otherwise
+    /// return `Err(ArxivError::RateLimited { wait_secs })` without
+    /// modifying state. Uses `BEGIN IMMEDIATE` so concurrent callers
+    /// against the same SQLite file (host + sidecar processes, or two
+    /// host threads) serialise; exactly one wins.
+    pub fn try_touch_rate_limit(&self) -> Result<(), ArxivError> {
         let guard = self.conn.lock().unwrap();
+        // BEGIN IMMEDIATE acquires the RESERVED lock immediately so a
+        // concurrent transaction starting at the same time is forced
+        // to wait (or fail with SQLITE_BUSY, which `busy_timeout`
+        // converts into a bounded retry).
         guard
-            .execute(
-                "UPDATE scheduler_state SET last_arxiv_call_at = ? WHERE id = 1",
-                rusqlite::params![now_iso8601()],
-            )
-            .map_err(|e| ArxivError::Sqlite(format!("touch_rate: {e}")))?;
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| ArxivError::Sqlite(format!("begin immediate: {e}")))?;
+        let read = (|| -> Result<Option<u64>, ArxivError> {
+            let last_iso: Option<String> = guard
+                .query_row(
+                    "SELECT last_arxiv_call_at FROM scheduler_state WHERE id = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| ArxivError::Sqlite(format!("rate select: {e}")))?;
+            compute_rate_wait(last_iso.as_deref())
+        })();
+        let wait = match read {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = guard.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        };
+        if let Some(secs) = wait {
+            let _ = guard.execute_batch("ROLLBACK");
+            return Err(ArxivError::RateLimited { wait_secs: secs });
+        }
+        if let Err(e) = guard.execute(
+            "UPDATE scheduler_state SET last_arxiv_call_at = ? WHERE id = 1",
+            rusqlite::params![now_iso8601()],
+        ) {
+            let _ = guard.execute_batch("ROLLBACK");
+            return Err(ArxivError::Sqlite(format!("rate update: {e}")));
+        }
+        guard
+            .execute_batch("COMMIT")
+            .map_err(|e| ArxivError::Sqlite(format!("rate commit: {e}")))?;
         Ok(())
     }
 
@@ -731,6 +761,31 @@ impl PapersStore {
     }
 }
 
+/// Convert a stored ISO 8601 timestamp into seconds the caller must
+/// still wait, or `None` if the rate-limit window has elapsed. Shared
+/// between read-only and acquire helpers so they cannot drift.
+fn compute_rate_wait(last_iso: Option<&str>) -> Result<Option<u64>, ArxivError> {
+    let Some(s) = last_iso else { return Ok(None); };
+    let last = parse_iso8601_to_unix(s)?;
+    let now = unix_now_secs();
+    let delta = now.saturating_sub(last);
+    if delta >= RATE_LIMIT_SECONDS {
+        Ok(None)
+    } else {
+        Ok(Some(RATE_LIMIT_SECONDS - delta))
+    }
+}
+
+/// Distinguishes a scheduler-driven daily fetch from an ad-hoc manual
+/// search. Only `ScheduledDigest` advances `scheduler_state.last_fired_at`
+/// and clears `last_error` — manual searches must not suppress the
+/// next startup backfill or hide a prior scheduler failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchPurpose {
+    ScheduledDigest,
+    ManualSearch,
+}
+
 pub fn now_iso8601() -> String {
     let secs = unix_now_secs();
     iso8601_from_unix(secs)
@@ -883,6 +938,7 @@ pub fn fetch_papers_gated(
     api_base: &str,
     query: &str,
     source: &str,
+    purpose: FetchPurpose,
 ) -> Result<Vec<PaperRecord>, ArxivError> {
     if query.trim().is_empty() {
         return Err(ArxivError::Parse("empty query".to_string()));
@@ -891,22 +947,29 @@ pub fn fetch_papers_gated(
         Some(true) => {}
         _ => return Err(ArxivError::NotOptedIn),
     }
-    if let Some(wait) = store.rate_limit_wait()? {
-        return Err(ArxivError::RateLimited { wait_secs: wait });
-    }
-    store.touch_rate_limit()?;
+    // Atomic acquire — if the rate-limit window has elapsed this stamps
+    // `last_arxiv_call_at` in the same transaction as the read so two
+    // concurrent callers can't both observe the gate as open.
+    store.try_touch_rate_limit()?;
     let url = build_arxiv_url(api_base, query, 10);
     let body = match arxiv_fetcher(&url) {
         Ok(b) => b,
         Err(e) => {
-            let _ = store.record_last_error(&format!("fetch: {e}"));
+            // Only the scheduled path surfaces failures into the daily
+            // status banner. Manual search errors are returned to the
+            // caller (UI / orchestrator) directly.
+            if purpose == FetchPurpose::ScheduledDigest {
+                let _ = store.record_last_error(&format!("fetch: {e}"));
+            }
             return Err(e);
         }
     };
     let parsed = match parse_arxiv_atom(&body, 10) {
         Ok(p) => p,
         Err(e) => {
-            let _ = store.record_last_error(&format!("parse: {e}"));
+            if purpose == FetchPurpose::ScheduledDigest {
+                let _ = store.record_last_error(&format!("parse: {e}"));
+            }
             return Err(e);
         }
     };
@@ -917,10 +980,18 @@ pub fn fetch_papers_gated(
             ..r
         })
         .collect();
-    match store.insert_dedup_and_touch_last_fired(&stamped, query) {
+    let insert_result = match purpose {
+        FetchPurpose::ScheduledDigest => {
+            store.insert_dedup_and_touch_last_fired(&stamped, query)
+        }
+        FetchPurpose::ManualSearch => store.insert_dedup(&stamped, query),
+    };
+    match insert_result {
         Ok(inserted) => Ok(inserted),
         Err(e) => {
-            let _ = store.record_last_error(&format!("storage: {e}"));
+            if purpose == FetchPurpose::ScheduledDigest {
+                let _ = store.record_last_error(&format!("storage: {e}"));
+            }
             Err(e)
         }
     }
@@ -961,21 +1032,26 @@ pub fn handle_tool_call(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let source = if tool_name == "papers.search" {
-                "manual".to_string()
+            let (source, purpose) = if tool_name == "papers.search" {
+                ("manual".to_string(), FetchPurpose::ManualSearch)
             } else {
-                args.get("source")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("scheduled")
-                    .to_string()
+                (
+                    args.get("source")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("scheduled")
+                        .to_string(),
+                    FetchPurpose::ScheduledDigest,
+                )
             };
             let api_base = resolve_arxiv_api_base();
-            fetch_papers_gated(store, arxiv_fetcher, &api_base, &query, &source).map(|inserted| {
-                json!({
-                    "new_count": inserted.len(),
-                    "papers": inserted,
-                })
-            })
+            fetch_papers_gated(store, arxiv_fetcher, &api_base, &query, &source, purpose).map(
+                |inserted| {
+                    json!({
+                        "new_count": inserted.len(),
+                        "papers": inserted,
+                    })
+                },
+            )
         }
         "papers.list_recent" => {
             let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10);
@@ -1207,10 +1283,10 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_blocks_within_window() {
+    fn rate_limit_wait_reflects_recent_acquire() {
         let (store, _t) = setup_store();
         assert!(store.rate_limit_wait().unwrap().is_none());
-        store.touch_rate_limit().unwrap();
+        store.try_touch_rate_limit().unwrap();
         let wait = store.rate_limit_wait().unwrap();
         assert!(wait.is_some());
         assert!(wait.unwrap() <= RATE_LIMIT_SECONDS);
@@ -1358,7 +1434,7 @@ mod tests {
     fn fetch_papers_gated_rejects_when_opt_in_null() {
         let (store, _t) = setup_store();
         let fetcher = |_: &str| Ok::<String, ArxivError>("<feed/>".to_string());
-        let err = fetch_papers_gated(&store, &fetcher, "https://x/", "q", "scheduled").unwrap_err();
+        let err = fetch_papers_gated(&store, &fetcher, "https://x/", "q", "scheduled", FetchPurpose::ScheduledDigest).unwrap_err();
         assert!(matches!(err, ArxivError::NotOptedIn));
     }
 
@@ -1367,7 +1443,7 @@ mod tests {
         let (store, _t) = setup_store();
         store.set_opt_in(false).unwrap();
         let fetcher = |_: &str| Ok::<String, ArxivError>("<feed/>".to_string());
-        let err = fetch_papers_gated(&store, &fetcher, "https://x/", "q", "scheduled").unwrap_err();
+        let err = fetch_papers_gated(&store, &fetcher, "https://x/", "q", "scheduled", FetchPurpose::ScheduledDigest).unwrap_err();
         assert!(matches!(err, ArxivError::NotOptedIn));
     }
 
@@ -1376,7 +1452,7 @@ mod tests {
         let (store, _t) = setup_store();
         store.set_opt_in(true).unwrap();
         let fetcher = |_: &str| Err::<String, ArxivError>(ArxivError::Http("boom".to_string()));
-        let _ = fetch_papers_gated(&store, &fetcher, "https://x/", "q", "scheduled");
+        let _ = fetch_papers_gated(&store, &fetcher, "https://x/", "q", "scheduled", FetchPurpose::ScheduledDigest);
         let recorded = store.last_error().unwrap();
         assert!(recorded.is_some());
         assert!(recorded.unwrap().contains("fetch"));
@@ -1392,7 +1468,7 @@ mod tests {
         let fetcher = move |_: &str| Ok::<String, ArxivError>(body.clone());
         let before_fired = store.last_fired_at_unix().unwrap();
         let inserted =
-            fetch_papers_gated(&store, &fetcher, "https://x/", "q", "scheduled").unwrap();
+            fetch_papers_gated(&store, &fetcher, "https://x/", "q", "scheduled", FetchPurpose::ScheduledDigest).unwrap();
         assert_eq!(inserted.len(), 1);
         // last_fired_at advanced (was None before the very first successful fire).
         let after_fired = store.last_fired_at_unix().unwrap();
@@ -1425,6 +1501,125 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert!(listed[0].starred);
         assert!(listed[0].read_at.is_some());
+    }
+
+    #[test]
+    fn manual_search_does_not_advance_last_fired_at() {
+        // Manual searches must NOT bump `last_fired_at`, otherwise the
+        // next startup backfill would think the daily digest already
+        // fired and skip itself. This is the FetchPurpose split's
+        // primary invariant.
+        let (store, _t) = setup_store();
+        store.set_opt_in(true).unwrap();
+        // Pre-set a stale last_fired_at (older than the 20h backfill
+        // threshold) and capture its value.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE scheduler_state SET last_fired_at = ?, last_error = 'previous failure' WHERE id = 1",
+                rusqlite::params!["1970-01-01T00:00:00Z"],
+            )
+            .unwrap();
+        let stale_before = store.last_fired_at_unix().unwrap().unwrap();
+
+        let body = r#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/m.1</id><title>T</title><summary>S</summary><link href="http://arxiv.org/pdf/m.1" type="application/pdf"/></entry></feed>"#.to_string();
+        let fetcher = move |_: &str| Ok::<String, ArxivError>(body.clone());
+        let inserted = fetch_papers_gated(
+            &store,
+            &fetcher,
+            "https://x/",
+            "query",
+            "manual",
+            FetchPurpose::ManualSearch,
+        )
+        .unwrap();
+        assert_eq!(inserted.len(), 1);
+
+        // last_fired_at must NOT have advanced.
+        let stale_after = store.last_fired_at_unix().unwrap().unwrap();
+        assert_eq!(stale_before, stale_after);
+
+        // last_error must NOT have been cleared by a manual search.
+        let err = store.last_error().unwrap();
+        assert_eq!(err.as_deref(), Some("previous failure"));
+
+        // should_backfill must still return true on a stale timestamp.
+        let now_unix = stale_after + 21 * 3600;
+        assert!(crate::compute_rate_wait(None).unwrap().is_none());
+        // Reuse the scheduler helper instead of duplicating logic.
+        // The crate's own should_backfill lives in src-tauri; here we
+        // assert the underlying invariant: stored last_fired_at is
+        // unchanged, so any sane backfill predicate will still trip.
+        assert!(now_unix > stale_after + 20 * 3600);
+    }
+
+    #[test]
+    fn try_touch_rate_limit_returns_rate_limited_within_window() {
+        let (store, _t) = setup_store();
+        // First acquire succeeds.
+        store.try_touch_rate_limit().unwrap();
+        // Second within the window fails atomically.
+        let err = store.try_touch_rate_limit().unwrap_err();
+        match err {
+            ArxivError::RateLimited { wait_secs } => {
+                assert!(wait_secs <= RATE_LIMIT_SECONDS);
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_touch_rate_limit_is_atomic_across_two_stores() {
+        // Two `PapersStore` handles pointed at the same SQLite file
+        // race; exactly one wins. The loser must get RateLimited
+        // without performing any side effect that lets it slip past.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("state.sqlite");
+        let setup_conn = Connection::open(&db_path).unwrap();
+        setup_conn
+            .execute_batch(
+                r#"
+                CREATE TABLE daily_recommendations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    arxiv_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    authors TEXT NOT NULL,
+                    abstract_snippet TEXT NOT NULL,
+                    pdf_url TEXT NOT NULL,
+                    abs_url TEXT NOT NULL,
+                    source_query TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'scheduled',
+                    fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE user_paper_state (
+                    arxiv_id TEXT PRIMARY KEY,
+                    starred INTEGER NOT NULL DEFAULT 0,
+                    read_at TEXT
+                );
+                CREATE TABLE scheduler_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    last_fired_at TEXT,
+                    last_arxiv_call_at TEXT,
+                    last_error TEXT,
+                    opt_in_enabled INTEGER
+                );
+                INSERT INTO scheduler_state (id) VALUES (1);
+                "#,
+            )
+            .unwrap();
+        drop(setup_conn);
+
+        let store_a = PapersStore::open(&db_path).unwrap();
+        let store_b = PapersStore::open(&db_path).unwrap();
+        // Both stores see a clean state; first one to call try_touch wins.
+        store_a.try_touch_rate_limit().unwrap();
+        let err = store_b.try_touch_rate_limit().unwrap_err();
+        assert!(
+            matches!(err, ArxivError::RateLimited { .. }),
+            "second concurrent caller must see RateLimited; got {err:?}"
+        );
     }
 
     #[test]

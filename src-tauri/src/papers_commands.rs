@@ -10,21 +10,22 @@
 //! orchestrator's papers-plugin sidecar opens, so the data is
 //! consistent regardless of which side mutates.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use papers_plugin::{
-    fetch_arxiv_with_retry, fetch_papers_gated, make_blocking_arxiv_fetcher,
-    resolve_arxiv_api_base, PaperRecord, PapersStore, RATE_LIMIT_SECONDS, MAX_RETRY_ATTEMPTS,
-};
+use papers_plugin::{FetchPurpose, PaperRecord, PapersStore, RATE_LIMIT_SECONDS};
 use serde::Serialize;
 use tauri::State;
 
 use crate::papers_scheduler::PapersScheduler;
+use crate::papers_sidecar_client::{fetch_via_sidecar, resolve_binary_path};
 
 /// Tauri-managed handle exposed by `lib.rs::run()`.
 pub struct PapersHandle {
     pub store: Arc<PapersStore>,
     pub scheduler: PapersScheduler,
+    pub workspace_root: PathBuf,
+    pub app_data_dir: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,13 +87,24 @@ pub async fn papers_search(
     handle: State<'_, PapersHandle>,
     query: String,
 ) -> Result<Vec<PaperRecord>, String> {
-    let store = handle.store.clone();
+    // arXiv HTTP runs inside the papers-plugin sidecar process, not
+    // here. The host owns timing (none for manual) and the SQLite
+    // reads that the UI consumes afterwards. The sidecar opens the
+    // same SQLite via APP_DATA_DIR; manual fetches stamp `source =
+    // "manual"` and do NOT advance `last_fired_at`.
+    let workspace_root = handle.workspace_root.clone();
+    let app_data_dir = handle.app_data_dir.clone();
+    let q = query.clone();
     tokio::task::spawn_blocking(move || {
-        let api_base = resolve_arxiv_api_base();
-        let client = make_blocking_arxiv_fetcher().map_err(|e| e.to_string())?;
-        let fetcher = |url: &str| fetch_arxiv_with_retry(&client, url, MAX_RETRY_ATTEMPTS);
-        fetch_papers_gated(&store, &fetcher, &api_base, &query, "manual")
-            .map_err(|e| e.to_string())
+        let binary = resolve_binary_path(&workspace_root).map_err(|e| e.to_string())?;
+        fetch_via_sidecar(
+            &binary,
+            &app_data_dir,
+            &workspace_root,
+            &q,
+            FetchPurpose::ManualSearch,
+        )
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?

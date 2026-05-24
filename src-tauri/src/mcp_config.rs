@@ -997,6 +997,56 @@ mod tests {
     }
 
     #[test]
+    fn stage_release_sidecars_script_lists_papers_plugin() {
+        // The release packaging path now goes through
+        // `scripts/stage-release-sidecars.mjs`. Assert the script
+        // exists and names all three sidecars so a future drop of
+        // the papers binary from the release path is caught at test
+        // time (rather than only at packaging time).
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root parent")
+            .join("scripts")
+            .join("stage-release-sidecars.mjs");
+        let body = std::fs::read_to_string(&script)
+            .unwrap_or_else(|e| panic!("read stage script {}: {e}", script.display()));
+        for sidecar in ["terminal-mesh-sidecar", "notes-plugin", "papers-plugin"] {
+            assert!(
+                body.contains(sidecar),
+                "stage-release-sidecars.mjs missing `{sidecar}` reference"
+            );
+        }
+    }
+
+    #[test]
+    fn package_json_release_sidecars_uses_release_profile() {
+        // Catch the regression where `build:sidecars` could be a
+        // plain `cargo build` (debug) while `bundle.externalBin`
+        // referenced `target/release/...`.
+        let pkg = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root parent")
+            .join("package.json");
+        let body = std::fs::read_to_string(&pkg).expect("read package.json");
+        assert!(
+            body.contains("\"build:sidecars:release\""),
+            "package.json missing a release sidecar build script"
+        );
+        assert!(
+            body.contains("cargo build --release"),
+            "build:sidecars:release must invoke `cargo build --release`"
+        );
+        assert!(
+            body.contains("\"prebuild\""),
+            "package.json missing `prebuild`"
+        );
+        assert!(
+            body.contains("build:sidecars:release"),
+            "prebuild must trigger the release sidecar build"
+        );
+    }
+
+    #[test]
     fn tauri_conf_bundles_all_three_sidecars() {
         // The dev path discovery in `dev_diagnostics::resolve_expected_paths`
         // covers running from `target/{debug,release}`, but production

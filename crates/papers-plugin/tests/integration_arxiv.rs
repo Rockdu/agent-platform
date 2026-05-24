@@ -140,7 +140,7 @@ async fn rate_limit_blocks_second_call_within_window() {
 
     let (store, _t) = make_store();
     assert!(store.rate_limit_wait().unwrap().is_none());
-    store.touch_rate_limit().unwrap();
+    store.try_touch_rate_limit().unwrap();
     let wait = store.rate_limit_wait().unwrap();
     assert!(wait.is_some());
     assert!(wait.unwrap() <= RATE_LIMIT_SECONDS);

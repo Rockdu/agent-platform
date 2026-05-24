@@ -20,6 +20,7 @@ mod orchestrator;
 mod papers_commands;
 mod papers_context;
 mod papers_scheduler;
+mod papers_sidecar_client;
 mod plugin_sqlite;
 mod secrets;
 mod sidecar_manager;
@@ -887,6 +888,10 @@ pub fn run() {
                                     workspaces: workspaces_handle,
                                     app_handle: Some(app.handle().clone()),
                                     papers_store: papers_store_arc.clone(),
+                                    papers_sidecar_paths: Some(host_rpc::PapersSidecarPaths {
+                                        workspace_root: paths.agent_platform.clone(),
+                                        app_data_dir: app_data_root.clone(),
+                                    }),
                                 },
                             );
                             tracing::info!(host_rpc_sock = %p.display(), "host_rpc bridge spawned");
@@ -897,6 +902,10 @@ pub fn run() {
                             None
                         }
                     };
+                    // Hold on to a copy for the papers handle / scheduler
+                    // below; OrchestratorBootstrap takes ownership of
+                    // the original `app_data_root` value.
+                    let app_data_root_for_papers = app_data_root.clone();
                     app.manage(OrchestratorBootstrap {
                         agent_platform_root: paths.agent_platform.clone(),
                         app_data_root,
@@ -929,11 +938,15 @@ pub fn run() {
                             workspaces_handle,
                             notification_service_arc.clone(),
                             Some(app.handle().clone()),
+                            paths.agent_platform.clone(),
+                            app_data_root_for_papers.clone(),
                         );
                         scheduler.clone().start();
                         app.manage(papers_commands::PapersHandle {
                             store,
                             scheduler,
+                            workspace_root: paths.agent_platform.clone(),
+                            app_data_dir: app_data_root_for_papers.clone(),
                         });
                     } else {
                         tracing::warn!(

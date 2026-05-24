@@ -73,9 +73,18 @@ pub struct HostRpcState {
     /// session calls `agentPlatform.openWorkspace`.
     pub app_handle: Option<tauri::AppHandle>,
     /// Optional shared SQLite handle for papers reads (papers.listRecent
-    /// and papers.search arms). None in tests that don't exercise the
-    /// papers path.
+    /// arm). None in tests that don't exercise the papers path.
     pub papers_store: Option<std::sync::Arc<papers_plugin::PapersStore>>,
+    /// Workspace root + app data dir for spawning the papers sidecar
+    /// subprocess from `papers.search`. None disables papers.search;
+    /// papers.listRecent still works as long as `papers_store` is set.
+    pub papers_sidecar_paths: Option<PapersSidecarPaths>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PapersSidecarPaths {
+    pub workspace_root: std::path::PathBuf,
+    pub app_data_dir: std::path::PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -617,11 +626,17 @@ fn handle_papers_search(
     state: &HostRpcState,
     params: PapersSearchParams,
 ) -> Result<Value, JsonRpcError> {
-    let store = state.papers_store.as_ref().ok_or_else(|| JsonRpcError {
-        code: ERR_NOT_FOUND,
-        message: "papers store not configured on this host".to_string(),
-        data: None,
-    })?;
+    // papers.listRecent still uses the direct SQLite path because it is
+    // a pure read. papers.search performs network IO, so it MUST be
+    // delegated to the sidecar binary per the immutable goal.
+    let paths = state
+        .papers_sidecar_paths
+        .as_ref()
+        .ok_or_else(|| JsonRpcError {
+            code: ERR_NOT_FOUND,
+            message: "papers sidecar paths not configured on this host".to_string(),
+            data: None,
+        })?;
     if params.query.trim().is_empty() {
         return Err(JsonRpcError {
             code: ERR_INVALID_PARAMS,
@@ -629,34 +644,45 @@ fn handle_papers_search(
             data: None,
         });
     }
-    let api_base = papers_plugin::resolve_arxiv_api_base();
-    let client = papers_plugin::make_blocking_arxiv_fetcher().map_err(|e| JsonRpcError {
-        code: ERR_BOUNDED_READ_FAILED,
-        message: format!("http client: {e}"),
-        data: None,
-    })?;
-    let fetcher =
-        |url: &str| papers_plugin::fetch_arxiv_with_retry(&client, url, papers_plugin::MAX_RETRY_ATTEMPTS);
-    let inserted =
-        papers_plugin::fetch_papers_gated(store, &fetcher, &api_base, &params.query, "manual")
-            .map_err(|e| match e {
-                papers_plugin::ArxivError::NotOptedIn => JsonRpcError {
+    let binary = crate::papers_sidecar_client::resolve_binary_path(&paths.workspace_root).map_err(
+        |e| JsonRpcError {
+            code: ERR_BOUNDED_READ_FAILED,
+            message: format!("papers sidecar resolve: {e}"),
+            data: None,
+        },
+    )?;
+    crate::papers_sidecar_client::fetch_via_sidecar(
+        &binary,
+        &paths.app_data_dir,
+        &paths.workspace_root,
+        &params.query,
+        papers_plugin::FetchPurpose::ManualSearch,
+    )
+    .map(|papers| json!({ "papers": papers }))
+    .map_err(|e| {
+        use crate::papers_sidecar_client::SidecarClientError;
+        match e {
+            SidecarClientError::Mcp { ref message, .. } if message.contains("not opted in") => {
+                JsonRpcError {
                     code: ERR_PERMISSION_DENIED,
                     message: "papers.search: opt-in required".to_string(),
                     data: None,
-                },
-                papers_plugin::ArxivError::RateLimited { wait_secs } => JsonRpcError {
+                }
+            }
+            SidecarClientError::Mcp { ref message, .. } if message.contains("rate limited") => {
+                JsonRpcError {
                     code: ERR_PERMISSION_DENIED,
-                    message: format!("rate limited: wait {wait_secs}s"),
+                    message: message.clone(),
                     data: None,
-                },
-                other => JsonRpcError {
-                    code: ERR_BOUNDED_READ_FAILED,
-                    message: format!("papers.search: {other}"),
-                    data: None,
-                },
-            })?;
-    Ok(json!({ "papers": inserted }))
+                }
+            }
+            other => JsonRpcError {
+                code: ERR_BOUNDED_READ_FAILED,
+                message: format!("papers.search: {other}"),
+                data: None,
+            },
+        }
+    })
 }
 
 fn handle_read_scrollback(
@@ -886,6 +912,7 @@ mod tests {
             ),
             app_handle: None,
             papers_store: None,
+            papers_sidecar_paths: None,
         };
         (state, resp.handle)
     }
@@ -1184,6 +1211,7 @@ mod tests {
             ),
             app_handle: None,
             papers_store: None,
+            papers_sidecar_paths: None,
         };
         (state, ws_tab_a, ws_tab_b, resp.handle)
     }
@@ -1249,6 +1277,7 @@ mod tests {
             ),
             app_handle: None,
             papers_store: None,
+            papers_sidecar_paths: None,
         };
 
         // Spoof the orchestrator's tab id from a regular client

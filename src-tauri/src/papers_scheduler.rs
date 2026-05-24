@@ -18,13 +18,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use papers_plugin::{
-    fetch_arxiv_with_retry, fetch_papers_gated, make_blocking_arxiv_fetcher,
-    resolve_arxiv_api_base, PaperRecord, PapersStore, MAX_RETRY_ATTEMPTS,
-};
+use papers_plugin::{FetchPurpose, PaperRecord, PapersStore};
 
 use crate::notification::{NotificationService, PapersTrayEntry};
 use crate::papers_context::{extract_workspace_keywords, CONTEXT_BUDGET_BYTES_TOTAL};
+use crate::papers_sidecar_client::{fetch_via_sidecar, resolve_binary_path, SidecarClientError};
 use crate::workspaces::WorkspaceRegistry;
 
 /// The hour-of-day (local time, 0..=23) at which the daily digest
@@ -78,14 +76,20 @@ pub fn should_backfill(now_unix_secs: u64, last_fired_unix_secs: Option<u64>) ->
 
 /// Long-lived scheduler state held by the host. Cheap to clone — the
 /// store and atomic are wrapped in Arc.
+///
+/// `workspace_root` + `app_data_dir` are passed to the papers sidecar
+/// subprocess so it opens the same SQLite the host reads from. The
+/// host no longer holds a reqwest client — all arXiv HTTP goes through
+/// the sidecar binary per the immutable goal.
 #[derive(Clone)]
 pub struct PapersScheduler {
     pub store: Arc<PapersStore>,
     pub workspaces: WorkspaceRegistry,
     pub notification: Arc<NotificationService>,
     pub in_flight: Arc<AtomicBool>,
-    pub api_base: String,
     pub app_handle: Option<tauri::AppHandle>,
+    pub workspace_root: PathBuf,
+    pub app_data_dir: PathBuf,
 }
 
 impl PapersScheduler {
@@ -94,14 +98,17 @@ impl PapersScheduler {
         workspaces: WorkspaceRegistry,
         notification: Arc<NotificationService>,
         app_handle: Option<tauri::AppHandle>,
+        workspace_root: PathBuf,
+        app_data_dir: PathBuf,
     ) -> Self {
         Self {
             store,
             workspaces,
             notification,
             in_flight: Arc::new(AtomicBool::new(false)),
-            api_base: resolve_arxiv_api_base(),
             app_handle,
+            workspace_root,
+            app_data_dir,
         }
     }
 
@@ -166,7 +173,7 @@ impl PapersScheduler {
         let opt_in = self
             .store
             .get_opt_in()
-            .map_err(|e| FireError::Storage(e.to_string()))?;
+            .map_err(|e| FireError::Sidecar(e.to_string()))?;
         if !matches!(opt_in, Some(true)) {
             tracing::info!(
                 opt_in = ?opt_in,
@@ -194,16 +201,28 @@ impl PapersScheduler {
         }
 
         let query = keywords.join(" ");
-        let api_base = self.api_base.clone();
-        let store = self.store.clone();
+        let workspace_root = self.workspace_root.clone();
+        let app_data_dir = self.app_data_dir.clone();
         let inserted: Vec<PaperRecord> = tokio::task::spawn_blocking(move || {
-            let client = make_blocking_arxiv_fetcher()?;
-            let fetcher = |url: &str| fetch_arxiv_with_retry(&client, url, MAX_RETRY_ATTEMPTS);
-            fetch_papers_gated(&store, &fetcher, &api_base, &query, "scheduled")
+            // Per the immutable goal, arXiv HTTP runs inside the
+            // papers-plugin sidecar process. The host owns timing
+            // and SQLite reads (list_recent for the UI) but not the
+            // network call. The sidecar opens the same SQLite file
+            // via APP_DATA_DIR so the host sees the new rows.
+            let binary = resolve_binary_path(&workspace_root)
+                .map_err(|e| FireError::Sidecar(e.to_string()))?;
+            fetch_via_sidecar(
+                &binary,
+                &app_data_dir,
+                &workspace_root,
+                &query,
+                FetchPurpose::ScheduledDigest,
+            )
+            .map_err(|e: SidecarClientError| FireError::Sidecar(e.to_string()))
         })
         .await
         .map_err(|e| FireError::Join(e.to_string()))?
-        .map_err(|e| FireError::Storage(e.to_string()))?;
+        .map_err(|e: FireError| e)?;
 
         let count = inserted.len();
         // last_fired_at was already advanced inside the transaction
@@ -240,8 +259,8 @@ pub enum FireError {
     EmptyContext,
     #[error("context extraction task: {0}")]
     ContextExtraction(String),
-    #[error("storage / arxiv: {0}")]
-    Storage(String),
+    #[error("papers sidecar: {0}")]
+    Sidecar(String),
     #[error("task join: {0}")]
     Join(String),
 }

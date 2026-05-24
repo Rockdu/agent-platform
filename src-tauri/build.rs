@@ -35,37 +35,68 @@ fn main() {
         panic!("{e}");
     });
 
-    // Stage `<sidecar>-<triple>` placeholders so tauri_build's
-    // externalBin check passes even when the sidecars have not been
-    // built. This is a build-time concern only; the real binaries are
-    // produced by `npm run build:sidecars` before the bundler actually
-    // copies them, and at runtime the host resolves binaries via
-    // `dev_diagnostics::resolve_expected_paths` (which looks at the
-    // canonical un-suffixed name).
+    // Stage `<sidecar>-<triple>` artefacts so tauri_build's
+    // `bundle.externalBin` check finds the expected name. Behaviour
+    // depends on the cargo PROFILE:
+    //
+    // - debug: placeholders are acceptable. Developers run
+    //   `cargo check` / `cargo test` against the host crate without
+    //   pre-building sidecars; the real `target/debug/<sidecar>` is
+    //   produced by `npm run build:sidecars:debug`. A zero-byte
+    //   placeholder lets the bundler-validation pass without
+    //   shipping any debug bundle.
+    //
+    // - release: zero-byte placeholders are REFUSED. A release build
+    //   that ships a bundle MUST package real sidecars; otherwise
+    //   the packaged app would crash the moment it spawns the
+    //   sidecar. We panic with a clear message pointing at the
+    //   `npm run build:sidecars:release` script that produces real
+    //   release binaries and stages the target-triple-suffixed
+    //   copies.
     let target_triple = std::env::var("TARGET").unwrap_or_default();
+    let profile = std::env::var("PROFILE").unwrap_or_default();
     if !target_triple.is_empty() {
-        for profile in ["debug", "release"] {
-            let target_dir = workspace_root.join("target").join(profile);
-            if !target_dir.is_dir() {
-                let _ = std::fs::create_dir_all(&target_dir);
+        let target_dir = workspace_root.join("target").join(&profile);
+        if !target_dir.is_dir() {
+            let _ = std::fs::create_dir_all(&target_dir);
+        }
+        for sidecar in BUNDLED_SIDECARS {
+            let canonical = target_dir.join(sidecar);
+            let suffixed = target_dir.join(format!("{sidecar}-{target_triple}"));
+            let needs_real = profile == "release";
+            // If the suffixed file already exists, validate it for release.
+            if suffixed.exists() {
+                if needs_real {
+                    let meta = std::fs::metadata(&suffixed);
+                    let is_empty = meta.map(|m| m.len() == 0).unwrap_or(true);
+                    if is_empty {
+                        panic!(
+                            "release bundle would ship zero-byte sidecar `{}`. Run `npm run build:sidecars:release` to produce a real binary before `cargo build --release`.",
+                            suffixed.display()
+                        );
+                    }
+                }
+                continue;
             }
-            for sidecar in BUNDLED_SIDECARS {
-                let canonical = target_dir.join(sidecar);
-                let suffixed = target_dir.join(format!("{sidecar}-{target_triple}"));
-                if suffixed.exists() {
+            if canonical.exists() {
+                let meta = std::fs::metadata(&canonical).ok();
+                let is_real = meta.map(|m| m.len() > 0).unwrap_or(false);
+                if is_real {
+                    let _ = std::fs::copy(&canonical, &suffixed);
                     continue;
                 }
-                if canonical.exists() {
-                    let _ = std::fs::copy(&canonical, &suffixed);
-                } else {
-                    // No real binary yet — create a zero-byte placeholder
-                    // so the bundler check passes during cargo check /
-                    // cargo test of the host crate. The real binary is
-                    // produced by `npm run build:sidecars` before any
-                    // packaged build runs.
-                    let _ = std::fs::File::create(&suffixed);
-                }
             }
+            // Canonical missing or zero-byte.
+            if needs_real {
+                panic!(
+                    "release bundle requires `{}`. Run `npm run build:sidecars:release` to produce real sidecars before `cargo build --release`.",
+                    suffixed.display()
+                );
+            }
+            // Debug profile: zero-byte placeholder is acceptable so
+            // `cargo check` / `cargo test` against the host don't
+            // need sidecars pre-built.
+            let _ = std::fs::File::create(&suffixed);
         }
     }
 
