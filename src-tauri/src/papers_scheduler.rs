@@ -122,7 +122,7 @@ pub fn duration_until_next_local_fire_chrono<Tz>(
 where
     Tz: chrono::TimeZone,
 {
-    use chrono::{NaiveDate, TimeZone};
+    use chrono::NaiveDate;
 
     fn pick_local<Tz: chrono::TimeZone>(
         tz: &Tz,
@@ -235,11 +235,18 @@ impl PapersScheduler {
         }
     }
 
-    /// Spawn the long-running daily loop on the current tokio runtime.
-    /// The future returned by `start()` resolves immediately; the loop
-    /// runs as a `tokio::spawn` task.
+    /// Spawn the long-running daily loop on Tauri's shared async
+    /// runtime. The future returned by `start()` resolves immediately;
+    /// the loop runs as a background task on the runtime Tauri
+    /// installed (tokio by default).
+    ///
+    /// Uses `tauri::async_runtime::spawn` instead of `tokio::spawn`
+    /// because the Tauri setup hook is invoked synchronously from
+    /// `did_finish_launching` (no tokio runtime in thread-local
+    /// scope), so a bare `tokio::spawn` panics with "there is no
+    /// reactor running".
     pub fn start(self) {
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             self.run_loop().await;
         });
     }
