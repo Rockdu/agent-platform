@@ -79,6 +79,18 @@ pub fn extract_workspace_keywords<P: AsRef<Path>>(
     workspaces: &[P],
     total_budget_bytes: usize,
 ) -> Vec<String> {
+    extract_workspace_keywords_with_git(workspaces, total_budget_bytes, "git")
+}
+
+/// Injectable variant that lets tests substitute the git binary
+/// (typically a tempfile shell script) so the subprocess-timeout
+/// regression test can run without touching the process-wide PATH
+/// — global PATH mutation races other parallel tests in this crate.
+pub fn extract_workspace_keywords_with_git<P: AsRef<Path>>(
+    workspaces: &[P],
+    total_budget_bytes: usize,
+    git_bin: &str,
+) -> Vec<String> {
     if workspaces.is_empty() {
         return Vec::new();
     }
@@ -128,7 +140,9 @@ pub fn extract_workspace_keywords<P: AsRef<Path>>(
         let Some(git_timeout) = git_timeout_for_remaining(remaining_ms) else {
             break;
         };
-        if let Ok(subjects) = mine_git_commits(ws, MAX_GIT_COMMITS, git_timeout) {
+        if let Ok(subjects) =
+            mine_git_commits_with_git(git_bin, ws, MAX_GIT_COMMITS, git_timeout)
+        {
             for s in subjects {
                 let redacted = redact_sensitive_spans(&s);
                 for t in tokenize(&redacted) {
@@ -334,12 +348,31 @@ fn is_useful_token(s: &str) -> bool {
 /// Spawn `git log --oneline -<n>` in `workspace` with a hard timeout.
 /// Returns the commit subject lines on success, or an error if the
 /// timeout fired, git was missing, or the workspace was not a git repo.
+///
+/// Public convenience wrapper around `mine_git_commits_with_git("git", …)`.
+/// Existing callers (and the two tests in this module) use this name.
+#[allow(dead_code)]
 pub fn mine_git_commits(
     workspace: &Path,
     n: usize,
     timeout_ms: u64,
 ) -> Result<Vec<String>, MineGitError> {
-    let mut cmd = Command::new("git");
+    mine_git_commits_with_git("git", workspace, n, timeout_ms)
+}
+
+/// Injectable variant of `mine_git_commits` — tests pass a fake git
+/// binary path so the adversarial timeout regression can run without
+/// PATH mutation. On Unix the child is launched in its own process
+/// group; on timeout the entire group is SIGKILL'd so any descendant
+/// process holding the inherited stdout fd is reaped and the reader
+/// thread can return EOF immediately.
+pub fn mine_git_commits_with_git(
+    git_bin: &str,
+    workspace: &Path,
+    n: usize,
+    timeout_ms: u64,
+) -> Result<Vec<String>, MineGitError> {
+    let mut cmd = Command::new(git_bin);
     cmd.arg("-C")
         .arg(workspace)
         .arg("log")
@@ -349,7 +382,19 @@ pub fn mine_git_commits(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null());
+    // On Unix, put git in its own process group so the timeout path
+    // can SIGKILL the whole group — wrapper-style git processes
+    // (shell scripts, sudo, etc.) leave descendants holding stdout
+    // even after the immediate child is killed, which made the
+    // reader thread block forever on `read_to_string` waiting for
+    // EOF that never came.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd.spawn().map_err(|e| MineGitError::Spawn(e.to_string()))?;
+    let child_pid = child.id();
     let stdout = child
         .stdout
         .take()
@@ -365,20 +410,30 @@ pub fn mine_git_commits(
     let start = Instant::now();
     let deadline = Duration::from_millis(timeout_ms);
     let body = loop {
-        if let Ok(s) = rx.recv_timeout(Duration::from_millis(50)) {
-            break Some(s);
-        }
-        if start.elapsed() > deadline {
+        // Sleep at most until the deadline; never longer than 50 ms.
+        let remaining_until_deadline = deadline.saturating_sub(start.elapsed());
+        if remaining_until_deadline.is_zero() {
+            kill_process_group(child_pid);
             let _ = child.kill();
+            let _ = child.wait();
+            // With the group dead the descendant's stdout fd is
+            // closed, so the reader thread returns EOF immediately
+            // — join here is bounded.
             let _ = handle.join();
             return Err(MineGitError::Timeout);
         }
-        if let Ok(Some(_)) = child.try_wait() {
-            // process exited; drain stdout one more time
-            if let Ok(s) = rx.recv_timeout(Duration::from_millis(200)) {
-                break Some(s);
+        let poll = remaining_until_deadline.min(Duration::from_millis(50));
+        match rx.recv_timeout(poll) {
+            Ok(s) => break Some(s),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Ok(Some(_)) = child.try_wait() {
+                    if let Ok(s) = rx.recv_timeout(Duration::from_millis(200)) {
+                        break Some(s);
+                    }
+                    break None;
+                }
             }
-            break None;
         }
     };
     let _ = handle.join();
@@ -398,6 +453,26 @@ pub fn mine_git_commits(
         })
         .collect();
     Ok(subjects)
+}
+
+/// Best-effort SIGKILL of the entire process group whose group-id
+/// equals `child_pid`. Only meaningful on Unix; a no-op elsewhere.
+/// The fallback `child.kill()` in the caller covers the immediate
+/// child if the group send fails for any reason.
+fn kill_process_group(child_pid: u32) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        // Negative PID sends to the entire process group whose
+        // group-id is child_pid (set by `process_group(0)` above).
+        let pgid = Pid::from_raw(-(child_pid as i32));
+        let _ = kill(pgid, Signal::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child_pid;
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -803,6 +878,81 @@ mod tests {
         // Below the per-call ceiling but above the spawn floor, the
         // remaining budget caps the timeout.
         assert_eq!(git_timeout_for_remaining(800), Some(800));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn extract_workspace_keywords_with_hanging_git_respects_2s_contract() {
+        // Regression for the subprocess-timeout bug: a wrapper-style
+        // git that leaves a descendant holding stdout open would
+        // make the reader thread block on EOF forever, so even
+        // though `child.kill()` killed the immediate process, the
+        // total extraction time would balloon past the plan's
+        // "<2 seconds total" budget.
+        //
+        // This test uses the injectable git-binary helper so it does
+        // NOT mutate process-wide PATH — Rust unit tests in this
+        // crate run in parallel within one process and a PATH change
+        // would race other git-using tests.
+        let fake_dir = TempDir::new().unwrap();
+        let fake_git = fake_dir.path().join("git");
+        fs::write(&fake_git, "#!/bin/sh\nsleep 5\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&fake_git).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_git, perms).unwrap();
+        let fake_git_str = fake_git.to_string_lossy().to_string();
+
+        let workspaces: Vec<TempDir> = (0..4).map(|_| TempDir::new().unwrap()).collect();
+        for ws in &workspaces {
+            write_claude_fixture(
+                ws.path(),
+                "transformer attention diffusion gradient research notes",
+            );
+        }
+        let paths: Vec<&std::path::Path> = workspaces.iter().map(|d| d.path()).collect();
+
+        let start = Instant::now();
+        let _tokens = extract_workspace_keywords_with_git(&paths, 64 * 1024, &fake_git_str);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "extract_workspace_keywords_with_git exceeded the 2-second context budget; \
+             elapsed = {elapsed:?} across {} workspaces with a hanging git",
+            paths.len()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mine_git_commits_with_git_returns_timeout_within_budget_on_hang() {
+        // Per-call boundary check: a hanging git fixture must return
+        // `MineGitError::Timeout` within roughly the configured
+        // timeout, not after the sleep finishes. We give a 600 ms
+        // headroom over the 200 ms timeout to absorb spawn latency.
+        let fake_dir = TempDir::new().unwrap();
+        let fake_git = fake_dir.path().join("git");
+        fs::write(&fake_git, "#!/bin/sh\nsleep 5\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&fake_git).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_git, perms).unwrap();
+
+        let ws = TempDir::new().unwrap();
+        let start = Instant::now();
+        let result = mine_git_commits_with_git(
+            &fake_git.to_string_lossy(),
+            ws.path(),
+            5,
+            200,
+        );
+        let elapsed = start.elapsed();
+        assert!(matches!(result, Err(MineGitError::Timeout)));
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "mine_git_commits_with_git took {elapsed:?} for a 200ms timeout; group-kill is not working"
+        );
     }
 
     #[test]
