@@ -207,6 +207,55 @@ pub async fn papers_refresh_now(
     sched.fire().await.map_err(|e| e.to_string())
 }
 
+/// Open an arXiv URL in the system browser. Tauri intercepts
+/// `target="_blank"` anchors so a plain link does nothing; this
+/// command shells out to the platform opener like the IDE/Finder
+/// handoff does. Only `http://` / `https://` URLs are accepted —
+/// anything else (file://, custom schemes, shell metacharacters) is
+/// rejected so the command can't be abused to launch arbitrary
+/// handlers.
+#[tauri::command]
+pub fn papers_open_url(
+    registry: State<'_, MountRegistry>,
+    capability: String,
+    url: String,
+) -> Result<(), String> {
+    require_papers_capability(&registry, &capability)?;
+    let parsed = url.trim();
+    if !is_openable_http_url(parsed) {
+        return Err(format!("refusing to open non-http(s) or malformed url: {parsed}"));
+    }
+    open_external_url(parsed).map_err(|e| e.to_string())
+}
+
+/// True only for plain `http(s)://` URLs with no whitespace or control
+/// characters. Used to gate `papers_open_url` so the command can't
+/// shell-launch `file://`, custom schemes, or anything containing
+/// shell-confusing whitespace; arXiv abstract URLs always satisfy it.
+fn is_openable_http_url(url: &str) -> bool {
+    (url.starts_with("https://") || url.starts_with("http://"))
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+fn open_external_url(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let (cmd, args): (&str, Vec<&str>) = ("/usr/bin/open", vec![url]);
+    #[cfg(target_os = "linux")]
+    let (cmd, args): (&str, Vec<&str>) = ("xdg-open", vec![url]);
+    #[cfg(target_os = "windows")]
+    let (cmd, args): (&str, Vec<&str>) = ("cmd", vec!["/C", "start", "", url]);
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let (cmd, args): (&str, Vec<&str>) = ("xdg-open", vec![url]);
+
+    std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +318,18 @@ mod tests {
         // After unmount the capability is no longer valid.
         let err = require_papers_capability(&registry, &handle).unwrap_err();
         assert!(err.contains("capability_expired"), "got: {err}");
+    }
+
+    #[test]
+    fn is_openable_http_url_accepts_arxiv_and_rejects_other_schemes() {
+        assert!(is_openable_http_url("https://arxiv.org/abs/2401.00001"));
+        assert!(is_openable_http_url("http://export.arxiv.org/abs/2401.00001"));
+        // Non-http(s) schemes and shell-confusing inputs are rejected.
+        assert!(!is_openable_http_url("file:///etc/passwd"));
+        assert!(!is_openable_http_url("javascript:alert(1)"));
+        assert!(!is_openable_http_url("ftp://example.com"));
+        assert!(!is_openable_http_url("https://arxiv.org/abs/2401 foo"));
+        assert!(!is_openable_http_url("https://arxiv.org/abs/\n2401"));
+        assert!(!is_openable_http_url(""));
     }
 }

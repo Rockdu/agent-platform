@@ -1126,6 +1126,7 @@ pub fn run() {
             papers_commands::papers_search,
             papers_commands::papers_refresh_now,
             papers_commands::papers_get_cooldown_state,
+            papers_commands::papers_open_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
