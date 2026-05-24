@@ -1,17 +1,20 @@
 //! Daily papers digest scheduler.
 //!
 //! Owns the 10 AM local-time fire, the startup backfill check, the
-//! opt-in gate, and the in-flight dedup. Calls into `papers-plugin`'s
-//! library helpers for arXiv HTTP, XML parse, and SQLite write so the
-//! sidecar binary is reserved for the orchestrator Claude's MCP tool
-//! surface.
+//! opt-in gate, the in-flight dedup, and the user-facing notification
+//! surface. arXiv HTTP itself runs inside the `papers-plugin` sidecar
+//! subprocess (spawned via `papers_sidecar_client`) per the immutable
+//! plan goal; the host owns timing, context extraction, and reads
+//! over the shared SQLite at `${APP_DATA_DIR}/plugins/papers/state.sqlite`.
 //!
 //! Failure model:
-//!   - HTTP / parse errors update `scheduler_state.last_error` and
-//!     do NOT update `last_fired_at`. The next startup or 10 AM tick
-//!     will retry.
+//!   - HTTP / parse errors are recorded into `scheduler_state.last_error`
+//!     inside the sidecar's `fetch_papers_gated` call and surfaced to
+//!     the host as `FireError::Sidecar`. `last_fired_at` is only
+//!     advanced when a scheduled fetch successfully commits rows.
 //!   - The opt-in flag is checked on every fire. Disabled → skip
-//!     extraction and HTTP entirely (no network call).
+//!     extraction and HTTP entirely (no subprocess spawn beyond the
+//!     opt-in check).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,10 +80,12 @@ pub fn should_backfill(now_unix_secs: u64, last_fired_unix_secs: Option<u64>) ->
 /// Long-lived scheduler state held by the host. Cheap to clone — the
 /// store and atomic are wrapped in Arc.
 ///
-/// `workspace_root` + `app_data_dir` are passed to the papers sidecar
-/// subprocess so it opens the same SQLite the host reads from. The
-/// host no longer holds a reqwest client — all arXiv HTTP goes through
-/// the sidecar binary per the immutable goal.
+/// `binary_root` is the directory tree the resolver walks to find the
+/// `papers-plugin` executable (repo root in dev). `app_data_dir` is
+/// passed to the sidecar as `APP_DATA_DIR` and is also where the host
+/// `PapersStore` is opened — host and sidecar must agree on this so
+/// they read/write the same SQLite. `bundle_resource_root` is the
+/// optional packaged-app resource directory for `bundle.externalBin`.
 #[derive(Clone)]
 pub struct PapersScheduler {
     pub store: Arc<PapersStore>,
@@ -88,7 +93,8 @@ pub struct PapersScheduler {
     pub notification: Arc<NotificationService>,
     pub in_flight: Arc<AtomicBool>,
     pub app_handle: Option<tauri::AppHandle>,
-    pub workspace_root: PathBuf,
+    pub binary_root: PathBuf,
+    pub bundle_resource_root: Option<PathBuf>,
     pub app_data_dir: PathBuf,
 }
 
@@ -98,7 +104,8 @@ impl PapersScheduler {
         workspaces: WorkspaceRegistry,
         notification: Arc<NotificationService>,
         app_handle: Option<tauri::AppHandle>,
-        workspace_root: PathBuf,
+        binary_root: PathBuf,
+        bundle_resource_root: Option<PathBuf>,
         app_data_dir: PathBuf,
     ) -> Self {
         Self {
@@ -107,7 +114,8 @@ impl PapersScheduler {
             notification,
             in_flight: Arc::new(AtomicBool::new(false)),
             app_handle,
-            workspace_root,
+            binary_root,
+            bundle_resource_root,
             app_data_dir,
         }
     }
@@ -201,7 +209,8 @@ impl PapersScheduler {
         }
 
         let query = keywords.join(" ");
-        let workspace_root = self.workspace_root.clone();
+        let binary_root = self.binary_root.clone();
+        let bundle_resource_root = self.bundle_resource_root.clone();
         let app_data_dir = self.app_data_dir.clone();
         let inserted: Vec<PaperRecord> = tokio::task::spawn_blocking(move || {
             // Per the immutable goal, arXiv HTTP runs inside the
@@ -209,12 +218,12 @@ impl PapersScheduler {
             // and SQLite reads (list_recent for the UI) but not the
             // network call. The sidecar opens the same SQLite file
             // via APP_DATA_DIR so the host sees the new rows.
-            let binary = resolve_binary_path(&workspace_root)
+            let binary = resolve_binary_path(&binary_root, bundle_resource_root.as_deref())
                 .map_err(|e| FireError::Sidecar(e.to_string()))?;
             fetch_via_sidecar(
                 &binary,
                 &app_data_dir,
-                &workspace_root,
+                &app_data_dir,
                 &query,
                 FetchPurpose::ScheduledDigest,
             )

@@ -859,18 +859,25 @@ pub fn run() {
                     // bridge and the later Tauri command surface share
                     // the same handle. None on failure (papers feature
                     // disabled but rest of app still runs).
+                    //
+                    // The plugin SQLite root MUST be the same root the
+                    // papers-plugin sidecar opens via `APP_DATA_DIR`
+                    // (resolved from `app_data_root`). Otherwise host
+                    // reads and sidecar writes go to different files
+                    // and the UI never sees scheduled/manual results.
+                    let papers_plugins_root = app_data_root.join("plugins");
                     let papers_store_arc: Option<std::sync::Arc<papers_plugin::PapersStore>> = (|| {
-                        let plugins_root = paths.agent_platform.join("plugins");
-                        let _ = std::fs::create_dir_all(&plugins_root);
-                        let plugin_dir = plugins_root.join("papers");
+                        let _ = std::fs::create_dir_all(&papers_plugins_root);
+                        let plugin_dir = papers_plugins_root.join("papers");
                         let _ = std::fs::create_dir_all(&plugin_dir);
                         let db_path = plugin_dir.join("state.sqlite");
-                        let migrations_dir = std::env::current_dir()
-                            .ok()?
+                        let migrations_dir = dev_diagnostics::workspace_root_for_dev()
                             .join("plugins")
                             .join("papers")
                             .join("migrations");
-                        if let Ok(storage) = plugin_sqlite::PluginStorage::open(&plugins_root, "papers") {
+                        if let Ok(storage) =
+                            plugin_sqlite::PluginStorage::open(&papers_plugins_root, "papers")
+                        {
                             if migrations_dir.is_dir() {
                                 let _ = storage.run_migrations(&migrations_dir);
                             }
@@ -889,7 +896,16 @@ pub fn run() {
                                     app_handle: Some(app.handle().clone()),
                                     papers_store: papers_store_arc.clone(),
                                     papers_sidecar_paths: Some(host_rpc::PapersSidecarPaths {
-                                        workspace_root: paths.agent_platform.clone(),
+                                        // Repo root — sidecar binary lives at
+                                        // `<binary_root>/target/{debug,release}/papers-plugin`.
+                                        // `paths.agent_platform` (~/AgentPlatform) is the
+                                        // user data dir, NOT the repo root, so the
+                                        // resolver would never find the binary there.
+                                        binary_root: dev_diagnostics::workspace_root_for_dev(),
+                                        bundle_resource_root: app
+                                            .path()
+                                            .resource_dir()
+                                            .ok(),
                                         app_data_dir: app_data_root.clone(),
                                     }),
                                 },
@@ -933,19 +949,22 @@ pub fn run() {
                     if let Some(store) = papers_store_arc.clone() {
                         let workspaces_handle =
                             app.state::<WorkspaceRegistry>().inner().clone();
+                        let bundle_resource_root = app.path().resource_dir().ok();
                         let scheduler = papers_scheduler::PapersScheduler::new(
                             store.clone(),
                             workspaces_handle,
                             notification_service_arc.clone(),
                             Some(app.handle().clone()),
-                            paths.agent_platform.clone(),
+                            dev_diagnostics::workspace_root_for_dev(),
+                            bundle_resource_root.clone(),
                             app_data_root_for_papers.clone(),
                         );
                         scheduler.clone().start();
                         app.manage(papers_commands::PapersHandle {
                             store,
                             scheduler,
-                            workspace_root: paths.agent_platform.clone(),
+                            binary_root: dev_diagnostics::workspace_root_for_dev(),
+                            bundle_resource_root,
                             app_data_dir: app_data_root_for_papers.clone(),
                         });
                     } else {

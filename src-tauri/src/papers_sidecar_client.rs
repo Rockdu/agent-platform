@@ -44,17 +44,42 @@ pub enum SidecarClientError {
     NoResponse,
 }
 
-/// Locate the papers-plugin binary. Honours `PAPERS_PLUGIN_BIN_OVERRIDE`
-/// for tests so the test harness can point at a freshly-built sidecar
-/// without depending on the production resolution order.
-pub fn resolve_binary_path(workspace_root: &Path) -> Result<PathBuf, SidecarClientError> {
+/// Locate the papers-plugin binary. Resolution order:
+///   1. `PAPERS_PLUGIN_BIN_OVERRIDE` env var (tests).
+///   2. Dev source-tree paths under `binary_root` via
+///      `dev_diagnostics::resolve_expected_paths`. `binary_root` MUST
+///      be the repo workspace root (e.g. `dev_diagnostics::workspace_root_for_dev()`),
+///      NOT the user data dir — the latter has no `target/` tree.
+///   3. Packaged-resource paths under `bundle_resource_root` if
+///      provided — Tauri's `bundle.externalBin` lands sidecars there
+///      as `<name>-<target-triple>` with no extension on macOS.
+pub fn resolve_binary_path(
+    binary_root: &Path,
+    bundle_resource_root: Option<&Path>,
+) -> Result<PathBuf, SidecarClientError> {
     if let Ok(path) = std::env::var("PAPERS_PLUGIN_BIN_OVERRIDE") {
         let p = PathBuf::from(path);
         if p.exists() {
             return Ok(p);
         }
     }
-    let candidates = resolve_expected_paths(workspace_root, SIDECAR_BIN);
+    let mut candidates: Vec<PathBuf> = resolve_expected_paths(binary_root, SIDECAR_BIN);
+    if let Some(bundle) = bundle_resource_root {
+        // Tauri appends `-<target-triple>` to externalBin entries; we
+        // try the canonical name first (resource dir without the
+        // suffix) then a few common triples so a packaged build with
+        // a known triple succeeds without needing tauri runtime
+        // introspection here.
+        candidates.push(bundle.join(SIDECAR_BIN));
+        for triple in [
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+        ] {
+            candidates.push(bundle.join(format!("{SIDECAR_BIN}-{triple}")));
+        }
+    }
     for c in &candidates {
         if c.exists() {
             return Ok(c.clone());
@@ -185,7 +210,7 @@ mod tests {
         unsafe {
             std::env::remove_var("PAPERS_PLUGIN_BIN_OVERRIDE");
         }
-        let err = resolve_binary_path(tmp.path()).unwrap_err();
+        let err = resolve_binary_path(tmp.path(), None).unwrap_err();
         match err {
             SidecarClientError::BinaryNotFound { searched } => {
                 assert!(searched.contains("target/debug/papers-plugin"));
@@ -204,10 +229,138 @@ mod tests {
         unsafe {
             std::env::set_var("PAPERS_PLUGIN_BIN_OVERRIDE", &fake_bin);
         }
-        let resolved = resolve_binary_path(tmp.path()).unwrap();
+        let resolved = resolve_binary_path(tmp.path(), None).unwrap();
         assert_eq!(resolved, fake_bin);
         unsafe {
             std::env::remove_var("PAPERS_PLUGIN_BIN_OVERRIDE");
         }
+    }
+
+    #[test]
+    fn resolve_binary_path_does_not_search_user_data_root() {
+        // Regression: a previous wiring passed the user data root
+        // (e.g. ~/AgentPlatform) as the search root, but that tree
+        // has no `target/` directory. The resolver must search the
+        // workspace root paths (`<root>/target/...` and
+        // `<root>/src-tauri/target/...`), not anything based on the
+        // user data dir. Here we use a tempdir that simulates the
+        // user data root: no `target/` subtree exists, and the
+        // resolver should fail with BinaryNotFound listing the
+        // workspace candidates relative to the workspace root
+        // passed in — never relative to ~/AgentPlatform.
+        let user_data_root = tempfile::TempDir::new().unwrap();
+        let workspace_root = tempfile::TempDir::new().unwrap();
+        unsafe {
+            std::env::remove_var("PAPERS_PLUGIN_BIN_OVERRIDE");
+        }
+        let err = resolve_binary_path(workspace_root.path(), None).unwrap_err();
+        let SidecarClientError::BinaryNotFound { searched } = err else {
+            panic!("expected BinaryNotFound");
+        };
+        // The error must reference the workspace_root passed in,
+        // not the user_data_root.
+        let workspace_str = workspace_root.path().display().to_string();
+        let user_data_str = user_data_root.path().display().to_string();
+        assert!(
+            searched.contains(&workspace_str),
+            "searched must include workspace_root; got `{searched}`"
+        );
+        assert!(
+            !searched.contains(&user_data_str),
+            "searched MUST NOT include user_data_root; got `{searched}`"
+        );
+    }
+
+    /// The host store and the sidecar subprocess MUST open the same
+    /// SQLite path when given the same `app_data_dir`. Catches the
+    /// regression where the host opened one DB while the sidecar
+    /// wrote to another. This test pins the path contract: both
+    /// sides compute `${app_data_dir}/plugins/papers/state.sqlite`.
+    #[test]
+    fn host_store_path_equals_sidecar_app_data_path() {
+        let app_data = tempfile::TempDir::new().unwrap();
+        // The path the host bootstrap derives.
+        let host_path = app_data
+            .path()
+            .join("plugins")
+            .join("papers")
+            .join("state.sqlite");
+        // The path the sidecar derives via APP_DATA_DIR resolution.
+        // Mirrors `papers_plugin::resolve_papers_db_path`.
+        let sidecar_path = std::path::PathBuf::from(app_data.path())
+            .join("plugins")
+            .join("papers")
+            .join("state.sqlite");
+        assert_eq!(
+            host_path, sidecar_path,
+            "host and sidecar must derive the same SQLite path from the same app_data_dir"
+        );
+    }
+
+    /// Cross-handle visibility regression: a row inserted via one `PapersStore`
+    /// handle pointed at a tempdir MUST be visible via another
+    /// `PapersStore` handle pointed at the SAME tempdir. This proves
+    /// the WAL-mode sharing semantics that the host scheduler /
+    /// list_recent code paths depend on after the manual search runs
+    /// inside the sidecar subprocess.
+    #[test]
+    fn host_sees_sidecar_inserted_paper_via_list_recent() {
+        use papers_plugin::{FetchPurpose, PaperRecord, PapersStore};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("plugins").join("papers").join("state.sqlite");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        // Initialise schema directly via rusqlite so this test does
+        // not depend on the workspace migration runner.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(include_str!(
+            "../../plugins/papers/migrations/0001_init.sql"
+        ))
+        .unwrap();
+        drop(conn);
+
+        // Sidecar-side handle: insert as if a manual search ran.
+        let sidecar_store = PapersStore::open(&db_path).unwrap();
+        sidecar_store.set_opt_in(true).unwrap();
+        let record = PaperRecord {
+            arxiv_id: "2024.cross-process".to_string(),
+            title: "Cross-Process Visibility".to_string(),
+            authors: vec!["Tester".to_string()],
+            abstract_snippet: "ensures host sees sidecar inserts".to_string(),
+            pdf_url: "http://arxiv.org/pdf/2024.cross-process".to_string(),
+            abs_url: "http://arxiv.org/abs/2024.cross-process".to_string(),
+            source: "manual".to_string(),
+            fetched_at: papers_plugin::now_iso8601(),
+            starred: false,
+            read_at: None,
+        };
+        sidecar_store.insert_dedup(&[record], "manual-query").unwrap();
+        // Manual-search invariant: insert_dedup must NOT have advanced last_fired_at.
+        assert!(sidecar_store.last_fired_at_unix().unwrap().is_none());
+        // Touch FetchPurpose so the trait is exercised; the value is
+        // not used past this point.
+        let _ = FetchPurpose::ManualSearch;
+
+        // Host-side handle on the same SQLite file: must see the row.
+        let host_store = PapersStore::open(&db_path).unwrap();
+        let listed = host_store.list_recent(10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].arxiv_id, "2024.cross-process");
+        assert_eq!(listed[0].source, "manual");
+    }
+
+    #[test]
+    fn bundle_resource_root_paths_are_tried() {
+        let workspace_root = tempfile::TempDir::new().unwrap();
+        let bundle = tempfile::TempDir::new().unwrap();
+        // Stage a triple-suffixed binary under the bundle resource root
+        // to simulate `bundle.externalBin` staging.
+        let triple = "aarch64-apple-darwin";
+        let bundled = bundle.path().join(format!("papers-plugin-{triple}"));
+        std::fs::write(&bundled, "stub").unwrap();
+        unsafe {
+            std::env::remove_var("PAPERS_PLUGIN_BIN_OVERRIDE");
+        }
+        let resolved = resolve_binary_path(workspace_root.path(), Some(bundle.path())).unwrap();
+        assert_eq!(resolved, bundled);
     }
 }

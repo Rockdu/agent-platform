@@ -24,7 +24,10 @@ use crate::papers_sidecar_client::{fetch_via_sidecar, resolve_binary_path};
 pub struct PapersHandle {
     pub store: Arc<PapersStore>,
     pub scheduler: PapersScheduler,
-    pub workspace_root: PathBuf,
+    /// Directory the sidecar binary resolver walks (repo root in dev).
+    pub binary_root: PathBuf,
+    pub bundle_resource_root: Option<PathBuf>,
+    /// Sidecar APP_DATA_DIR — also where the host opens `PapersStore`.
     pub app_data_dir: PathBuf,
 }
 
@@ -92,15 +95,17 @@ pub async fn papers_search(
     // reads that the UI consumes afterwards. The sidecar opens the
     // same SQLite via APP_DATA_DIR; manual fetches stamp `source =
     // "manual"` and do NOT advance `last_fired_at`.
-    let workspace_root = handle.workspace_root.clone();
+    let binary_root = handle.binary_root.clone();
+    let bundle_resource_root = handle.bundle_resource_root.clone();
     let app_data_dir = handle.app_data_dir.clone();
     let q = query.clone();
     tokio::task::spawn_blocking(move || {
-        let binary = resolve_binary_path(&workspace_root).map_err(|e| e.to_string())?;
+        let binary = resolve_binary_path(&binary_root, bundle_resource_root.as_deref())
+            .map_err(|e| e.to_string())?;
         fetch_via_sidecar(
             &binary,
             &app_data_dir,
-            &workspace_root,
+            &app_data_dir,
             &q,
             FetchPurpose::ManualSearch,
         )

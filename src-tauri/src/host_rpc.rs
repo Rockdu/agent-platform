@@ -83,7 +83,15 @@ pub struct HostRpcState {
 
 #[derive(Debug, Clone)]
 pub struct PapersSidecarPaths {
-    pub workspace_root: std::path::PathBuf,
+    /// Where to look for the `papers-plugin` binary. In dev this is the
+    /// repo workspace root (`dev_diagnostics::workspace_root_for_dev()`).
+    /// MUST NOT be the user data dir — that tree has no `target/`.
+    pub binary_root: std::path::PathBuf,
+    /// Optional packaged-resource root for `bundle.externalBin`.
+    pub bundle_resource_root: Option<std::path::PathBuf>,
+    /// Sidecar APP_DATA_DIR. The sidecar opens
+    /// `${app_data_dir}/plugins/papers/state.sqlite`; the host must
+    /// open the SAME path.
     pub app_data_dir: std::path::PathBuf,
 }
 
@@ -644,17 +652,19 @@ fn handle_papers_search(
             data: None,
         });
     }
-    let binary = crate::papers_sidecar_client::resolve_binary_path(&paths.workspace_root).map_err(
-        |e| JsonRpcError {
-            code: ERR_BOUNDED_READ_FAILED,
-            message: format!("papers sidecar resolve: {e}"),
-            data: None,
-        },
-    )?;
+    let binary = crate::papers_sidecar_client::resolve_binary_path(
+        &paths.binary_root,
+        paths.bundle_resource_root.as_deref(),
+    )
+    .map_err(|e| JsonRpcError {
+        code: ERR_BOUNDED_READ_FAILED,
+        message: format!("papers sidecar resolve: {e}"),
+        data: None,
+    })?;
     crate::papers_sidecar_client::fetch_via_sidecar(
         &binary,
         &paths.app_data_dir,
-        &paths.workspace_root,
+        &paths.app_data_dir,
         &params.query,
         papers_plugin::FetchPurpose::ManualSearch,
     )
