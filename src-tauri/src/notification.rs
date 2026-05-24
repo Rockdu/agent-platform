@@ -176,9 +176,25 @@ impl NotificationService {
                 }
             }
         }
-        // Best-effort native notification. Permission denial is logged
-        // by the sink itself; the entry is already in the ring.
-        self.inner.sink.fire(&title, &body);
+        // Resolve the OS notification permission lazily, mirroring
+        // `on_needs_attention`. On a fresh install the cached state is
+        // `Unknown` until the first terminal notification runs the
+        // prompt — without this gate, a papers digest that arrives
+        // first would bypass the prompt, and any future `fire()` call
+        // after denial would still hit the sink. On `Denied` we keep
+        // the tray ring entry and the `tray://updated` emit so the
+        // digest is still surfaced via the tray UI (graceful
+        // degradation: the user can read the digest from the menu bar
+        // even when the OS notification is suppressed).
+        let perm = self.ensure_permission_resolved();
+        if matches!(perm, NotifyPermissionState::Granted) {
+            self.inner.sink.fire(&title, &body);
+        } else {
+            tracing::info!(
+                ?perm,
+                "push_papers_digest: skipping native notification — permission not granted; tray ring still updated"
+            );
+        }
         if let Some(handle) = app_handle {
             // Notify any already-open tray window to refresh — the
             // same channel existing tray entries use.
@@ -737,6 +753,65 @@ mod tests {
         assert_eq!(svc.list_recent_entries().len(), 3);
         svc.clear_entries();
         assert_eq!(svc.list_recent_entries().len(), 0);
+    }
+
+    fn fake_papers_entry() -> PapersTrayEntry {
+        PapersTrayEntry {
+            arxiv_id: "2024.demo".to_string(),
+            title: "Demo".to_string(),
+            abstract_snippet: "abs".to_string(),
+            abs_url: "http://arxiv.org/abs/2024.demo".to_string(),
+            fetched_at: "2026-05-24T10:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn papers_digest_resolves_permission_before_firing() {
+        // On a fresh service the cached permission is Unknown until the
+        // first `ensure_permission_resolved` call. push_papers_digest
+        // MUST run that resolution and only call `sink.fire` when the
+        // sink reports Granted. This proves a papers digest that
+        // arrives before any terminal notification still routes through
+        // the prompt-then-fire gate.
+        let sink = RecordingSink::new(NotifyPermissionState::Granted);
+        let svc = NotificationService::with_sink(sink.clone());
+        assert!(matches!(svc.permission_state_dto(), PermissionStateDto::Unknown));
+        svc.push_papers_digest(
+            "每日论文推荐".to_string(),
+            "1 paper found".to_string(),
+            vec![fake_papers_entry()],
+            None,
+        );
+        assert_eq!(sink.fire_count(), 1, "Granted sink must fire exactly once");
+        assert!(matches!(svc.permission_state_dto(), PermissionStateDto::Granted));
+        // Ring entry is still recorded so the tray UI sees the digest.
+        assert_eq!(svc.list_recent_papers_entries().len(), 1);
+    }
+
+    #[test]
+    fn papers_digest_skips_native_when_permission_denied() {
+        // When the sink reports Denied, the native `fire` MUST be
+        // suppressed so the OS doesn't see repeated rejected
+        // notifications. The papers ring still records the entry so the
+        // user can read the digest via the tray UI — graceful
+        // degradation: every digest is still surfaced via the menu bar
+        // even when the OS notification is rejected.
+        let sink = RecordingSink::new(NotifyPermissionState::Denied);
+        let svc = NotificationService::with_sink(sink.clone());
+        svc.push_papers_digest(
+            "每日论文推荐".to_string(),
+            "1 paper found".to_string(),
+            vec![fake_papers_entry()],
+            None,
+        );
+        assert_eq!(
+            sink.fire_count(),
+            0,
+            "Denied permission must NOT trigger sink.fire"
+        );
+        assert!(matches!(svc.permission_state_dto(), PermissionStateDto::Denied));
+        // Ring still has the entry — degraded but not lost.
+        assert_eq!(svc.list_recent_papers_entries().len(), 1);
     }
 
     #[test]

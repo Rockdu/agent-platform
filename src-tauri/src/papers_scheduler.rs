@@ -96,6 +96,93 @@ pub fn next_fire_on_same_local_day(
     now_local.div_euclid(86400) == next_local.div_euclid(86400)
 }
 
+/// DST-aware production helper. Computes seconds from `now` until the
+/// next occurrence of `hour_local:00:00` in `now`'s timezone, using
+/// chrono's `from_local_datetime` so spring-forward / fall-back
+/// transitions are handled correctly. The fixed-offset arithmetic in
+/// `duration_until_next_fire_local` is preserved for its pure unit
+/// tests but is no longer used by `run_loop`.
+///
+/// Generic over `chrono::TimeZone` so tests can pin behaviour with
+/// `chrono_tz::Tz` (a real DST-aware timezone) while production passes
+/// `chrono::Local::now()` directly.
+pub fn duration_until_next_local_fire_chrono<Tz>(
+    now: chrono::DateTime<Tz>,
+    hour_local: u32,
+) -> Duration
+where
+    Tz: chrono::TimeZone,
+{
+    use chrono::{Datelike, NaiveDate, TimeZone};
+
+    fn pick_local<Tz: chrono::TimeZone>(
+        tz: &Tz,
+        naive: chrono::NaiveDateTime,
+    ) -> Option<chrono::DateTime<Tz>> {
+        match tz.from_local_datetime(&naive) {
+            chrono::LocalResult::Single(dt) => Some(dt),
+            // Ambiguous fall-back: pick the earlier instant so we fire
+            // at the first 10:00 the user sees that morning.
+            chrono::LocalResult::Ambiguous(early, _late) => Some(early),
+            // Spring-forward gap: the wall clock skips this hour. For
+            // the default 10:00 fire this won't trigger; if a future
+            // user chooses 02:30 on the spring-forward day, fall back
+            // to the next minute that DOES exist (advance by 1 hour
+            // — the cheapest sensible choice).
+            chrono::LocalResult::None => None,
+        }
+    }
+
+    let tz = now.timezone();
+    let today_date: NaiveDate = now.date_naive();
+    let target_today_naive = today_date
+        .and_hms_opt(hour_local, 0, 0)
+        .expect("hour_local must be 0..=23");
+    let target_today = pick_local(&tz, target_today_naive);
+
+    let chosen = match target_today {
+        Some(t) if t > now => t,
+        _ => {
+            // Today's slot already passed (or doesn't exist on the
+            // local clock today — fall through to tomorrow).
+            let tomorrow_naive = today_date
+                .succ_opt()
+                .expect("date succ")
+                .and_hms_opt(hour_local, 0, 0)
+                .expect("hour_local must be 0..=23");
+            pick_local(&tz, tomorrow_naive).unwrap_or_else(|| {
+                // Tomorrow's slot also doesn't exist — push to a slot
+                // that definitely will (next day, target_hour + 1).
+                let bumped_naive = today_date
+                    .succ_opt()
+                    .and_then(|d| d.succ_opt())
+                    .expect("date succ")
+                    .and_hms_opt(hour_local, 0, 0)
+                    .expect("hour_local must be 0..=23");
+                pick_local(&tz, bumped_naive).expect("two-day-ahead slot must exist")
+            })
+        }
+    };
+
+    let secs = (chosen - now).num_seconds().max(1);
+    Duration::from_secs(secs as u64)
+}
+
+/// DST-aware companion of `next_fire_on_same_local_day` used by
+/// `run_loop`. Returns true when adding `wait` to `now` lands on the
+/// same local calendar date as `now`. Generic over `TimeZone` for
+/// test injection.
+pub fn next_fire_on_same_local_day_chrono<Tz>(
+    now: chrono::DateTime<Tz>,
+    wait: Duration,
+) -> bool
+where
+    Tz: chrono::TimeZone,
+{
+    let next = now.clone() + chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::zero());
+    now.date_naive() == next.date_naive()
+}
+
 /// Long-lived scheduler state held by the host. Cheap to clone — the
 /// store and atomic are wrapped in Arc.
 ///
@@ -156,19 +243,17 @@ impl PapersScheduler {
         // 3-second rate-limit window: yesterday's fire at 10:00,
         // app starts today at 09:50, gap = 23h50m > 20h triggers
         // backfill, loop then sleeps 10 minutes and fires again.
+        //
+        // Use chrono::Local-aware helpers so DST transitions land the
+        // fire at the correct wall-clock 10:00 — the fixed-offset
+        // arithmetic captured the offset once and would have fired at
+        // 11:00 across a spring-forward boundary.
         let now_unix = unix_now_secs();
         let last = self.store.last_fired_at_unix().ok().flatten();
-        let offset = local_offset_seconds();
-        let wait_until_next = duration_until_next_fire_local(
-            now_unix as i64,
-            DAILY_FIRE_HOUR_LOCAL,
-            offset,
-        );
-        let same_day = next_fire_on_same_local_day(
-            now_unix as i64,
-            wait_until_next.as_secs(),
-            offset,
-        );
+        let now_local = chrono::Local::now();
+        let wait_until_next =
+            duration_until_next_local_fire_chrono(now_local, DAILY_FIRE_HOUR_LOCAL);
+        let same_day = next_fire_on_same_local_day_chrono(chrono::Local::now(), wait_until_next);
         if should_backfill(now_unix, last) && !same_day {
             tracing::info!(
                 last_fired_at = ?last,
@@ -183,9 +268,10 @@ impl PapersScheduler {
             );
         }
         loop {
-            let now = unix_now_secs() as i64;
-            let offset = local_offset_seconds();
-            let wait = duration_until_next_fire_local(now, DAILY_FIRE_HOUR_LOCAL, offset);
+            let wait = duration_until_next_local_fire_chrono(
+                chrono::Local::now(),
+                DAILY_FIRE_HOUR_LOCAL,
+            );
             tracing::info!(
                 wait_secs = wait.as_secs(),
                 "papers-scheduler: sleeping until next daily fire"
@@ -322,15 +408,10 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Current local-vs-UTC offset in seconds. Uses `chrono::Local`,
-/// which calls `localtime_r` on Unix and
-/// `GetDynamicTimeZoneInformation` on Windows — the previous
-/// `date +%z` shellout silently failed on Windows (the platform's
-/// `date` builtin does not understand `+%z`) and made the daily
-/// digest fire at 10:00 UTC on Windows hosts instead of 10:00 local.
-fn local_offset_seconds() -> i64 {
-    chrono::Local::now().offset().local_minus_utc() as i64
-}
+// `local_offset_seconds` was removed once `run_loop` migrated to
+// `duration_until_next_local_fire_chrono`, which uses `chrono::Local`
+// directly instead of capturing a single fixed offset that would
+// schedule the fire one hour off across DST transitions.
 
 #[cfg(test)]
 mod tests {
@@ -383,21 +464,66 @@ mod tests {
     }
 
     #[test]
-    fn local_offset_seconds_is_in_valid_earth_range() {
-        // Earth's real timezone offsets range from -12:00 (Baker Island)
-        // to +14:00 (Kiribati Line Islands). A return value outside
-        // [-12h, +14h] means the platform call is broken or the
-        // function regressed to the silent-fallback (0) path on a
-        // host whose local offset is genuinely non-zero. This test
-        // can't distinguish "correct 0" from "broken 0" on UTC CI
-        // hosts, but it does pin the range on every other host AND
-        // ensures the call itself does not panic on macOS / Linux /
-        // Windows.
-        let offset = local_offset_seconds();
-        assert!(
-            (-12 * 3600..=14 * 3600).contains(&offset),
-            "local offset {offset}s outside valid earth-timezone range"
+    fn next_local_fire_spring_forward_lands_at_10am_local_not_11() {
+        // Regression: the previous fixed-offset arithmetic captured
+        // PST (-08:00) once at startup and reused it to compute the
+        // next 10:00 slot. Across a US spring-forward boundary
+        // (2026-03-08 02:00 PST → 03:00 PDT) the actual next 10:00
+        // PDT is only 23 wall-clock hours after 11:00 PST the prior
+        // day — the old code returned 24h, so the scheduler woke up
+        // at 11:00 local instead of 10:00.
+        //
+        // chrono-tz provides the real DST-aware timezone the test
+        // needs; the chrono-based helper handles the transition
+        // because it asks the timezone for `from_local_datetime` on
+        // each candidate slot rather than projecting a captured
+        // numeric offset.
+        use chrono::TimeZone;
+        let la = chrono_tz::America::Los_Angeles;
+        // 2026-03-07 (Saturday) 11:00 PST — one day before spring-forward.
+        let now = la.with_ymd_and_hms(2026, 3, 7, 11, 0, 0).single().expect("PST instant");
+        let wait = duration_until_next_local_fire_chrono(now, 10);
+        // 11:00 PST = 19:00 UTC March 7. The next 10:00 PDT
+        // = 17:00 UTC March 8 = 22 wall-clock hours later. The old
+        // fixed-offset arithmetic ignored the DST transition and
+        // returned 23h, which landed the scheduler at 11:00 PDT
+        // instead of 10:00 PDT.
+        assert_eq!(
+            wait.as_secs(),
+            22 * 3600,
+            "spring-forward day: 11:00 PST → next 10:00 PDT must be 22 wall-clock hours, got {wait:?}"
         );
+        // Sanity: outside the DST transition window the answer is
+        // the unambiguous 23h.
+        let no_dst_now = la.with_ymd_and_hms(2026, 5, 1, 11, 0, 0).single().expect("PDT instant");
+        let no_dst_wait = duration_until_next_local_fire_chrono(no_dst_now, 10);
+        assert_eq!(
+            no_dst_wait.as_secs(),
+            23 * 3600,
+            "non-DST day: 11:00 → next 10:00 should be 23h, got {no_dst_wait:?}"
+        );
+    }
+
+    #[test]
+    fn next_local_fire_same_day_when_slot_still_upcoming_chrono() {
+        // Sanity: at 09:00 local, the same-day predicate must be true
+        // (today's 10:00 slot is still upcoming).
+        use chrono::TimeZone;
+        let la = chrono_tz::America::Los_Angeles;
+        let now = la.with_ymd_and_hms(2026, 6, 15, 9, 0, 0).single().unwrap();
+        let wait = duration_until_next_local_fire_chrono(now, 10);
+        assert_eq!(wait.as_secs(), 3600);
+        assert!(next_fire_on_same_local_day_chrono(now, wait));
+    }
+
+    #[test]
+    fn next_local_fire_different_day_when_slot_already_passed_chrono() {
+        use chrono::TimeZone;
+        let la = chrono_tz::America::Los_Angeles;
+        let now = la.with_ymd_and_hms(2026, 6, 15, 11, 0, 0).single().unwrap();
+        let wait = duration_until_next_local_fire_chrono(now, 10);
+        assert_eq!(wait.as_secs(), 23 * 3600);
+        assert!(!next_fire_on_same_local_day_chrono(now, wait));
     }
 
     #[test]

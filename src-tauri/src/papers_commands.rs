@@ -67,11 +67,12 @@ pub fn papers_list_recent(
     registry: State<'_, MountRegistry>,
     capability: String,
     limit: Option<i64>,
+    source: Option<String>,
 ) -> Result<Vec<PaperRecord>, String> {
     require_papers_capability(&registry, &capability)?;
     handle
         .store
-        .list_recent(limit.unwrap_or(20))
+        .list_recent_by_source(source.as_deref(), limit.unwrap_or(20))
         .map_err(|e| e.to_string())
 }
 

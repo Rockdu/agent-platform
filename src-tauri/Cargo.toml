@@ -57,3 +57,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tempfile = "3"
 static_assertions = "1"
 filetime = "0.2"
+# Real-DST timezone database for scheduler tests that pin DST
+# transition behaviour (e.g. spring-forward in America/Los_Angeles).
+# Dev-only — production uses `chrono::Local` which reads the host's
+# OS timezone.
+chrono-tz = "0.10"

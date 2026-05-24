@@ -575,6 +575,25 @@ impl PapersStore {
     }
 
     pub fn list_recent(&self, limit: i64) -> Result<Vec<PaperRecord>, ArxivError> {
+        self.list_recent_by_source(None, limit)
+    }
+
+    /// Source-filtered variant of `list_recent`. `source = None` returns
+    /// rows of every source (legacy behaviour preserved for back-compat).
+    /// `source = Some("scheduled" | "manual")` restricts the result to
+    /// the matching `daily_recommendations.source` value.
+    ///
+    /// Closes a UI eviction bug: if the user accumulates more than
+    /// `limit` manual-search rows (newer `fetched_at` than any
+    /// scheduled row), a mixed query returns only manual rows and the
+    /// Papers panel renders an empty digest even though scheduled
+    /// rows still exist. The frontend now issues one filtered call per
+    /// section so the two sources can't evict each other.
+    pub fn list_recent_by_source(
+        &self,
+        source: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<PaperRecord>, ArxivError> {
         // Clamp before substituting into SQL. SQLite treats `LIMIT -1`
         // as no limit, so passing a negative value through would
         // return the entire recommendations table. Callers come from
@@ -584,16 +603,32 @@ impl PapersStore {
         // LEFT JOIN user_paper_state so the wire shape includes the
         // user's starred / read state for the React component (no
         // separate hydration round trip required).
-        let mut stmt = guard
-            .prepare(
+        let (sql, mut params): (&str, Vec<rusqlite::types::Value>) = match source {
+            None => (
                 "SELECT d.arxiv_id, d.title, d.authors, d.abstract_snippet, d.pdf_url, d.abs_url, d.source, d.fetched_at, COALESCE(u.starred, 0), u.read_at \
                  FROM daily_recommendations d \
                  LEFT JOIN user_paper_state u ON u.arxiv_id = d.arxiv_id \
                  ORDER BY d.fetched_at DESC LIMIT ?",
-            )
+                vec![],
+            ),
+            Some(_) => (
+                "SELECT d.arxiv_id, d.title, d.authors, d.abstract_snippet, d.pdf_url, d.abs_url, d.source, d.fetched_at, COALESCE(u.starred, 0), u.read_at \
+                 FROM daily_recommendations d \
+                 LEFT JOIN user_paper_state u ON u.arxiv_id = d.arxiv_id \
+                 WHERE d.source = ? \
+                 ORDER BY d.fetched_at DESC LIMIT ?",
+                Vec::new(),
+            ),
+        };
+        if let Some(s) = source {
+            params.push(rusqlite::types::Value::Text(s.to_string()));
+        }
+        params.push(rusqlite::types::Value::Integer(bounded));
+        let mut stmt = guard
+            .prepare(sql)
             .map_err(|e| ArxivError::Sqlite(format!("prepare: {e}")))?;
         let rows = stmt
-            .query_map(rusqlite::params![bounded], |row| {
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
                 let authors_str: String = row.get(2)?;
                 let authors: Vec<String> = authors_str
                     .split(';')
@@ -1637,6 +1672,96 @@ mod tests {
         }
         let rows = store.list_recent(1_000_000).unwrap();
         assert_eq!(rows.len(), MAX_LIST_RECENT_LIMIT as usize);
+    }
+
+    #[test]
+    fn list_recent_by_source_returns_only_matching_rows() {
+        // Regression: with N manual rows and a smaller scheduled set,
+        // the mixed `list_recent(limit)` returns only manual rows
+        // (newer fetched_at) and the UI loses the scheduled digest.
+        // The source-filtered variant must return ONLY the requested
+        // source so each panel section can be fetched independently.
+        let (store, _t) = setup_store();
+        for i in 0..5 {
+            store
+                .insert_dedup(
+                    &[PaperRecord {
+                        arxiv_id: format!("sched.{i}"),
+                        title: format!("S{i}"),
+                        authors: vec![],
+                        abstract_snippet: String::new(),
+                        pdf_url: String::new(),
+                        abs_url: String::new(),
+                        source: "scheduled".to_string(),
+                        fetched_at: now_iso8601(),
+                        starred: false,
+                        read_at: None,
+                    }],
+                    "q",
+                )
+                .unwrap();
+        }
+        for i in 0..40 {
+            store
+                .insert_dedup(
+                    &[PaperRecord {
+                        arxiv_id: format!("man.{i}"),
+                        title: format!("M{i}"),
+                        authors: vec![],
+                        abstract_snippet: String::new(),
+                        pdf_url: String::new(),
+                        abs_url: String::new(),
+                        source: "manual".to_string(),
+                        fetched_at: now_iso8601(),
+                        starred: false,
+                        read_at: None,
+                    }],
+                    "q",
+                )
+                .unwrap();
+        }
+        let scheduled = store
+            .list_recent_by_source(Some("scheduled"), 30)
+            .unwrap();
+        let manual = store.list_recent_by_source(Some("manual"), 30).unwrap();
+        assert_eq!(scheduled.len(), 5);
+        assert!(scheduled.iter().all(|p| p.source == "scheduled"));
+        assert_eq!(manual.len(), 30);
+        assert!(manual.iter().all(|p| p.source == "manual"));
+    }
+
+    #[test]
+    fn list_recent_by_source_none_matches_existing_behaviour() {
+        // Back-compat: `list_recent_by_source(None, limit)` must
+        // return the same rows as `list_recent(limit)` so the legacy
+        // wrapper is a faithful delegate.
+        let (store, _t) = setup_store();
+        for i in 0..3 {
+            store
+                .insert_dedup(
+                    &[PaperRecord {
+                        arxiv_id: format!("mix.{i}"),
+                        title: format!("T{i}"),
+                        authors: vec![],
+                        abstract_snippet: String::new(),
+                        pdf_url: String::new(),
+                        abs_url: String::new(),
+                        source: if i % 2 == 0 { "scheduled" } else { "manual" }
+                            .to_string(),
+                        fetched_at: now_iso8601(),
+                        starred: false,
+                        read_at: None,
+                    }],
+                    "q",
+                )
+                .unwrap();
+        }
+        let via_legacy = store.list_recent(10).unwrap();
+        let via_filter = store.list_recent_by_source(None, 10).unwrap();
+        assert_eq!(via_legacy.len(), via_filter.len());
+        let legacy_ids: Vec<_> = via_legacy.iter().map(|p| p.arxiv_id.clone()).collect();
+        let filter_ids: Vec<_> = via_filter.iter().map(|p| p.arxiv_id.clone()).collect();
+        assert_eq!(legacy_ids, filter_ids);
     }
 
     #[test]

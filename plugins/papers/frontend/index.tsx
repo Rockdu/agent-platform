@@ -45,12 +45,23 @@ export default function PapersPanel() {
 
   const refreshDigest = useCallback(async () => {
     try {
-      const list = await invoke<PaperRecord[]>("papers_list_recent", {
-        capability,
-        limit: 30,
-      });
-      const scheduled = list.filter((p) => p.source !== "manual");
-      const manualList = list.filter((p) => p.source === "manual");
+      // Two parallel source-filtered calls so heavy manual searches
+      // (more than `limit` recent rows) cannot evict the scheduled
+      // digest from the UI. Mixing both sources in one limited query
+      // would surface only the newest rows, and manual rows have
+      // newer fetched_at than the daily 10am scheduled fire.
+      const [scheduled, manualList] = await Promise.all([
+        invoke<PaperRecord[]>("papers_list_recent", {
+          capability,
+          limit: 30,
+          source: "scheduled",
+        }),
+        invoke<PaperRecord[]>("papers_list_recent", {
+          capability,
+          limit: 30,
+          source: "manual",
+        }),
+      ]);
       setDigest(scheduled);
       setManual(manualList);
       setError(null);
