@@ -209,26 +209,41 @@ impl PluginStorage {
             })?;
             let checksum = checksum_hex(&bytes);
 
-            match lookup_applied(&conn, &version)? {
+            let sql = std::str::from_utf8(&bytes).map_err(|err| PluginStorageError::Io {
+                context: format!("decode {} as utf-8", path.display()),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, err),
+            })?;
+
+            let needs_record_insert = match lookup_applied(&conn, &version)? {
                 Some(applied) if applied.filename == filename && applied.checksum == checksum => {
                     // Already applied with identical body — skip silently.
                     continue;
                 }
                 Some(applied) => {
-                    return Err(PluginStorageError::MigrationChecksumMismatch {
-                        plugin_id: self.plugin_id.clone(),
-                        version,
-                        existing_filename: applied.filename,
-                        new_filename: filename,
-                    });
+                    // Self-heal: a migration whose body was edited to a
+                    // strictly-idempotent superset (every statement is
+                    // `CREATE ... IF NOT EXISTS` or `INSERT OR
+                    // IGNORE/REPLACE INTO`) is safe to re-apply against
+                    // the already-applied schema — every statement
+                    // becomes a no-op. Re-run it, then update the
+                    // stored checksum so the mismatch stops re-firing
+                    // on every launch. Anything that ALTERs, DROPs,
+                    // UPDATEs, or DELETEs falls through to the strict
+                    // refusal because re-applying could lose data.
+                    if applied.filename == filename && is_strictly_idempotent_sql(sql) {
+                        false
+                    } else {
+                        return Err(PluginStorageError::MigrationChecksumMismatch {
+                            plugin_id: self.plugin_id.clone(),
+                            version,
+                            existing_filename: applied.filename,
+                            new_filename: filename,
+                        });
+                    }
                 }
-                None => {}
-            }
+                None => true,
+            };
 
-            let sql = std::str::from_utf8(&bytes).map_err(|err| PluginStorageError::Io {
-                context: format!("decode {} as utf-8", path.display()),
-                source: std::io::Error::new(std::io::ErrorKind::InvalidData, err),
-            })?;
             reject_forbidden_sql(sql, &self.plugin_id, &filename)?;
 
             let tx = conn
@@ -244,14 +259,25 @@ impl PluginStorage {
                     source,
                 });
             }
-            tx.execute(
-                "INSERT INTO _plugin_migrations (version, filename, checksum, applied_at) VALUES (?1, ?2, ?3, datetime('now'))",
-                [&version, &filename, &checksum],
-            )
-            .map_err(|source| PluginStorageError::Sqlite {
-                context: format!("record applied migration {}", filename),
-                source,
-            })?;
+            if needs_record_insert {
+                tx.execute(
+                    "INSERT INTO _plugin_migrations (version, filename, checksum, applied_at) VALUES (?1, ?2, ?3, datetime('now'))",
+                    [&version, &filename, &checksum],
+                )
+                .map_err(|source| PluginStorageError::Sqlite {
+                    context: format!("record applied migration {}", filename),
+                    source,
+                })?;
+            } else {
+                tx.execute(
+                    "UPDATE _plugin_migrations SET checksum = ?1, applied_at = datetime('now') WHERE version = ?2",
+                    [&checksum, &version],
+                )
+                .map_err(|source| PluginStorageError::Sqlite {
+                    context: format!("refresh checksum for migration {}", filename),
+                    source,
+                })?;
+            }
             tx.commit().map_err(|source| PluginStorageError::Sqlite {
                 context: format!("commit migration {}", filename),
                 source,
@@ -260,6 +286,73 @@ impl PluginStorage {
         }
         Ok(applied_now)
     }
+}
+
+/// True when every non-comment statement in `sql` starts with one of
+/// the strictly-idempotent forms (`CREATE TABLE/INDEX/UNIQUE INDEX/
+/// TRIGGER/VIEW IF NOT EXISTS`, `INSERT OR IGNORE INTO`, `INSERT OR
+/// REPLACE INTO`). Used by the migration runner to self-heal a stale
+/// checksum row when the file body was edited to add `IF NOT EXISTS`
+/// without changing the effective schema. Conservative: anything that
+/// could mutate or destroy existing rows (ALTER, DROP, UPDATE, DELETE,
+/// plain CREATE without IF NOT EXISTS) makes this return `false` and
+/// the strict refusal path runs.
+fn is_strictly_idempotent_sql(sql: &str) -> bool {
+    let stripped = strip_sql_comments(sql);
+    const ALLOWED_PREFIXES: &[&str] = &[
+        "CREATE TABLE IF NOT EXISTS ",
+        "CREATE INDEX IF NOT EXISTS ",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ",
+        "CREATE TRIGGER IF NOT EXISTS ",
+        "CREATE VIEW IF NOT EXISTS ",
+        "INSERT OR IGNORE INTO ",
+        "INSERT OR REPLACE INTO ",
+    ];
+    for stmt in stripped.split(';') {
+        let trimmed = stmt.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let upper: String = trimmed.to_uppercase();
+        let collapsed = upper.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !ALLOWED_PREFIXES.iter().any(|p| collapsed.starts_with(p)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Strip `-- line` and `/* block */` comments from `sql`, preserving
+/// newlines so statement splits on `;` keep line affinity for error
+/// messages. Does NOT attempt to honour string-literal escaping; the
+/// caller only uses the result for token-prefix matching, not for
+/// execution.
+fn strip_sql_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            for nc in chars.by_ref() {
+                if nc == '\n' {
+                    out.push('\n');
+                    break;
+                }
+            }
+        } else if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut prev = ' ';
+            for nc in chars.by_ref() {
+                if prev == '*' && nc == '/' {
+                    break;
+                }
+                prev = nc;
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Row shape for the `_plugin_migrations` lookup. `version` is the PK; the
@@ -1390,6 +1483,129 @@ mod tests {
                 );
             }
             other => panic!("expected Ok for example-notes; got {other:?}"),
+        }
+    }
+
+    // ----- self-healing on idempotent body change -----
+
+    #[test]
+    fn is_strictly_idempotent_sql_accepts_create_if_not_exists_and_insert_or_ignore() {
+        let body = r#"
+            -- header comment
+            CREATE TABLE IF NOT EXISTS t (id INTEGER);
+            CREATE INDEX IF NOT EXISTS idx_t ON t(id);
+            CREATE UNIQUE INDEX IF NOT EXISTS uniq_t ON t(id);
+            INSERT OR IGNORE INTO t (id) VALUES (1);
+            INSERT OR REPLACE INTO t (id) VALUES (2);
+        "#;
+        assert!(is_strictly_idempotent_sql(body));
+    }
+
+    #[test]
+    fn is_strictly_idempotent_sql_rejects_plain_create_and_destructive_forms() {
+        for body in [
+            "CREATE TABLE t (id INTEGER);",
+            "DROP TABLE t;",
+            "ALTER TABLE t ADD COLUMN c INTEGER;",
+            "UPDATE t SET x = 1;",
+            "DELETE FROM t;",
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER); ALTER TABLE t ADD COLUMN c INTEGER;",
+        ] {
+            assert!(
+                !is_strictly_idempotent_sql(body),
+                "body should NOT be idempotent: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_migrations_self_heals_when_body_becomes_idempotent_superset() {
+        // Reproduces the regression that blocked the Papers tab from
+        // mounting on every cold start: an earlier version of
+        // `0001_init.sql` was applied with `CREATE TABLE foo (...)`
+        // (no `IF NOT EXISTS`); a later release edited the file to
+        // add `IF NOT EXISTS` so `PapersStore::open`'s embedded
+        // include_str! could also apply it idempotently. The schema
+        // is materially identical but the checksum differs, so the
+        // migration runner refused to silently skip and the host
+        // gated mount with a MigrationFailurePanel. With self-healing
+        // in place the runner re-applies (no-op) and updates the
+        // stored checksum.
+        let root = tmp_root();
+        let migrations = root.path().join("mig");
+        write_migration(&migrations, "0001_init.sql", "CREATE TABLE foo (id INTEGER);");
+        let storage = PluginStorage::open(root.path(), REAL_PLUGIN).unwrap();
+        storage.run_migrations(&migrations).expect("first apply");
+        // Snapshot the stored checksum BEFORE the body edit.
+        let conn = storage.connect().unwrap();
+        let before_checksum: String = conn
+            .query_row(
+                "SELECT checksum FROM _plugin_migrations WHERE version = '0001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        // Edit the body to an idempotent superset and re-run.
+        write_migration(
+            &migrations,
+            "0001_init.sql",
+            "CREATE TABLE IF NOT EXISTS foo (id INTEGER);",
+        );
+        let applied = storage
+            .run_migrations(&migrations)
+            .expect("self-heal must succeed for idempotent body change");
+        assert_eq!(applied, vec!["0001_init.sql"]);
+
+        // Stored checksum updated; row count still 1 (UPDATE not INSERT).
+        let conn = storage.connect().unwrap();
+        let after_checksum: String = conn
+            .query_row(
+                "SELECT checksum FROM _plugin_migrations WHERE version = '0001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(before_checksum, after_checksum, "checksum must be refreshed");
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _plugin_migrations WHERE version = '0001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "still exactly one row for version 0001");
+
+        // Re-running again with the SAME body is a silent no-op.
+        let second = storage.run_migrations(&migrations).unwrap();
+        assert!(second.is_empty(), "second run must be a no-op: {second:?}");
+    }
+
+    #[test]
+    fn run_migrations_refuses_destructive_body_change() {
+        // Non-idempotent body changes (ALTER, DROP, ...) still hit
+        // the strict refusal so the user is forced to add a new
+        // versioned migration rather than silently replay something
+        // that could lose rows.
+        let root = tmp_root();
+        let migrations = root.path().join("mig");
+        write_migration(&migrations, "0001_init.sql", "CREATE TABLE foo (id INTEGER);");
+        let storage = PluginStorage::open(root.path(), REAL_PLUGIN).unwrap();
+        storage.run_migrations(&migrations).expect("first apply");
+
+        write_migration(
+            &migrations,
+            "0001_init.sql",
+            "DROP TABLE foo; CREATE TABLE foo (id INTEGER, x INTEGER);",
+        );
+        let err = storage.run_migrations(&migrations).unwrap_err();
+        match err {
+            PluginStorageError::MigrationChecksumMismatch { plugin_id, version, .. } => {
+                assert_eq!(plugin_id, REAL_PLUGIN);
+                assert_eq!(version, "0001");
+            }
+            other => panic!("expected MigrationChecksumMismatch; got {other:?}"),
         }
     }
 }

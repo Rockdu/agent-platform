@@ -202,13 +202,14 @@ impl NotificationService {
             if let Err(err) = handle.emit("tray://updated", ()) {
                 tracing::warn!(%err, "push_papers_digest: emit tray://updated failed");
             }
-            // Notification activation surface: tauri-plugin-notification
-            // v2 doesn't surface OS-level click events directly back
-            // through to the app on macOS. The functional equivalent
-            // is to pop the tray ourselves so the user lands on the
-            // paper cards immediately. The user can dismiss via the
-            // menubar icon (same toggle handler) afterwards.
-            show_tray_window(&handle);
+            // Do NOT auto-open the tray window here. The positioner
+            // plugin panics with "Tray position not set" if no
+            // tray-icon click has cached a position yet, and even
+            // when it works, popping the tray on every fire is
+            // disruptive — the daily digest is announced via the
+            // native notification + tray ring entry, and the user
+            // opens the tray themselves by clicking the menubar
+            // icon or the notification banner.
         }
     }
 
@@ -421,8 +422,23 @@ pub fn show_tray_window(app: &tauri::AppHandle) {
         tracing::warn!("show_tray_window: tray webview window missing");
         return;
     };
-    if let Err(err) = window.move_window(Position::TrayBottomCenter) {
-        tracing::warn!(%err, "show_tray_window: move_window failed");
+    // tauri-plugin-positioner v2 panics with "Tray position not set"
+    // when asked for a TrayXxx position before any tray-icon event
+    // has cached a position. The positioner's `move_window` returns
+    // Result but unwraps internally for tray positions, so a plain
+    // `if let Err` is not enough — catch_unwind keeps the runtime
+    // worker thread alive and falls back to leaving the window at
+    // its last position (better than crashing the task).
+    let window_for_move = window.clone();
+    let move_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        window_for_move.move_window(Position::TrayBottomCenter)
+    }));
+    match move_result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::warn!(%err, "show_tray_window: move_window failed"),
+        Err(_) => tracing::warn!(
+            "show_tray_window: positioner panicked (tray position not yet cached); showing window at its last position"
+        ),
     }
     if let Err(err) = window.show() {
         tracing::warn!(%err, "show_tray_window: show failed");

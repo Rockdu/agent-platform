@@ -19,7 +19,7 @@
 //! into this module unless `opt_in_enabled = 1` in the papers SQLite).
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -80,25 +80,38 @@ pub fn workspace_is_stale(ws: &Path, now: SystemTime, threshold_secs: u64) -> bo
     }
 }
 
-/// Newest mtime among regular files inside `<ws>/.claude`, capped at
-/// 64 entries (mirroring the `count` cap in `extract_keywords_from_claude_dir`).
-/// Returns `None` when `.claude/` doesn't exist, can't be read, or
-/// contains no readable files.
+/// Newest mtime among regular files inside `<ws>/.claude` AND
+/// `~/.claude/projects/<flattened-workspace-path>/`, capped at 64
+/// entries per directory (mirroring the `count` cap in
+/// `extract_keywords_from_claude_dir`). Returns `None` when neither
+/// dir exists, can be read, or contains readable files.
+///
+/// Including the global path is critical: Claude Code stores per-
+/// project conversation logs there (not inside the workspace), so a
+/// workspace whose local `.claude/` is absent or stale can still
+/// reflect very recent activity through the global jsonl mtime.
 fn newest_claude_file_mtime(ws: &Path) -> Option<SystemTime> {
-    let claude = ws.join(".claude");
-    let entries = std::fs::read_dir(&claude).ok()?;
+    let mut probe_dirs: Vec<PathBuf> = vec![ws.join(".claude")];
+    if let Some(global) = claude_projects_dir_for(ws) {
+        probe_dirs.push(global);
+    }
     let mut newest: Option<SystemTime> = None;
-    let mut count = 0usize;
-    for entry in entries.flatten() {
-        count += 1;
-        if count > 64 {
-            break;
-        }
-        if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
-            newest = Some(match newest {
-                Some(cur) if cur >= mtime => cur,
-                _ => mtime,
-            });
+    for dir in &probe_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut count = 0usize;
+        for entry in entries.flatten() {
+            count += 1;
+            if count > 64 {
+                break;
+            }
+            if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+                newest = Some(match newest {
+                    Some(cur) if cur >= mtime => cur,
+                    _ => mtime,
+                });
+            }
         }
     }
     newest
@@ -237,37 +250,53 @@ pub fn extract_workspace_keywords_with_git<P: AsRef<Path>>(
     ranked
 }
 
-/// Read up to `byte_budget` bytes from the largest-mtime `.claude/*.jsonl`
-/// file under `workspace`, tokenize, and return useful tokens. Returns an
-/// empty Vec if `.claude/` does not exist or is empty.
+/// Read up to `byte_budget` bytes from the largest-mtime `*.jsonl` file
+/// under `<workspace>/.claude/` AND `~/.claude/projects/<flattened-workspace-path>/`,
+/// tokenize, and return useful tokens.
+///
+/// Claude Code stores per-project conversation logs at the GLOBAL
+/// path (a flattened directory under the user's home `.claude` tree),
+/// not inside the workspace itself. Older workspaces that pre-date
+/// the per-project-claude convention will still have a local
+/// `<ws>/.claude/` dir — both paths are probed and the newest jsonl
+/// across both wins. Returns an empty Vec if neither dir has any
+/// readable jsonl file.
 pub fn extract_keywords_from_claude_dir(workspace: &Path, byte_budget: usize) -> Vec<String> {
-    let claude_dir = workspace.join(".claude");
-    if !claude_dir.is_dir() {
+    let mut probe_dirs: Vec<PathBuf> = Vec::new();
+    let local = workspace.join(".claude");
+    if local.is_dir() {
+        probe_dirs.push(local);
+    }
+    if let Some(global) = claude_projects_dir_for(workspace) {
+        if global.is_dir() {
+            probe_dirs.push(global);
+        }
+    }
+    if probe_dirs.is_empty() {
         return Vec::new();
     }
-    let entries = match std::fs::read_dir(&claude_dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-    let mut newest: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
-    let mut count = 0usize;
-    for entry in entries.flatten() {
-        count += 1;
-        if count > 64 {
-            break;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let mtime = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok();
-        if let Some(mt) = mtime {
-            match &newest {
-                Some((_, cur)) if *cur >= mt => {}
-                _ => newest = Some((path, mt)),
+    let mut newest: Option<(PathBuf, SystemTime)> = None;
+    for dir in &probe_dirs {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let mut count = 0usize;
+        for entry in entries.flatten() {
+            count += 1;
+            if count > 64 {
+                break;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let mtime = entry.metadata().and_then(|m| m.modified()).ok();
+            if let Some(mt) = mtime {
+                match &newest {
+                    Some((_, cur)) if *cur >= mt => {}
+                    _ => newest = Some((path, mt)),
+                }
             }
         }
     }
@@ -285,6 +314,24 @@ pub fn extract_keywords_from_claude_dir(workspace: &Path, byte_budget: usize) ->
         }
     }
     out.into_iter().collect()
+}
+
+/// Map a workspace path to Claude Code's global per-project jsonl
+/// directory: `~/.claude/projects/<flattened-path>/`. The flattening
+/// rule is "every non-ASCII-alphanumeric character → `-`" (per-char
+/// after UTF-8 decoding; no collapsing of consecutive replacements).
+/// Returns `None` if `$HOME` is unset.
+fn claude_projects_dir_for(workspace: &Path) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok().map(PathBuf::from)?;
+    let abs = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let flattened: String = abs
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    Some(home.join(".claude").join("projects").join(flattened))
 }
 
 /// Read at most `byte_budget` bytes from the end of `path`.
