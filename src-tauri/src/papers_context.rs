@@ -86,7 +86,8 @@ pub fn extract_workspace_keywords<P: AsRef<Path>>(
         }
         if let Ok(subjects) = mine_git_commits(ws, MAX_GIT_COMMITS, GIT_LOG_TIMEOUT_MS) {
             for s in subjects {
-                for t in tokenize(&s) {
+                let redacted = redact_sensitive_spans(&s);
+                for t in tokenize(&redacted) {
                     if is_useful_token(&t) {
                         all_tokens.insert(t);
                     }
@@ -144,8 +145,9 @@ pub fn extract_keywords_from_claude_dir(workspace: &Path, byte_budget: usize) ->
     let Some(content) = read_tail(&path, byte_budget) else {
         return Vec::new();
     };
+    let redacted = redact_sensitive_spans(&content);
     let mut out: HashSet<String> = HashSet::new();
-    for tok in tokenize(&content) {
+    for tok in tokenize(&redacted) {
         if is_useful_token(&tok) {
             out.insert(tok);
         }
@@ -164,6 +166,67 @@ fn read_tail(path: &Path, byte_budget: usize) -> Option<String> {
     let mut buf = Vec::with_capacity(byte_budget);
     f.take(byte_budget as u64).read_to_end(&mut buf).ok()?;
     Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Whole-span sanitizer. Replaces matched spans (file paths, URLs,
+/// email addresses, SSH-style git URLs, API-key-shaped tokens, common
+/// API-key prefixes) with a single space BEFORE tokenization so the
+/// component words of a sensitive span cannot leak into the arXiv
+/// query. `tokenize()` only splits on punctuation; without this pass
+/// `/Users/alice/secretProject/...` would contribute `alice`,
+/// `secretProject`, `Users`, `src`, etc. as keywords.
+///
+/// Each pattern is matched, the match is replaced with a space, and
+/// the remaining text continues through tokenization. Patterns are
+/// applied in order; later patterns operate on the result of earlier
+/// ones (so e.g. a URL whose path component would otherwise look like
+/// a multi-segment path is already gone before the path pattern runs).
+pub fn redact_sensitive_spans(input: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        let raw = [
+            // Schemed URLs (http(s)://, ws(s)://, ftp://, custom-scheme://...).
+            r"[A-Za-z][A-Za-z0-9+\-.]*://[^\s]+",
+            // SSH-shaped git URLs: git@github.com:owner/repo.git
+            r"\b[A-Za-z_][A-Za-z0-9_\-]*@[A-Za-z0-9.\-]+:[A-Za-z0-9_./\-]+",
+            // Email addresses.
+            r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b",
+            // Windows drive paths.
+            r"\b[A-Za-z]:[\\/][^\s]+",
+            // Relative paths starting with `./` or `../`.
+            r"\.{1,2}/[^\s]+",
+            // Absolute / repository-rooted paths: any token containing
+            // a `/` with at least one alphanumeric segment on each side.
+            // Catches `/Users/alice/...`, `src/lib/foo.rs`, `a/b`,
+            // `path/to/file.ext`. Conservative — also wipes things like
+            // `transformer/decoder` from prose, but the loss is
+            // acceptable next to the privacy gain.
+            r"\S*[A-Za-z0-9_\-]+/[A-Za-z0-9_./\-]+",
+            // Common API-key prefixes (specific shapes first so they
+            // can't be missed by the generic long-token pattern when
+            // they include punctuation).
+            r"\b(?:sk|ghp|gho|ghu|ghs|github_pat|xox[abps])-[A-Za-z0-9_\-]{8,}",
+            r"\bAKIA[0-9A-Z]{16}\b",
+            // Long opaque alphanumeric tokens (>=24 chars) — typical
+            // API keys / hashes / bearer tokens.
+            r"\b[A-Za-z0-9_\-]{24,}\b",
+            // Hex blobs (>=12 chars) that look like commit shas, MD5s,
+            // SHA256s, etc.
+            r"\b[A-Fa-f0-9]{12,}\b",
+        ];
+        raw.iter()
+            .map(|p| Regex::new(p).expect("redaction regex must compile"))
+            .collect()
+    });
+
+    let mut current = input.to_string();
+    for re in patterns {
+        current = re.replace_all(&current, " ").into_owned();
+    }
+    current
 }
 
 /// Tokenize text into alphanumeric chunks of length 4..=24. Strips
@@ -444,5 +507,146 @@ mod tests {
         let subjects = mine_git_commits(tmp.path(), 5, 2000).unwrap();
         assert_eq!(subjects.len(), 1);
         assert!(subjects[0].contains("transformer"));
+    }
+
+    fn write_claude_fixture(workspace: &std::path::Path, body: &str) {
+        let claude = workspace.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(claude.join("conv.jsonl"), body).unwrap();
+    }
+
+    fn lower_tokens(workspace: &std::path::Path) -> Vec<String> {
+        extract_workspace_keywords(&[workspace], 256 * 1024)
+            .into_iter()
+            .map(|t| t.to_ascii_lowercase())
+            .collect()
+    }
+
+    #[test]
+    fn redact_sensitive_spans_removes_paths_emails_urls_api_keys() {
+        let input = "research notes /Users/alice/secretProject/src/model_loader.rs more text \
+                     contact alice@example.com see https://github.com/foo/bar and \
+                     git@github.com:owner/repo.git plus token sk-abcdef1234567890abcdefABCDEFabcd \
+                     and AKIAABCDEFGHIJKLMNOP also hash deadbeefcafe0001";
+        let out = redact_sensitive_spans(input);
+        let lower = out.to_ascii_lowercase();
+        for must_be_gone in [
+            "/users/alice",
+            "secretproject",
+            "model_loader",
+            "alice@example.com",
+            "https://github.com",
+            "git@github.com:owner",
+            "sk-abcdef1234567890",
+            "akiaabcdefghijklmnop",
+            "deadbeefcafe0001",
+        ] {
+            assert!(
+                !lower.contains(must_be_gone),
+                "redaction missed `{must_be_gone}` in `{out}`"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_workspace_keywords_drops_path_components() {
+        let tmp = TempDir::new().unwrap();
+        write_claude_fixture(
+            tmp.path(),
+            "looking at /Users/alice/secretProject/src/model_loader.rs for inspiration",
+        );
+        let tokens = lower_tokens(tmp.path());
+        for leaked in [
+            "alice",
+            "users",
+            "secretproject",
+            "model_loader",
+            "modelloader",
+        ] {
+            assert!(
+                !tokens.iter().any(|t| t == leaked),
+                "path component `{leaked}` leaked into tokens={tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_workspace_keywords_drops_email_local_and_domain() {
+        let tmp = TempDir::new().unwrap();
+        write_claude_fixture(
+            tmp.path(),
+            "ping researchers reach alice@example.com about transformers",
+        );
+        let tokens = lower_tokens(tmp.path());
+        for leaked in ["alice", "example"] {
+            assert!(
+                !tokens.iter().any(|t| t == leaked),
+                "email component `{leaked}` leaked into tokens={tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_workspace_keywords_drops_url_components() {
+        let tmp = TempDir::new().unwrap();
+        write_claude_fixture(
+            tmp.path(),
+            "see https://github.com/foo/bar and also git@github.com:owner/repo.git",
+        );
+        let tokens = lower_tokens(tmp.path());
+        for leaked in ["github", "foo", "owner", "repo"] {
+            assert!(
+                !tokens.iter().any(|t| t == leaked),
+                "URL component `{leaked}` leaked into tokens={tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_workspace_keywords_drops_api_key_shaped_tokens() {
+        let tmp = TempDir::new().unwrap();
+        write_claude_fixture(
+            tmp.path(),
+            "secrets sk-abcdef1234567890abcdefABCDEFabcd and AKIAABCDEFGHIJKLMNOP \
+             and ghp_abcdefghijklmnopqrstuvwxyz012345 plus bare token \
+             0123456789abcdef0123456789abcdef and shorter dead beef cafe",
+        );
+        let tokens = lower_tokens(tmp.path());
+        for leaked in [
+            "abcdefghijklmnop",
+            "akiaabcdefghijklmnop",
+            "0123456789abcdef",
+            "ghp_abcdefghijklmn",
+        ] {
+            // tokens are capped at 24 chars by tokenize; check no
+            // long-key fragment slipped through.
+            assert!(
+                !tokens.iter().any(|t| t.contains(leaked) || t.starts_with(leaked)),
+                "api-key-shaped fragment `{leaked}` leaked into tokens={tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_workspace_keywords_preserves_real_research_terms() {
+        let tmp = TempDir::new().unwrap();
+        write_claude_fixture(
+            tmp.path(),
+            "studying transformer attention diffusion gradient backpropagation \
+             alongside /Users/alice/secretProject/notes.md and alice@example.com",
+        );
+        let tokens = lower_tokens(tmp.path());
+        for kept in [
+            "transformer",
+            "attention",
+            "diffusion",
+            "gradient",
+            "backpropagation",
+        ] {
+            assert!(
+                tokens.iter().any(|t| t == kept),
+                "research term `{kept}` was wrongly dropped; tokens={tokens:?}"
+            );
+        }
     }
 }
