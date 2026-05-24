@@ -55,6 +55,7 @@ version = "0.0.1"
 dependencies = [
  "argon2",
  "base64 0.22.1",
+ "chrono",
  "directories",
  "filetime",
  "fs4",

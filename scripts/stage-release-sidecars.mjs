@@ -38,11 +38,18 @@ function isRealBinary(path) {
 
 const triple = detectTargetTriple();
 const releaseDir = resolve(repoRoot, "target", "release");
+// On Windows, Cargo writes `<sidecar>.exe` to target/release and
+// Tauri's `bundle.externalBin` check expects the staged copy as
+// `<sidecar>-<triple>.exe`. Without the suffix on both `src` and
+// `dst`, the script reports every sidecar as missing on Windows and
+// blocks `tauri build`. `process.platform === "win32"` covers all
+// Windows hosts regardless of msvc/gnu/uwp triple.
+const exeSuffix = process.platform === "win32" ? ".exe" : "";
 
 let failures = 0;
 for (const sidecar of SIDECARS) {
-  const src = resolve(releaseDir, sidecar);
-  const dst = resolve(releaseDir, `${sidecar}-${triple}`);
+  const src = resolve(releaseDir, `${sidecar}${exeSuffix}`);
+  const dst = resolve(releaseDir, `${sidecar}-${triple}${exeSuffix}`);
   if (!isRealBinary(src)) {
     console.error(
       `stage-release-sidecars: ${src} is missing or zero-byte; build it first with \`cargo build --release -p ${sidecar}\``,

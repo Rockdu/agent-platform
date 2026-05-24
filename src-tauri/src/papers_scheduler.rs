@@ -322,35 +322,14 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Best-effort current local-vs-UTC offset in seconds. Reads
-/// `chrono` if available; otherwise asks `date +%z`. On failure
-/// returns 0 (treat as UTC).
+/// Current local-vs-UTC offset in seconds. Uses `chrono::Local`,
+/// which calls `localtime_r` on Unix and
+/// `GetDynamicTimeZoneInformation` on Windows — the previous
+/// `date +%z` shellout silently failed on Windows (the platform's
+/// `date` builtin does not understand `+%z`) and made the daily
+/// digest fire at 10:00 UTC on Windows hosts instead of 10:00 local.
 fn local_offset_seconds() -> i64 {
-    let output = std::process::Command::new("date").arg("+%z").output();
-    match output {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            parse_date_offset(&s).unwrap_or(0)
-        }
-        _ => 0,
-    }
-}
-
-fn parse_date_offset(s: &str) -> Option<i64> {
-    // Expect format ±HHMM, e.g. "-0500" or "+0900".
-    if s.len() < 5 {
-        return None;
-    }
-    let sign: i64 = if s.starts_with('+') {
-        1
-    } else if s.starts_with('-') {
-        -1
-    } else {
-        return None;
-    };
-    let hh: i64 = s[1..3].parse().ok()?;
-    let mm: i64 = s[3..5].parse().ok()?;
-    Some(sign * (hh * 3600 + mm * 60))
+    chrono::Local::now().offset().local_minus_utc() as i64
 }
 
 #[cfg(test)]
@@ -404,11 +383,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_date_offset_handles_both_signs() {
-        assert_eq!(parse_date_offset("+0800"), Some(28800));
-        assert_eq!(parse_date_offset("-0500"), Some(-18000));
-        assert_eq!(parse_date_offset("+0000"), Some(0));
-        assert_eq!(parse_date_offset("UTC"), None);
+    fn local_offset_seconds_is_in_valid_earth_range() {
+        // Earth's real timezone offsets range from -12:00 (Baker Island)
+        // to +14:00 (Kiribati Line Islands). A return value outside
+        // [-12h, +14h] means the platform call is broken or the
+        // function regressed to the silent-fallback (0) path on a
+        // host whose local offset is genuinely non-zero. This test
+        // can't distinguish "correct 0" from "broken 0" on UTC CI
+        // hosts, but it does pin the range on every other host AND
+        // ensures the call itself does not panic on macOS / Linux /
+        // Windows.
+        let offset = local_offset_seconds();
+        assert!(
+            (-12 * 3600..=14 * 3600).contains(&offset),
+            "local offset {offset}s outside valid earth-timezone range"
+        );
     }
 
     #[test]

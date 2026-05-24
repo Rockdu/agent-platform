@@ -1065,6 +1065,39 @@ mod tests {
     }
 
     #[test]
+    fn stage_release_sidecars_script_applies_windows_exe_suffix() {
+        // Regression: on Windows hosts Cargo writes `<sidecar>.exe`
+        // and Tauri's `bundle.externalBin` check expects
+        // `<sidecar>-<triple>.exe`. The script must detect Windows
+        // and append the suffix to BOTH the source and the staged
+        // destination paths, otherwise `npm run build:sidecars:release`
+        // reports every sidecar as missing and blocks `tauri build`.
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root parent")
+            .join("scripts")
+            .join("stage-release-sidecars.mjs");
+        let body = std::fs::read_to_string(&script)
+            .unwrap_or_else(|e| panic!("read stage script {}: {e}", script.display()));
+        assert!(
+            body.contains("process.platform === \"win32\""),
+            "stage-release-sidecars.mjs must detect Windows hosts to add .exe suffix"
+        );
+        assert!(
+            body.contains("\".exe\""),
+            "stage-release-sidecars.mjs must reference \".exe\" as the Windows executable suffix"
+        );
+        assert!(
+            body.contains("${sidecar}${exeSuffix}"),
+            "stage-release-sidecars.mjs must apply exeSuffix to the source path"
+        );
+        assert!(
+            body.contains("${sidecar}-${triple}${exeSuffix}"),
+            "stage-release-sidecars.mjs must apply exeSuffix to the staged destination path"
+        );
+    }
+
+    #[test]
     fn package_json_release_sidecars_uses_release_profile() {
         // Catch the regression where `build:sidecars` could be a
         // plain `cargo build` (debug) while `bundle.externalBin`
