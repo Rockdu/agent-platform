@@ -49,6 +49,11 @@ pub const MAX_RESULTS_PER_FIRE: usize = 10;
 ///
 /// `local_offset_secs` is the UTC→local offset in seconds (negative
 /// west of UTC). Production callers pass the current system offset.
+///
+/// Test-only since production migrated to the DST-aware
+/// `duration_until_next_local_fire_chrono`; retained for the pure
+/// fixed-offset arithmetic unit tests below.
+#[cfg(test)]
 pub fn duration_until_next_fire_local(
     now_unix_secs: i64,
     hour_local: u32,
@@ -86,6 +91,10 @@ pub fn should_backfill(now_unix_secs: u64, last_fired_unix_secs: Option<u64>) ->
 ///
 /// `local_offset_secs` is the same UTC→local offset
 /// `duration_until_next_fire_local` uses.
+///
+/// Test-only companion of `duration_until_next_fire_local`; the
+/// production loop uses `next_fire_on_same_local_day_chrono`.
+#[cfg(test)]
 pub fn next_fire_on_same_local_day(
     now_unix_secs: i64,
     wait_until_next_secs: u64,
@@ -113,7 +122,7 @@ pub fn duration_until_next_local_fire_chrono<Tz>(
 where
     Tz: chrono::TimeZone,
 {
-    use chrono::{Datelike, NaiveDate, TimeZone};
+    use chrono::{NaiveDate, TimeZone};
 
     fn pick_local<Tz: chrono::TimeZone>(
         tz: &Tz,

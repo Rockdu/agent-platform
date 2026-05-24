@@ -146,7 +146,6 @@ pub async fn papers_search(
     let binary_root = handle.binary_root.clone();
     let bundle_resource_root = handle.bundle_resource_root.clone();
     let app_data_dir = handle.app_data_dir.clone();
-    let q = query.clone();
     tokio::task::spawn_blocking(move || {
         let binary = resolve_binary_path(&binary_root, bundle_resource_root.as_deref())
             .map_err(|e| e.to_string())?;
@@ -154,7 +153,7 @@ pub async fn papers_search(
             &binary,
             &app_data_dir,
             &app_data_dir,
-            &q,
+            &query,
             FetchPurpose::ManualSearch,
         )
         .map_err(|e| e.to_string())
@@ -205,11 +204,7 @@ pub async fn papers_refresh_now(
 ) -> Result<usize, String> {
     require_papers_capability(&registry, &capability)?;
     let sched = handle.scheduler.clone();
-    let result = sched.fire().await;
-    match result {
-        Ok(count) => Ok(count),
-        Err(e) => Err(e.to_string()),
-    }
+    sched.fire().await.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -220,7 +215,7 @@ mod tests {
     /// Mint a valid papers mount and return the handle string.
     fn make_valid_papers_capability() -> (MountRegistry, String) {
         let registry = MountRegistry::new();
-        let resp = mount_inner(&registry, "papers", Some("tab-test"))
+        let resp = mount_inner(&registry, PAPERS_PLUGIN_ID, Some("tab-test"))
             .expect("papers is a known plugin (codegen registers it)");
         (registry, resp.handle)
     }

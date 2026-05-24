@@ -602,30 +602,23 @@ impl PapersStore {
         let guard = self.conn.lock().unwrap();
         // LEFT JOIN user_paper_state so the wire shape includes the
         // user's starred / read state for the React component (no
-        // separate hydration round trip required).
-        let (sql, mut params): (&str, Vec<rusqlite::types::Value>) = match source {
-            None => (
-                "SELECT d.arxiv_id, d.title, d.authors, d.abstract_snippet, d.pdf_url, d.abs_url, d.source, d.fetched_at, COALESCE(u.starred, 0), u.read_at \
-                 FROM daily_recommendations d \
-                 LEFT JOIN user_paper_state u ON u.arxiv_id = d.arxiv_id \
-                 ORDER BY d.fetched_at DESC LIMIT ?",
-                vec![],
-            ),
-            Some(_) => (
-                "SELECT d.arxiv_id, d.title, d.authors, d.abstract_snippet, d.pdf_url, d.abs_url, d.source, d.fetched_at, COALESCE(u.starred, 0), u.read_at \
-                 FROM daily_recommendations d \
-                 LEFT JOIN user_paper_state u ON u.arxiv_id = d.arxiv_id \
-                 WHERE d.source = ? \
-                 ORDER BY d.fetched_at DESC LIMIT ?",
-                Vec::new(),
-            ),
-        };
+        // separate hydration round trip required). The optional source
+        // filter is glued into the same query so the two branches
+        // can't drift in projection / ordering.
+        let where_clause = if source.is_some() { "WHERE d.source = ? " } else { "" };
+        let sql = format!(
+            "SELECT d.arxiv_id, d.title, d.authors, d.abstract_snippet, d.pdf_url, d.abs_url, d.source, d.fetched_at, COALESCE(u.starred, 0), u.read_at \
+             FROM daily_recommendations d \
+             LEFT JOIN user_paper_state u ON u.arxiv_id = d.arxiv_id \
+             {where_clause}ORDER BY d.fetched_at DESC LIMIT ?"
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
         if let Some(s) = source {
             params.push(rusqlite::types::Value::Text(s.to_string()));
         }
         params.push(rusqlite::types::Value::Integer(bounded));
         let mut stmt = guard
-            .prepare(sql)
+            .prepare(&sql)
             .map_err(|e| ArxivError::Sqlite(format!("prepare: {e}")))?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params.iter()), |row| {
