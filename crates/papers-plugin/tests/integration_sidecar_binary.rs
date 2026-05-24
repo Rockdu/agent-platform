@@ -9,9 +9,12 @@
 //! Sends MCP messages (`initialize`, `tools/list`, `tools/call`) on
 //! stdin and reads JSON-RPC responses from stdout. Verifies:
 //!   - `tools/list` returns the expected papers tool names.
-//!   - `papers.set_opt_in {enabled: true}` succeeds.
 //!   - `papers.fetch {query}` returns at least one paper and writes
-//!     to the sidecar's SQLite.
+//!     to the sidecar's SQLite (opt-in is seeded directly via SQLite
+//!     because `papers.set_opt_in` is intentionally NOT an MCP tool
+//!     — the WRITE lives behind the host UI prompt so the
+//!     orchestrator Claude cannot enable arXiv context queries on
+//!     the user's behalf).
 //!   - Bypassing opt-in (calling `papers.fetch` without prior set_opt_in)
 //!     returns a `not opted in` error.
 
@@ -157,6 +160,18 @@ async fn sidecar_binary_initialize_tools_list_fetch_end_to_end() {
     // Instead, capture the URL and drive the sidecar from a blocking task.
     let arxiv_base_owned = arxiv_base.clone();
     let tmp_path = tmp.path().to_path_buf();
+    // Seed opt-in directly via SQLite — `papers.set_opt_in` is NOT
+    // an MCP tool (it must stay user-confirmed via the host UI),
+    // and the binary boundary test still needs to exercise the
+    // opt-in-required code paths.
+    {
+        let conn = Connection::open(tmp.path().join("plugins/papers/state.sqlite")).unwrap();
+        conn.execute(
+            "UPDATE scheduler_state SET opt_in_enabled = 1 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    }
     let responses = tokio::task::spawn_blocking(move || {
         let messages = vec![
             json!({
@@ -176,15 +191,6 @@ async fn sidecar_binary_initialize_tools_list_fetch_end_to_end() {
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "papers.set_opt_in",
-                    "arguments": { "enabled": true }
-                }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 4,
-                "method": "tools/call",
-                "params": {
                     "name": "papers.fetch",
                     "arguments": { "query": "transformer attention" }
                 }
@@ -195,7 +201,7 @@ async fn sidecar_binary_initialize_tools_list_fetch_end_to_end() {
     .await
     .unwrap();
 
-    assert_eq!(responses.len(), 4, "expected one response per request");
+    assert_eq!(responses.len(), 3, "expected one response per request");
 
     // initialize: result includes serverInfo.name = "papers-plugin"
     assert_eq!(
@@ -204,7 +210,8 @@ async fn sidecar_binary_initialize_tools_list_fetch_end_to_end() {
         responses[0]
     );
 
-    // tools/list: at least papers.fetch present
+    // tools/list: at least papers.fetch present; papers.set_opt_in is
+    // intentionally absent.
     let tools = responses[1]["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools
         .iter()
@@ -216,18 +223,18 @@ async fn sidecar_binary_initialize_tools_list_fetch_end_to_end() {
         "papers.search",
         "papers.toggle_star",
         "papers.mark_read",
-        "papers.set_opt_in",
         "papers.get_opt_in",
     ] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }
-
-    // set_opt_in succeeded
-    assert_eq!(responses[2]["result"]["ok"], true);
+    assert!(
+        !names.contains(&"papers.set_opt_in"),
+        "papers.set_opt_in must NOT be exposed as an MCP tool; got: {names:?}"
+    );
 
     // fetch succeeded with the mocked arXiv response
-    assert_eq!(responses[3]["result"]["new_count"], 1);
-    let papers = responses[3]["result"]["papers"].as_array().unwrap();
+    assert_eq!(responses[2]["result"]["new_count"], 1);
+    let papers = responses[2]["result"]["papers"].as_array().unwrap();
     assert_eq!(papers[0]["arxivId"], "2401.00001v1");
 
     // SQLite state reflects the insertion

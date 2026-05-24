@@ -26,6 +26,11 @@ pub const RATE_LIMIT_SECONDS: u64 = 3;
 pub const DEDUP_WINDOW_DAYS: u64 = 7;
 pub const MAX_RETRY_ATTEMPTS: u32 = 3;
 pub const ARXIV_API_DEFAULT: &str = "https://export.arxiv.org/api/query";
+/// Hard cap on rows returned by `PapersStore::list_recent`. Callers
+/// (MCP, Tauri, host RPC) supply the limit but the input is untrusted
+/// — without clamping, a negative value would make SQLite interpret
+/// `LIMIT -1` as no-limit and return the entire recommendations table.
+pub const MAX_LIST_RECENT_LIMIT: i64 = 500;
 
 /// CLI args parsed from argv (mirrors terminal-mesh-sidecar shape).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,19 +186,8 @@ pub fn tools_list_response() -> Value {
                 }
             },
             {
-                "name": "papers.set_opt_in",
-                "description": "Set the global opt-in flag for daily arXiv context queries.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "enabled": {"type": "boolean"}
-                    },
-                    "required": ["enabled"]
-                }
-            },
-            {
                 "name": "papers.get_opt_in",
-                "description": "Read the global opt-in flag. Returns {enabled: bool|null} — null means the first-run prompt has not been answered yet.",
+                "description": "Read the global opt-in flag. Returns {enabled: bool|null} — null means the first-run prompt has not been answered yet. Read-only — the WRITE side (`papers_set_opt_in`) is intentionally NOT an MCP tool; it lives behind the host UI prompt so the orchestrator Claude cannot enable arXiv context queries on the user's behalf.",
                 "inputSchema": {"type": "object", "properties": {}}
             }
         ]
@@ -574,6 +568,11 @@ impl PapersStore {
     }
 
     pub fn list_recent(&self, limit: i64) -> Result<Vec<PaperRecord>, ArxivError> {
+        // Clamp before substituting into SQL. SQLite treats `LIMIT -1`
+        // as no limit, so passing a negative value through would
+        // return the entire recommendations table. Callers come from
+        // the MCP and Tauri surfaces so the input is untrusted.
+        let bounded = limit.clamp(0, MAX_LIST_RECENT_LIMIT);
         let guard = self.conn.lock().unwrap();
         // LEFT JOIN user_paper_state so the wire shape includes the
         // user's starred / read state for the React component (no
@@ -587,7 +586,7 @@ impl PapersStore {
             )
             .map_err(|e| ArxivError::Sqlite(format!("prepare: {e}")))?;
         let rows = stmt
-            .query_map(rusqlite::params![limit], |row| {
+            .query_map(rusqlite::params![bounded], |row| {
                 let authors_str: String = row.get(2)?;
                 let authors: Vec<String> = authors_str
                     .split(';')
@@ -1096,10 +1095,12 @@ pub fn handle_tool_call(
                 .to_string();
             store.mark_read(&arxiv_id).map(|_| json!({ "ok": true }))
         }
-        "papers.set_opt_in" => {
-            let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-            store.set_opt_in(enabled).map(|_| json!({ "ok": true }))
-        }
+        // Note: `papers.set_opt_in` is NOT an MCP tool. The opt-in
+        // mutation must stay user-confirmed; exposing it to the
+        // orchestrator Claude would let the model enable arXiv
+        // context queries on the user's behalf. The host's
+        // `papers_set_opt_in` Tauri command (wired to the React
+        // first-run banner) is the only WRITE path.
         "papers.get_opt_in" => store
             .get_opt_in()
             .map(|enabled| json!({ "enabled": enabled })),
@@ -1475,8 +1476,118 @@ mod tests {
         assert!(names.contains(&"papers.list_recent"));
         assert!(names.contains(&"papers.search"));
         assert!(names.contains(&"papers.toggle_star"));
-        assert!(names.contains(&"papers.set_opt_in"));
+        assert!(names.contains(&"papers.mark_read"));
         assert!(names.contains(&"papers.get_opt_in"));
+    }
+
+    #[test]
+    fn papers_set_opt_in_is_not_an_mcp_tool() {
+        // Opt-in WRITE must stay user-confirmed; the orchestrator
+        // Claude must not be able to flip it via MCP.
+        let v = tools_list_response();
+        let tools = v.get("tools").and_then(|t| t.as_array()).unwrap();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t.get("name").and_then(|n| n.as_str()).unwrap())
+            .collect();
+        assert!(
+            !names.contains(&"papers.set_opt_in"),
+            "papers.set_opt_in must NOT be exposed as an MCP tool; got: {names:?}"
+        );
+        // The dispatch arm must also be gone — invoking the name via
+        // tools/call returns an unknown-tool error, not a successful
+        // mutation.
+        let (store, _t) = setup_store();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: JsonRpcId::Number(99),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "papers.set_opt_in",
+                "arguments": { "enabled": true }
+            })),
+        };
+        let fetcher = |_: &str| Ok::<String, ArxivError>(String::new());
+        let resp = handle_mcp_message(JsonRpcMessage::Request(req), &store, &fetcher).unwrap();
+        let err = resp.error.expect("expected MCP error for removed tool");
+        assert_eq!(err.code, -32601);
+        // The store state must NOT have been mutated.
+        assert_eq!(store.get_opt_in().unwrap(), None);
+    }
+
+    #[test]
+    fn papers_get_opt_in_still_exposed_as_mcp_tool() {
+        // Read access stays — orchestrator needs to know whether
+        // context-driven searches are enabled.
+        let v = tools_list_response();
+        let tools = v.get("tools").and_then(|t| t.as_array()).unwrap();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t.get("name").and_then(|n| n.as_str()).unwrap())
+            .collect();
+        assert!(names.contains(&"papers.get_opt_in"));
+    }
+
+    #[test]
+    fn list_recent_clamps_negative_limit_to_zero() {
+        // SQLite treats `LIMIT -1` as no-limit. A negative caller
+        // value must not return the entire table.
+        let (store, _t) = setup_store();
+        // Seed a handful of rows so the test would fail if clamping
+        // were absent (we'd see all 3 rows back instead of 0).
+        for i in 0..3 {
+            store
+                .insert_dedup(
+                    &[PaperRecord {
+                        arxiv_id: format!("2024.neg.{i}"),
+                        title: format!("T{i}"),
+                        authors: vec![],
+                        abstract_snippet: "".to_string(),
+                        pdf_url: "".to_string(),
+                        abs_url: "".to_string(),
+                        source: "scheduled".to_string(),
+                        fetched_at: now_iso8601(),
+                        starred: false,
+                        read_at: None,
+                    }],
+                    "q",
+                )
+                .unwrap();
+        }
+        let rows = store.list_recent(-1).unwrap();
+        assert!(
+            rows.is_empty(),
+            "negative limit must clamp to 0 rows; got {} rows",
+            rows.len()
+        );
+    }
+
+    #[test]
+    fn list_recent_clamps_above_max_limit() {
+        // Above the cap, list_recent returns at most MAX_LIST_RECENT_LIMIT.
+        let (store, _t) = setup_store();
+        let seed_count = (MAX_LIST_RECENT_LIMIT as usize) + 50;
+        for i in 0..seed_count {
+            store
+                .insert_dedup(
+                    &[PaperRecord {
+                        arxiv_id: format!("2024.cap.{i:05}"),
+                        title: format!("T{i}"),
+                        authors: vec![],
+                        abstract_snippet: "".to_string(),
+                        pdf_url: "".to_string(),
+                        abs_url: "".to_string(),
+                        source: "scheduled".to_string(),
+                        fetched_at: now_iso8601(),
+                        starred: false,
+                        read_at: None,
+                    }],
+                    "q",
+                )
+                .unwrap();
+        }
+        let rows = store.list_recent(1_000_000).unwrap();
+        assert_eq!(rows.len(), MAX_LIST_RECENT_LIMIT as usize);
     }
 
     #[test]
