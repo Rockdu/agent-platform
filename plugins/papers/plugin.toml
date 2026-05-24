@@ -1,0 +1,21 @@
+name = "论文"
+version = "0.0.1"
+type = "tab"
+command_bin = "papers-plugin"
+frontend = "frontend/index.tsx"
+permissions = ["notify"]
+required_apis = ["invoke", "listen"]
+db_namespace = "papers"
+migrations_path = "migrations/"
+
+[[commands]]
+name = "list_recent"
+permissions = []
+args_type = "ListRecentArgs"
+result_type = "ListRecentResult"
+
+[[commands]]
+name = "search"
+permissions = ["notify"]
+args_type = "SearchArgs"
+result_type = "SearchResult"

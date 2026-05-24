@@ -1,0 +1,11 @@
+[package]
+name = "papers-plugin"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "papers-plugin"
+path = "src/main.rs"
