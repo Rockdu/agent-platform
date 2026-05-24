@@ -210,15 +210,17 @@ async fn sidecar_binary_initialize_tools_list_fetch_end_to_end() {
         responses[0]
     );
 
-    // tools/list: at least papers.fetch present; papers.set_opt_in is
-    // intentionally absent.
+    // tools/list: orchestrator-visible tools only. `papers.fetch` is
+    // intentionally absent so an ad-hoc orchestrator request cannot
+    // advance scheduler state (the host scheduler still calls it via
+    // unlisted `tools/call`). `papers.set_opt_in` is intentionally
+    // absent so the model cannot flip the opt-in flag.
     let tools = responses[1]["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
     for expected in [
-        "papers.fetch",
         "papers.list_recent",
         "papers.search",
         "papers.toggle_star",
@@ -227,12 +229,16 @@ async fn sidecar_binary_initialize_tools_list_fetch_end_to_end() {
     ] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }
-    assert!(
-        !names.contains(&"papers.set_opt_in"),
-        "papers.set_opt_in must NOT be exposed as an MCP tool; got: {names:?}"
-    );
+    for forbidden in ["papers.fetch", "papers.set_opt_in"] {
+        assert!(
+            !names.contains(&forbidden),
+            "{forbidden} must NOT be advertised in tools/list; got: {names:?}"
+        );
+    }
 
-    // fetch succeeded with the mocked arXiv response
+    // fetch succeeded with the mocked arXiv response (papers.fetch
+    // still routes via `tools/call` — only the discovery path is
+    // hidden from the orchestrator).
     assert_eq!(responses[2]["result"]["new_count"], 1);
     let papers = responses[2]["result"]["papers"].as_array().unwrap();
     assert_eq!(papers[0]["arxivId"], "2401.00001v1");

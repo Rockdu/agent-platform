@@ -1,13 +1,24 @@
 //! `papers-plugin` MCP sidecar — arXiv recommendation engine.
 //!
-//! Exposes MCP tools to the orchestrator's `claude`:
-//!   - `papers.fetch` — fetch arXiv papers for a keyword query, store
-//!     deduplicated results in the papers SQLite, return the new rows.
+//! Exposes MCP tools to the orchestrator's `claude` (listed in
+//! `tools_list_response`):
 //!   - `papers.list_recent` — read the most recent stored recommendations.
 //!   - `papers.search` — ad-hoc search by keyword (writes `source = "manual"`).
 //!   - `papers.toggle_star` — toggle the `starred` bit for a paper.
-//!   - `papers.set_opt_in` — write the global opt-in flag.
+//!   - `papers.mark_read` — stamp the `read_at` timestamp for a paper.
 //!   - `papers.get_opt_in` — read the global opt-in flag.
+//!
+//! `papers.fetch` is intentionally NOT advertised in `tools/list` but
+//! is still accepted by `handle_tool_call` so the host scheduler's
+//! direct `tools/call` (via `papers_sidecar_client::fetch_via_sidecar`)
+//! can route the daily digest through the same dispatch path. The
+//! orchestrator Claude only sees `papers.search`; this prevents an
+//! ad-hoc Claude request from advancing scheduler state.
+//!
+//! `papers.set_opt_in` is also intentionally absent — the opt-in
+//! WRITE lives behind the host UI prompt (Tauri `papers_set_opt_in`
+//! command) so the model cannot enable arXiv context queries on the
+//! user's behalf.
 //!
 //! Discovery: `APP_DATA_DIR` env var locates `${APP_DATA}/plugins/papers/state.sqlite`.
 //!
@@ -126,20 +137,17 @@ pub enum ArxivError {
 /// enforced by `mcp_config.rs` excluding the papers sidecar from
 /// non-orchestrator tab configs, so any Claude that sees these tools
 /// has already passed that gate.
+///
+/// `papers.fetch` is intentionally NOT advertised here. It is the
+/// scheduler-driven path and would otherwise let an ad-hoc orchestrator
+/// request advance `scheduler_state.last_fired_at` / clear `last_error`,
+/// causing the real daily backfill to be skipped. `handle_tool_call`
+/// still accepts the tool name so the host scheduler's direct
+/// `tools/call` (via `papers_sidecar_client::fetch_via_sidecar`)
+/// continues to work without a protocol change.
 pub fn tools_list_response() -> Value {
     json!({
         "tools": [
-            {
-                "name": "papers.fetch",
-                "description": "Scheduler-driven arXiv fetch for the daily digest path. Deduplicates against the 7-day window, stores in papers SQLite, returns new records, and advances `last_fired_at` + clears `last_error`. Respects 3s minimum between arXiv calls. For ad-hoc or manual searches use `papers.search` instead — it shares the same opt-in / rate-limit / dedup pipeline but does NOT touch scheduler state, so it cannot suppress the next daily backfill.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Space-separated keywords"}
-                    },
-                    "required": ["query"]
-                }
-            },
             {
                 "name": "papers.list_recent",
                 "description": "Return the N most recent stored paper records ordered by fetched_at DESC.",
@@ -966,7 +974,27 @@ pub fn fetch_papers_gated(
     // Atomic acquire — if the rate-limit window has elapsed this stamps
     // `last_arxiv_call_at` in the same transaction as the read so two
     // concurrent callers can't both observe the gate as open.
-    store.try_touch_rate_limit()?;
+    //
+    // Cooldown handling differs by purpose. A scheduled digest cannot
+    // give up on `RateLimited`: bubbling the error to the host
+    // scheduler's `run_loop` discards the daily fire entirely (the
+    // loop swallows the result and sleeps until the next 10 AM slot),
+    // so a manual search completing at 09:59:59 would silently kill
+    // the 10:00:00 digest. Wait the reported cooldown plus a small
+    // margin and retry the acquire exactly once. Manual searches
+    // surface `RateLimited` directly because the UI cooldown banner
+    // already explains the wait.
+    if let Err(err) = store.try_touch_rate_limit() {
+        match (err, purpose) {
+            (ArxivError::RateLimited { wait_secs }, FetchPurpose::ScheduledDigest) => {
+                std::thread::sleep(
+                    std::time::Duration::from_millis(wait_secs.saturating_mul(1000) + 250),
+                );
+                store.try_touch_rate_limit()?;
+            }
+            (other, _) => return Err(other),
+        }
+    }
     let url = build_arxiv_url(api_base, query, 10);
     let body = match arxiv_fetcher(&url) {
         Ok(b) => b,
@@ -1468,19 +1496,37 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_includes_all_papers_tools() {
+    fn tools_list_includes_all_orchestrator_visible_papers_tools() {
         let v = tools_list_response();
         let tools = v.get("tools").and_then(|t| t.as_array()).unwrap();
         let names: Vec<&str> = tools
             .iter()
             .map(|t| t.get("name").and_then(|n| n.as_str()).unwrap())
             .collect();
-        assert!(names.contains(&"papers.fetch"));
         assert!(names.contains(&"papers.list_recent"));
         assert!(names.contains(&"papers.search"));
         assert!(names.contains(&"papers.toggle_star"));
         assert!(names.contains(&"papers.mark_read"));
         assert!(names.contains(&"papers.get_opt_in"));
+    }
+
+    #[test]
+    fn papers_fetch_is_not_advertised_in_tools_list() {
+        // The scheduler-driven fetch path must NOT be discoverable by
+        // the orchestrator Claude. If listed, an ad-hoc request can
+        // pick it instead of `papers.search`, hardcoded to
+        // ScheduledDigest, which would advance `last_fired_at` /
+        // clear `last_error` and silently kill the next daily digest.
+        let v = tools_list_response();
+        let tools = v.get("tools").and_then(|t| t.as_array()).unwrap();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t.get("name").and_then(|n| n.as_str()).unwrap())
+            .collect();
+        assert!(
+            !names.contains(&"papers.fetch"),
+            "papers.fetch must NOT be advertised in tools/list; got: {names:?}"
+        );
     }
 
     #[test]
@@ -1830,30 +1876,126 @@ mod tests {
     }
 
     #[test]
-    fn papers_fetch_schema_does_not_advertise_source_argument() {
-        // Regression: previously `papers.fetch` advertised a `source`
-        // property on its input schema with values "scheduled" /
-        // "manual". A caller passing "manual" still triggered the
-        // ScheduledDigest path, which would suppress the next
-        // backfill. The argument is now removed from the schema and
-        // ignored at dispatch time.
-        let v = tools_list_response();
-        let tools = v.get("tools").and_then(|t| t.as_array()).unwrap();
-        let fetch_tool = tools
-            .iter()
-            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("papers.fetch"))
-            .expect("papers.fetch must still be advertised");
-        let properties = fetch_tool
-            .get("inputSchema")
-            .and_then(|s| s.get("properties"))
-            .and_then(|p| p.as_object())
-            .expect("input schema with properties");
+    fn papers_fetch_still_routes_to_scheduled_digest_via_tools_call() {
+        // Even though papers.fetch is no longer advertised in
+        // tools/list, the dispatch arm in handle_tool_call MUST remain
+        // so the host scheduler's direct tools/call (via
+        // papers_sidecar_client::fetch_via_sidecar) keeps working
+        // without a protocol change. The arm hardcodes
+        // (source="scheduled", FetchPurpose::ScheduledDigest).
+        let (store, _t) = setup_store();
+        store.set_opt_in(true).unwrap();
+        let before_fired = store.last_fired_at_unix().unwrap();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: JsonRpcId::Number(7),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "papers.fetch",
+                "arguments": { "query": "transformers" }
+            })),
+        };
+        let fetcher = |_url: &str| {
+            Ok::<String, ArxivError>(
+                r#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/keep.1</id><title>T</title><summary>S</summary><link href="http://arxiv.org/pdf/keep.1" type="application/pdf"/></entry></feed>"#
+                    .to_string(),
+            )
+        };
+        let resp = handle_mcp_message(JsonRpcMessage::Request(req), &store, &fetcher).unwrap();
         assert!(
-            !properties.contains_key("source"),
-            "papers.fetch must not advertise a `source` argument; got: {:?}",
-            properties.keys().collect::<Vec<_>>()
+            resp.error.is_none(),
+            "papers.fetch via tools/call must still succeed; got error: {:?}",
+            resp.error
         );
-        assert!(properties.contains_key("query"));
+        let after_fired = store.last_fired_at_unix().unwrap();
+        assert!(
+            before_fired.is_none() || after_fired > before_fired,
+            "papers.fetch must advance last_fired_at (ScheduledDigest path); before={before_fired:?} after={after_fired:?}"
+        );
+        let listed = store.list_recent(10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source, "scheduled");
+    }
+
+    #[test]
+    fn scheduled_digest_waits_for_cooldown_and_retries() {
+        // Reproduces the missed-digest bug: a manual search at
+        // (now - 1s) is inside the 3-second rate-limit window. The
+        // scheduled fire that follows MUST wait the cooldown and
+        // retry the acquire, not bubble RateLimited up to the
+        // scheduler (which would discard the daily fire entirely
+        // and sleep until tomorrow).
+        let (store, _t) = setup_store();
+        store.set_opt_in(true).unwrap();
+        // Acquire once to stamp last_arxiv_call_at = "now".
+        store.try_touch_rate_limit().unwrap();
+        let fetcher = |_url: &str| {
+            Ok::<String, ArxivError>(
+                r#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/wait.1</id><title>T</title><summary>S</summary><link href="http://arxiv.org/pdf/wait.1" type="application/pdf"/></entry></feed>"#
+                    .to_string(),
+            )
+        };
+        let start = std::time::Instant::now();
+        let inserted = fetch_papers_gated(
+            &store,
+            &fetcher,
+            "https://x/",
+            "query",
+            "scheduled",
+            FetchPurpose::ScheduledDigest,
+        )
+        .expect("scheduled digest must succeed after cooldown wait, not bubble RateLimited");
+        let elapsed = start.elapsed();
+        assert_eq!(inserted.len(), 1, "expected one row inserted");
+        // The acquire stamped 'now' and the gate window is
+        // RATE_LIMIT_SECONDS; we should have waited at least
+        // (window - small slack) before the retry. The retry sleep
+        // is wait_secs + 250 ms, so the upper bound is ~window + 1s.
+        let lower = std::time::Duration::from_millis(
+            RATE_LIMIT_SECONDS.saturating_mul(1000).saturating_sub(500),
+        );
+        let upper = std::time::Duration::from_millis(
+            RATE_LIMIT_SECONDS.saturating_mul(1000) + 1500,
+        );
+        assert!(
+            elapsed >= lower && elapsed <= upper,
+            "scheduled digest should have waited ~{}s for cooldown; took {:?}",
+            RATE_LIMIT_SECONDS,
+            elapsed
+        );
+    }
+
+    #[test]
+    fn manual_search_still_bubbles_rate_limited_immediately() {
+        // ManualSearch must keep its current behaviour: surface
+        // RateLimited to the UI immediately so the cooldown banner
+        // can explain the wait. It must NOT inherit the scheduled
+        // retry/sleep path (that would block the UI thread).
+        let (store, _t) = setup_store();
+        store.set_opt_in(true).unwrap();
+        store.try_touch_rate_limit().unwrap();
+        let fetcher = |_url: &str| Ok::<String, ArxivError>(String::new());
+        let start = std::time::Instant::now();
+        let err = fetch_papers_gated(
+            &store,
+            &fetcher,
+            "https://x/",
+            "query",
+            "manual",
+            FetchPurpose::ManualSearch,
+        )
+        .unwrap_err();
+        let elapsed = start.elapsed();
+        match err {
+            ArxivError::RateLimited { wait_secs } => {
+                assert!(wait_secs <= RATE_LIMIT_SECONDS);
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "manual search must return immediately on RateLimited; took {elapsed:?}"
+        );
     }
 
     #[test]
