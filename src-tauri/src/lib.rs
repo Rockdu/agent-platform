@@ -17,6 +17,9 @@ mod sshfs_mount;
 mod logging;
 mod mcp_config;
 mod orchestrator;
+mod papers_commands;
+mod papers_context;
+mod papers_scheduler;
 mod plugin_sqlite;
 mod secrets;
 mod sidecar_manager;
@@ -851,6 +854,28 @@ pub fn run() {
                     let mount_registry_handle = app.state::<dispatcher::MountRegistry>().inner().clone();
                     let terminal_registry_handle = app.state::<TerminalMeshRegistry>().inner().clone();
                     let workspaces_handle = app.state::<WorkspaceRegistry>().inner().clone();
+                    // Open the papers SQLite early so both the host RPC
+                    // bridge and the later Tauri command surface share
+                    // the same handle. None on failure (papers feature
+                    // disabled but rest of app still runs).
+                    let papers_store_arc: Option<std::sync::Arc<papers_plugin::PapersStore>> = (|| {
+                        let plugins_root = paths.agent_platform.join("plugins");
+                        let _ = std::fs::create_dir_all(&plugins_root);
+                        let plugin_dir = plugins_root.join("papers");
+                        let _ = std::fs::create_dir_all(&plugin_dir);
+                        let db_path = plugin_dir.join("state.sqlite");
+                        let migrations_dir = std::env::current_dir()
+                            .ok()?
+                            .join("plugins")
+                            .join("papers")
+                            .join("migrations");
+                        if let Ok(storage) = plugin_sqlite::PluginStorage::open(&plugins_root, "papers") {
+                            if migrations_dir.is_dir() {
+                                let _ = storage.run_migrations(&migrations_dir);
+                            }
+                        }
+                        papers_plugin::PapersStore::open(&db_path).ok().map(std::sync::Arc::new)
+                    })();
                     let host_rpc_sock_path = match host_rpc::prepare_socket_path(&app_data_root) {
                         Ok(p) => {
                             host_rpc::spawn_bridge(
@@ -861,6 +886,7 @@ pub fn run() {
                                     terminal_registry: terminal_registry_handle,
                                     workspaces: workspaces_handle,
                                     app_handle: Some(app.handle().clone()),
+                                    papers_store: papers_store_arc.clone(),
                                 },
                             );
                             tracing::info!(host_rpc_sock = %p.display(), "host_rpc bridge spawned");
@@ -889,7 +915,30 @@ pub fn run() {
                     );
                     let notification_service =
                         notification::NotificationService::with_sink(real_sink);
+                    let notification_service_arc = std::sync::Arc::new(notification_service.clone());
                     app.manage(notification_service);
+
+                    // Papers feature: reuse the store opened above for
+                    // the host RPC bridge. Spawn the daily scheduler
+                    // and expose store + scheduler via PapersHandle.
+                    if let Some(store) = papers_store_arc.clone() {
+                        let workspaces_handle =
+                            app.state::<WorkspaceRegistry>().inner().clone();
+                        let scheduler = papers_scheduler::PapersScheduler::new(
+                            store.clone(),
+                            workspaces_handle,
+                            notification_service_arc.clone(),
+                        );
+                        scheduler.clone().start();
+                        app.manage(papers_commands::PapersHandle {
+                            store,
+                            scheduler,
+                        });
+                    } else {
+                        tracing::warn!(
+                            "papers feature disabled: could not open papers state.sqlite or run migrations"
+                        );
+                    }
 
                     // Round 41 (task22 remediation): menubar tray icon
                     // — left-click toggles the tray window via
@@ -1014,6 +1063,14 @@ pub fn run() {
             notification::notification_list_recent_tray_entries,
             notification::notification_clear_tray_entries,
             notification::notification_get_permission_state,
+            notification::notification_list_recent_papers_tray_entries,
+            notification::notification_clear_papers_tray_entries,
+            papers_commands::papers_list_recent,
+            papers_commands::papers_get_opt_in,
+            papers_commands::papers_set_opt_in,
+            papers_commands::papers_toggle_star,
+            papers_commands::papers_search,
+            papers_commands::papers_refresh_now,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

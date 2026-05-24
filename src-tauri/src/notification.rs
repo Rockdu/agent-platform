@@ -37,6 +37,11 @@ use terminal_mesh_core::{
 /// most-recent slice; older entries are dropped when the ring fills.
 pub const MAX_TRAY_ENTRIES: usize = 100;
 
+/// Hard cap on retained papers tray entries. Papers ring is separate
+/// from `TrayEntry` (which is terminal-event-shaped) so the daily
+/// digest never collides with attention events.
+pub const MAX_PAPERS_TRAY_ENTRIES: usize = 50;
+
 /// Cached permission state. Stored as `AtomicU8` so concurrent fires
 /// don't race on the lazy first-request flow.
 const PERM_UNKNOWN: u8 = 0;
@@ -62,6 +67,19 @@ pub struct TrayEntry {
     /// frontend renders a 🤖 / "claude" badge on these rows so
     /// orchestrator events are visually distinct from regular tabs.
     pub is_orchestrator: bool,
+}
+
+/// Papers digest tray entry — kept distinct from `TrayEntry` because
+/// `TrayEntry`'s shape encodes terminal events (terminal_id, severity,
+/// suppressed_count) which do not apply to paper cards.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PapersTrayEntry {
+    pub arxiv_id: String,
+    pub title: String,
+    pub abstract_snippet: String,
+    pub abs_url: String,
+    pub fetched_at: String,
 }
 
 /// Wire shape for `notification_get_permission_state`. `unknown` until
@@ -106,6 +124,7 @@ pub struct NotificationService {
 struct NotificationInner {
     arbiter: StdMutex<DedupArbiter>,
     entries: StdMutex<VecDeque<TrayEntry>>,
+    papers_entries: StdMutex<VecDeque<PapersTrayEntry>>,
     permission: AtomicU8,
     sink: Arc<dyn NotifySink>,
 }
@@ -119,10 +138,66 @@ impl NotificationService {
             inner: Arc::new(NotificationInner {
                 arbiter: StdMutex::new(DedupArbiter::for_production()),
                 entries: StdMutex::new(VecDeque::with_capacity(MAX_TRAY_ENTRIES)),
+                papers_entries: StdMutex::new(VecDeque::with_capacity(MAX_PAPERS_TRAY_ENTRIES)),
                 permission: AtomicU8::new(PERM_UNKNOWN),
                 sink,
             }),
         }
+    }
+
+    /// Append the daily-digest papers entries to the papers-only ring
+    /// buffer and fire one native notification with `title` / `body`.
+    /// No-op for the notification if `entries` is empty; the ring still
+    /// records every entry passed in (cap enforced).
+    ///
+    /// Surfaces via the separate `notification_list_recent_papers_tray_entries`
+    /// Tauri command so the tray window can render paper cards in a
+    /// distinct section.
+    pub fn push_papers_digest(
+        &self,
+        title: String,
+        body: String,
+        entries: Vec<PapersTrayEntry>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        {
+            let mut guard = self
+                .inner
+                .papers_entries
+                .lock()
+                .expect("papers tray entries poisoned");
+            for entry in entries {
+                guard.push_back(entry);
+                while guard.len() > MAX_PAPERS_TRAY_ENTRIES {
+                    guard.pop_front();
+                }
+            }
+        }
+        // Best-effort native notification. Permission denial is logged
+        // by the sink itself; the entry is already in the ring.
+        self.inner.sink.fire(&title, &body);
+    }
+
+    /// Snapshot of the recent papers tray entries (newest first).
+    pub fn list_recent_papers_entries(&self) -> Vec<PapersTrayEntry> {
+        let guard = self
+            .inner
+            .papers_entries
+            .lock()
+            .expect("papers tray entries poisoned");
+        guard.iter().rev().cloned().collect()
+    }
+
+    /// Clear the papers tray ring.
+    pub fn clear_papers_entries(&self) {
+        let mut guard = self
+            .inner
+            .papers_entries
+            .lock()
+            .expect("papers tray entries poisoned");
+        guard.clear();
     }
 
     /// Snapshot of the recent tray entries (newest first).
@@ -464,6 +539,18 @@ pub fn notification_get_permission_state(
     service: tauri::State<'_, NotificationService>,
 ) -> PermissionStateDto {
     service.permission_state_dto()
+}
+
+#[tauri::command]
+pub fn notification_list_recent_papers_tray_entries(
+    service: tauri::State<'_, NotificationService>,
+) -> Vec<PapersTrayEntry> {
+    service.list_recent_papers_entries()
+}
+
+#[tauri::command]
+pub fn notification_clear_papers_tray_entries(service: tauri::State<'_, NotificationService>) {
+    service.clear_papers_entries();
 }
 
 #[cfg(test)]

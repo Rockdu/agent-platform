@@ -34,3 +34,24 @@ export async function notificationListRecentTrayEntries(): Promise<TrayEntryDto[
 export async function notificationClearTrayEntries(): Promise<void> {
   await invoke<void>("notification_clear_tray_entries");
 }
+
+/**
+ * Daily-digest paper card. Stored in a ring buffer separate from the
+ * terminal-event-shaped TrayEntryDto so the tray UI can render a
+ * dedicated papers section without conflating the two data shapes.
+ */
+export interface PapersTrayEntryDto {
+  arxivId: string;
+  title: string;
+  abstractSnippet: string;
+  absUrl: string;
+  fetchedAt: string;
+}
+
+export async function notificationListRecentPapersTrayEntries(): Promise<PapersTrayEntryDto[]> {
+  return await invoke<PapersTrayEntryDto[]>("notification_list_recent_papers_tray_entries");
+}
+
+export async function notificationClearPapersTrayEntries(): Promise<void> {
+  await invoke<void>("notification_clear_papers_tray_entries");
+}

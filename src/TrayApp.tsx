@@ -1,26 +1,34 @@
-// task22 / AC-8.1 — TrayBottomCenter tray window root.
+// TrayBottomCenter tray window root.
 //
 // Renders the most-recent NeedsAttention events surfaced by the
-// host notification service. Subscribes to `tray://updated` so the
-// list refreshes whenever a new event fires (or a dedup-suppressed
+// host notification service, plus a separate section for papers
+// digest entries. Subscribes to `tray://updated` so the list
+// refreshes whenever a new event fires (or a dedup-suppressed
 // event bumps an existing entry's suppressed_count).
 
 import { useCallback, useEffect, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   notificationClearTrayEntries,
+  notificationListRecentPapersTrayEntries,
   notificationListRecentTrayEntries,
+  type PapersTrayEntryDto,
   type TrayEntryDto,
 } from "./notification";
 
 export function TrayApp() {
   const [entries, setEntries] = useState<TrayEntryDto[]>([]);
+  const [papers, setPapers] = useState<PapersTrayEntryDto[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const list = await notificationListRecentTrayEntries();
+      const [list, paperList] = await Promise.all([
+        notificationListRecentTrayEntries(),
+        notificationListRecentPapersTrayEntries(),
+      ]);
       setEntries(list);
+      setPapers(paperList);
       setError(null);
     } catch (err) {
       setError(typeof err === "string" ? err : JSON.stringify(err));
@@ -103,6 +111,36 @@ export function TrayApp() {
             </li>
           ))}
         </ul>
+      )}
+      {papers.length > 0 && (
+        <section className="tray-app__papers" aria-label="每日论文推荐">
+          <header className="tray-app__papers-header">
+            <h2>每日论文推荐</h2>
+          </header>
+          <ul className="tray-app__list tray-app__list--papers">
+            {papers.map((p) => (
+              <li key={p.arxivId} className="tray-app__item tray-app__item--papers">
+                <div className="tray-app__item-head">
+                  <code className="tray-app__source">{p.arxivId}</code>
+                </div>
+                <p className="tray-app__summary">
+                  <strong>{p.title}</strong>
+                </p>
+                <p className="tray-app__summary tray-app__summary--abstract">
+                  {p.abstractSnippet}
+                </p>
+                <a
+                  className="tray-app__paper-link"
+                  href={p.absUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  arXiv ↗
+                </a>
+              </li>
+            ))}
+          </ul>
+        </section>
       )}
     </div>
   );

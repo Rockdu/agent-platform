@@ -17,6 +17,11 @@ use crate::generated::plugin_registry::PLUGINS;
 
 const CONFIGS_DIRNAME: &str = "claude-mcp-configs";
 const ORCHESTRATOR_CROSS_TAB_PLUGIN: &str = "terminal-mesh";
+/// Plugin ids whose MCP sidecar is included only in the orchestrator's
+/// generated config. Workspace tabs get a tool list that omits these
+/// servers entirely. Defense-in-depth lives in `host_rpc.rs` so direct
+/// non-orchestrator callers also receive an authorization error.
+const ORCHESTRATOR_ONLY_PLUGINS: &[&str] = &["papers"];
 const TAB_ID_PATTERN: &str = r"^[A-Za-z0-9._-]{1,128}$";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +234,11 @@ pub fn generate_config_with_host_rpc_sock(
                 .map(|p| (p.plugin_id, p.command_bin)),
         );
     for (plugin_id, command_bin) in plugin_iter {
+        if ORCHESTRATOR_ONLY_PLUGINS.contains(&plugin_id)
+            && kind != McpConfigKind::Orchestrator
+        {
+            continue;
+        }
         let candidates = resolve_expected_paths(workspace_root_for_dev, command_bin);
         let Some(command_path) = candidates.iter().find(|p| p.exists()) else {
             tracing::warn!(
@@ -983,6 +993,56 @@ mod tests {
         assert!(
             !entry.env.contains_key("TERMINAL_MESH_CAPABILITY"),
             "missing capability must NOT introduce an env var"
+        );
+    }
+
+    #[test]
+    fn standard_config_excludes_papers_sidecar() {
+        let app_data = tempfile::TempDir::new().unwrap();
+        let workspace_root = tempfile::TempDir::new().unwrap();
+        let workspace = make_workspace_dir();
+        stub_sidecar_for(workspace_root.path(), "notes-plugin");
+        stub_sidecar_for(workspace_root.path(), "terminal-mesh-sidecar");
+        stub_sidecar_for(workspace_root.path(), "papers-plugin");
+        let doc = generate_config_with_host_rpc_sock(
+            "tab-std",
+            workspace.path(),
+            McpConfigKind::Standard,
+            app_data.path(),
+            workspace_root.path(),
+            Some(std::path::Path::new("/tmp/host.sock")),
+            None,
+        )
+        .expect("generate");
+        assert!(
+            !doc.mcp_servers.contains_key("papers"),
+            "standard tabs MUST NOT have a papers sidecar entry; got servers={:?}",
+            doc.mcp_servers.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn orchestrator_config_includes_papers_sidecar() {
+        let app_data = tempfile::TempDir::new().unwrap();
+        let workspace_root = tempfile::TempDir::new().unwrap();
+        let workspace = make_workspace_dir();
+        stub_sidecar_for(workspace_root.path(), "notes-plugin");
+        stub_sidecar_for(workspace_root.path(), "terminal-mesh-sidecar");
+        stub_sidecar_for(workspace_root.path(), "papers-plugin");
+        let doc = generate_config_with_host_rpc_sock(
+            "tab-orch",
+            workspace.path(),
+            McpConfigKind::Orchestrator,
+            app_data.path(),
+            workspace_root.path(),
+            Some(std::path::Path::new("/tmp/host.sock")),
+            None,
+        )
+        .expect("generate");
+        assert!(
+            doc.mcp_servers.contains_key("papers"),
+            "orchestrator config MUST include papers sidecar; got servers={:?}",
+            doc.mcp_servers.keys().collect::<Vec<_>>()
         );
     }
 

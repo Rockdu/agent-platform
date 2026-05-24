@@ -60,7 +60,7 @@ const ERR_METHOD_NOT_FOUND: i64 = -32601;
 const ERR_INVALID_PARAMS: i64 = -32602;
 
 /// Bundled state the bridge needs to authorize and resolve reads.
-/// All three fields are internally-Arc-shared, so cloning the bundle
+/// All fields are internally-Arc-shared, so cloning the bundle
 /// (e.g., per accepted connection) is cheap and the bridge observes
 /// the same state as the Tauri-managed handles.
 #[derive(Clone)]
@@ -72,6 +72,10 @@ pub struct HostRpcState {
     /// Needed to emit `workspace://agent-opened` when a Claude
     /// session calls `agentPlatform.openWorkspace`.
     pub app_handle: Option<tauri::AppHandle>,
+    /// Optional shared SQLite handle for papers reads (papers.listRecent
+    /// and papers.search arms). None in tests that don't exercise the
+    /// papers path.
+    pub papers_store: Option<std::sync::Arc<papers_plugin::PapersStore>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -486,12 +490,197 @@ pub fn dispatch_method(
                 })?;
             handle_open_workspace(state, parsed)
         }
+        "papers.listRecent" => {
+            let parsed: PapersListRecentParams =
+                serde_json::from_value(params).map_err(|e| JsonRpcError {
+                    code: ERR_INVALID_PARAMS,
+                    message: format!("invalid params: {e}"),
+                    data: None,
+                })?;
+            require_orchestrator_plugin_client(
+                state,
+                &parsed.client_id,
+                "papers",
+                "papers.listRecent",
+            )?;
+            handle_papers_list_recent(state, parsed)
+        }
+        "papers.search" => {
+            let parsed: PapersSearchParams =
+                serde_json::from_value(params).map_err(|e| JsonRpcError {
+                    code: ERR_INVALID_PARAMS,
+                    message: format!("invalid params: {e}"),
+                    data: None,
+                })?;
+            require_orchestrator_plugin_client(
+                state,
+                &parsed.client_id,
+                "papers",
+                "papers.search",
+            )?;
+            handle_papers_search(state, parsed)
+        }
         other => Err(JsonRpcError {
             code: ERR_METHOD_NOT_FOUND,
             message: format!("unknown method `{other}`"),
             data: None,
         }),
     }
+}
+
+/// Defense-in-depth gate for papers methods. The MCP config exclusion
+/// in `mcp_config.rs` already prevents non-orchestrator tabs from
+/// even seeing the papers sidecar; this gate rejects direct calls
+/// to the host RPC bridge that try to forge a non-orchestrator
+/// clientId for a papers method.
+fn require_orchestrator_plugin_client(
+    state: &HostRpcState,
+    client_id: &str,
+    expected_plugin_id: &str,
+    method: &str,
+) -> Result<String, JsonRpcError> {
+    let caller = ClientId::parse(client_id).map_err(|e| JsonRpcError {
+        code: ERR_INVALID_CLIENT_ID,
+        message: format!("invalid clientId: {e:?}"),
+        data: None,
+    })?;
+    let (caller_tab_id, plugin_id) = match caller {
+        ClientId::Claude { tab_id, plugin_id } => (tab_id.to_string(), plugin_id),
+        ClientId::HostUi { .. } => {
+            return Err(JsonRpcError {
+                code: ERR_INVALID_REQUEST,
+                message: format!("host_ui clientId cannot call {method}"),
+                data: None,
+            });
+        }
+    };
+    if plugin_id != expected_plugin_id {
+        return Err(JsonRpcError {
+            code: ERR_INVALID_REQUEST,
+            message: format!(
+                "{method} requires plugin_id={expected_plugin_id}; got `{plugin_id}`"
+            ),
+            data: None,
+        });
+    }
+    let snapshot = state.orchestrator.snapshot();
+    let is_orchestrator = snapshot
+        .as_ref()
+        .map(|s| s.tab_id == caller_tab_id)
+        .unwrap_or(false);
+    if !is_orchestrator {
+        return Err(JsonRpcError {
+            code: ERR_PERMISSION_DENIED,
+            message: format!("{method} is orchestrator-only"),
+            data: None,
+        });
+    }
+    Ok(caller_tab_id)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PapersListRecentParams {
+    client_id: String,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PapersSearchParams {
+    client_id: String,
+    query: String,
+}
+
+fn handle_papers_list_recent(
+    state: &HostRpcState,
+    params: PapersListRecentParams,
+) -> Result<Value, JsonRpcError> {
+    let store = state.papers_store.as_ref().ok_or_else(|| JsonRpcError {
+        code: ERR_NOT_FOUND,
+        message: "papers store not configured on this host".to_string(),
+        data: None,
+    })?;
+    let limit = params.limit.unwrap_or(20);
+    store
+        .list_recent(limit)
+        .map(|papers| json!({ "papers": papers }))
+        .map_err(|e| JsonRpcError {
+            code: ERR_BOUNDED_READ_FAILED,
+            message: format!("papers list_recent: {e}"),
+            data: None,
+        })
+}
+
+fn handle_papers_search(
+    state: &HostRpcState,
+    params: PapersSearchParams,
+) -> Result<Value, JsonRpcError> {
+    let store = state.papers_store.as_ref().ok_or_else(|| JsonRpcError {
+        code: ERR_NOT_FOUND,
+        message: "papers store not configured on this host".to_string(),
+        data: None,
+    })?;
+    if params.query.trim().is_empty() {
+        return Err(JsonRpcError {
+            code: ERR_INVALID_PARAMS,
+            message: "papers.search requires non-empty query".to_string(),
+            data: None,
+        });
+    }
+    if let Some(wait) = store.rate_limit_wait().map_err(|e| JsonRpcError {
+        code: ERR_BOUNDED_READ_FAILED,
+        message: format!("rate_limit_wait: {e}"),
+        data: None,
+    })? {
+        return Err(JsonRpcError {
+            code: ERR_PERMISSION_DENIED,
+            message: format!("rate limited: wait {wait}s"),
+            data: None,
+        });
+    }
+    store.touch_rate_limit().map_err(|e| JsonRpcError {
+        code: ERR_BOUNDED_READ_FAILED,
+        message: format!("touch_rate_limit: {e}"),
+        data: None,
+    })?;
+    let url = papers_plugin::build_arxiv_url(papers_plugin::ARXIV_API_DEFAULT, &params.query, 10);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| JsonRpcError {
+            code: ERR_BOUNDED_READ_FAILED,
+            message: format!("http client: {e}"),
+            data: None,
+        })?;
+    let body = papers_plugin::fetch_arxiv_with_retry(
+        &client,
+        &url,
+        papers_plugin::MAX_RETRY_ATTEMPTS,
+    )
+    .map_err(|e| JsonRpcError {
+        code: ERR_BOUNDED_READ_FAILED,
+        message: format!("fetch_arxiv: {e}"),
+        data: None,
+    })?;
+    let mut parsed =
+        papers_plugin::parse_arxiv_atom(&body, 10).map_err(|e| JsonRpcError {
+            code: ERR_BOUNDED_READ_FAILED,
+            message: format!("parse_arxiv: {e}"),
+            data: None,
+        })?;
+    for r in parsed.iter_mut() {
+        r.source = "manual".to_string();
+    }
+    let inserted = store
+        .insert_dedup(&parsed, &params.query)
+        .map_err(|e| JsonRpcError {
+            code: ERR_BOUNDED_READ_FAILED,
+            message: format!("insert_dedup: {e}"),
+            data: None,
+        })?;
+    Ok(json!({ "papers": inserted }))
 }
 
 fn handle_read_scrollback(
@@ -720,6 +909,7 @@ mod tests {
                 None,
             ),
             app_handle: None,
+            papers_store: None,
         };
         (state, resp.handle)
     }
@@ -1017,6 +1207,7 @@ mod tests {
                 None,
             ),
             app_handle: None,
+            papers_store: None,
         };
         (state, ws_tab_a, ws_tab_b, resp.handle)
     }
@@ -1081,6 +1272,7 @@ mod tests {
                 None,
             ),
             app_handle: None,
+            papers_store: None,
         };
 
         // Spoof the orchestrator's tab id from a regular client
@@ -1281,5 +1473,58 @@ mod tests {
         for tab in tabs {
             assert_ne!(tab["workspaceId"], "workspace-B");
         }
+    }
+
+    #[test]
+    fn papers_list_recent_rejects_non_orchestrator_client_id() {
+        let orch_tab = make_uuid_tab_id();
+        let (state, _handle) = bridge_state_with_two_tabs(&orch_tab, &make_uuid_tab_id());
+        let workspace_tab = make_uuid_tab_id();
+        let params = json!({
+            "clientId": format!("claude:{workspace_tab}:papers"),
+        });
+        let err = dispatch_method(&state, "papers.listRecent", params)
+            .expect_err("non-orchestrator must be denied");
+        assert_eq!(err.code, ERR_PERMISSION_DENIED);
+        assert!(err.message.contains("orchestrator-only"));
+    }
+
+    #[test]
+    fn papers_search_rejects_host_ui_client_id() {
+        let orch_tab = make_uuid_tab_id();
+        let (state, _handle) = bridge_state_with_two_tabs(&orch_tab, &make_uuid_tab_id());
+        let params = json!({
+            "clientId": "host_ui:papers",
+            "query": "transformers",
+        });
+        let err = dispatch_method(&state, "papers.search", params)
+            .expect_err("host_ui must be rejected");
+        assert_eq!(err.code, ERR_INVALID_REQUEST);
+    }
+
+    #[test]
+    fn papers_list_recent_rejects_wrong_plugin_id() {
+        let orch_tab = make_uuid_tab_id();
+        let (state, _handle) = bridge_state_with_two_tabs(&orch_tab, &make_uuid_tab_id());
+        let params = json!({
+            "clientId": format!("claude:{orch_tab}:terminal-mesh"),
+        });
+        let err = dispatch_method(&state, "papers.listRecent", params)
+            .expect_err("wrong plugin_id must be rejected");
+        assert_eq!(err.code, ERR_INVALID_REQUEST);
+        assert!(err.message.contains("plugin_id=papers"));
+    }
+
+    #[test]
+    fn papers_list_recent_with_orchestrator_returns_not_found_when_store_missing() {
+        let orch_tab = make_uuid_tab_id();
+        let (state, _handle) = bridge_state_with_two_tabs(&orch_tab, &make_uuid_tab_id());
+        let params = json!({
+            "clientId": format!("claude:{orch_tab}:papers"),
+        });
+        let err = dispatch_method(&state, "papers.listRecent", params)
+            .expect_err("orchestrator passes gate but store missing");
+        assert_eq!(err.code, ERR_NOT_FOUND);
+        assert!(err.message.contains("papers store"));
     }
 }
