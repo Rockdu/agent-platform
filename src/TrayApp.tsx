@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
+  notificationClearPapersTrayEntries,
   notificationClearTrayEntries,
   notificationListRecentPapersTrayEntries,
   notificationListRecentTrayEntries,
@@ -57,7 +58,14 @@ export function TrayApp() {
 
   const onClear = useCallback(async () => {
     try {
-      await notificationClearTrayEntries();
+      // Clear both rings together — the papers section is rendered in
+      // the same tray window as the terminal entries, so the global
+      // "清空" button must wipe both. Run in parallel since they hit
+      // independent ring buffers on the host.
+      await Promise.all([
+        notificationClearTrayEntries(),
+        notificationClearPapersTrayEntries(),
+      ]);
       await refresh();
     } catch (err) {
       setError(typeof err === "string" ? err : JSON.stringify(err));
