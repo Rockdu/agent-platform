@@ -629,57 +629,33 @@ fn handle_papers_search(
             data: None,
         });
     }
-    if let Some(wait) = store.rate_limit_wait().map_err(|e| JsonRpcError {
+    let api_base = papers_plugin::resolve_arxiv_api_base();
+    let client = papers_plugin::make_blocking_arxiv_fetcher().map_err(|e| JsonRpcError {
         code: ERR_BOUNDED_READ_FAILED,
-        message: format!("rate_limit_wait: {e}"),
-        data: None,
-    })? {
-        return Err(JsonRpcError {
-            code: ERR_PERMISSION_DENIED,
-            message: format!("rate limited: wait {wait}s"),
-            data: None,
-        });
-    }
-    store.touch_rate_limit().map_err(|e| JsonRpcError {
-        code: ERR_BOUNDED_READ_FAILED,
-        message: format!("touch_rate_limit: {e}"),
+        message: format!("http client: {e}"),
         data: None,
     })?;
-    let url = papers_plugin::build_arxiv_url(papers_plugin::ARXIV_API_DEFAULT, &params.query, 10);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| JsonRpcError {
-            code: ERR_BOUNDED_READ_FAILED,
-            message: format!("http client: {e}"),
-            data: None,
-        })?;
-    let body = papers_plugin::fetch_arxiv_with_retry(
-        &client,
-        &url,
-        papers_plugin::MAX_RETRY_ATTEMPTS,
-    )
-    .map_err(|e| JsonRpcError {
-        code: ERR_BOUNDED_READ_FAILED,
-        message: format!("fetch_arxiv: {e}"),
-        data: None,
-    })?;
-    let mut parsed =
-        papers_plugin::parse_arxiv_atom(&body, 10).map_err(|e| JsonRpcError {
-            code: ERR_BOUNDED_READ_FAILED,
-            message: format!("parse_arxiv: {e}"),
-            data: None,
-        })?;
-    for r in parsed.iter_mut() {
-        r.source = "manual".to_string();
-    }
-    let inserted = store
-        .insert_dedup(&parsed, &params.query)
-        .map_err(|e| JsonRpcError {
-            code: ERR_BOUNDED_READ_FAILED,
-            message: format!("insert_dedup: {e}"),
-            data: None,
-        })?;
+    let fetcher =
+        |url: &str| papers_plugin::fetch_arxiv_with_retry(&client, url, papers_plugin::MAX_RETRY_ATTEMPTS);
+    let inserted =
+        papers_plugin::fetch_papers_gated(store, &fetcher, &api_base, &params.query, "manual")
+            .map_err(|e| match e {
+                papers_plugin::ArxivError::NotOptedIn => JsonRpcError {
+                    code: ERR_PERMISSION_DENIED,
+                    message: "papers.search: opt-in required".to_string(),
+                    data: None,
+                },
+                papers_plugin::ArxivError::RateLimited { wait_secs } => JsonRpcError {
+                    code: ERR_PERMISSION_DENIED,
+                    message: format!("rate limited: wait {wait_secs}s"),
+                    data: None,
+                },
+                other => JsonRpcError {
+                    code: ERR_BOUNDED_READ_FAILED,
+                    message: format!("papers.search: {other}"),
+                    data: None,
+                },
+            })?;
     Ok(json!({ "papers": inserted }))
 }
 

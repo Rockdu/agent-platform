@@ -81,6 +81,9 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<SidecarArgs
 
 /// One arXiv paper record. Serialised as camelCase to match the
 /// React-facing PaperRecord interface in `plugins/papers/types.ts`.
+/// `starred` and `read_at` are hydrated from `user_paper_state` via
+/// LEFT JOIN; freshly-inserted rows are unstarred / unread until the
+/// user interacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaperRecord {
@@ -92,6 +95,10 @@ pub struct PaperRecord {
     pub abs_url: String,
     pub source: String,
     pub fetched_at: String,
+    #[serde(default)]
+    pub starred: bool,
+    #[serde(default)]
+    pub read_at: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -102,6 +109,8 @@ pub enum ArxivError {
     Parse(String),
     #[error("rate limited: must wait {wait_secs}s")]
     RateLimited { wait_secs: u64 },
+    #[error("not opted in: enable daily papers in the Papers tab before searching")]
+    NotOptedIn,
     #[error("sqlite: {0}")]
     Sqlite(String),
     #[error("io: {0}")]
@@ -158,6 +167,17 @@ pub fn tools_list_response() -> Value {
                         "starred": {"type": "boolean"}
                     },
                     "required": ["arxiv_id", "starred"]
+                }
+            },
+            {
+                "name": "papers.mark_read",
+                "description": "Mark a paper as read at the current time; persists in user_paper_state.read_at.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "arxiv_id": {"type": "string"}
+                    },
+                    "required": ["arxiv_id"]
                 }
             },
             {
@@ -319,6 +339,8 @@ pub fn parse_arxiv_atom(xml: &str, max_results: usize) -> Result<Vec<PaperRecord
                                 },
                                 source: "scheduled".to_string(),
                                 fetched_at: now_iso8601(),
+                                starred: false,
+                                read_at: None,
                             });
                             if out.len() >= max_results {
                                 return Ok(out);
@@ -505,9 +527,15 @@ impl PapersStore {
 
     pub fn list_recent(&self, limit: i64) -> Result<Vec<PaperRecord>, ArxivError> {
         let guard = self.conn.lock().unwrap();
+        // LEFT JOIN user_paper_state so the wire shape includes the
+        // user's starred / read state for the React component (no
+        // separate hydration round trip required).
         let mut stmt = guard
             .prepare(
-                "SELECT arxiv_id, title, authors, abstract_snippet, pdf_url, abs_url, source, fetched_at FROM daily_recommendations ORDER BY fetched_at DESC LIMIT ?",
+                "SELECT d.arxiv_id, d.title, d.authors, d.abstract_snippet, d.pdf_url, d.abs_url, d.source, d.fetched_at, COALESCE(u.starred, 0), u.read_at \
+                 FROM daily_recommendations d \
+                 LEFT JOIN user_paper_state u ON u.arxiv_id = d.arxiv_id \
+                 ORDER BY d.fetched_at DESC LIMIT ?",
             )
             .map_err(|e| ArxivError::Sqlite(format!("prepare: {e}")))?;
         let rows = stmt
@@ -518,6 +546,8 @@ impl PapersStore {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
+                let starred: i64 = row.get(8)?;
+                let read_at: Option<String> = row.get(9)?;
                 Ok(PaperRecord {
                     arxiv_id: row.get(0)?,
                     title: row.get(1)?,
@@ -527,6 +557,8 @@ impl PapersStore {
                     abs_url: row.get(5)?,
                     source: row.get(6)?,
                     fetched_at: row.get(7)?,
+                    starred: starred != 0,
+                    read_at,
                 })
             })
             .map_err(|e| ArxivError::Sqlite(format!("query: {e}")))?;
@@ -535,6 +567,20 @@ impl PapersStore {
             out.push(r.map_err(|e| ArxivError::Sqlite(format!("row: {e}")))?);
         }
         Ok(out)
+    }
+
+    /// Mark a paper as read at the current time. Idempotent: subsequent
+    /// calls overwrite `read_at` so the user always sees their latest
+    /// view time.
+    pub fn mark_read(&self, arxiv_id: &str) -> Result<(), ArxivError> {
+        let guard = self.conn.lock().unwrap();
+        guard
+            .execute(
+                "INSERT INTO user_paper_state (arxiv_id, starred, read_at) VALUES (?, 0, ?) ON CONFLICT(arxiv_id) DO UPDATE SET read_at = excluded.read_at",
+                rusqlite::params![arxiv_id, now_iso8601()],
+            )
+            .map_err(|e| ArxivError::Sqlite(format!("mark_read: {e}")))?;
+        Ok(())
     }
 
     pub fn toggle_star(&self, arxiv_id: &str, starred: bool) -> Result<(), ArxivError> {
@@ -580,6 +626,93 @@ impl PapersStore {
             )
             .map_err(|e| ArxivError::Sqlite(format!("touch_last_fired: {e}")))?;
         Ok(())
+    }
+
+    /// Persist the most recent fetch failure to `scheduler_state.last_error`
+    /// so the UI can surface why the daily digest missed.
+    pub fn record_last_error(&self, message: &str) -> Result<(), ArxivError> {
+        let guard = self.conn.lock().unwrap();
+        guard
+            .execute(
+                "UPDATE scheduler_state SET last_error = ? WHERE id = 1",
+                rusqlite::params![message],
+            )
+            .map_err(|e| ArxivError::Sqlite(format!("record_last_error: {e}")))?;
+        Ok(())
+    }
+
+    /// Returns the persisted `last_error` (or None when the last fetch
+    /// succeeded).
+    pub fn last_error(&self) -> Result<Option<String>, ArxivError> {
+        let guard = self.conn.lock().unwrap();
+        guard
+            .query_row(
+                "SELECT last_error FROM scheduler_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| ArxivError::Sqlite(format!("last_error: {e}")))
+    }
+
+    /// Insert `records` deduped against the 7-day window AND advance
+    /// `last_fired_at` / clear `last_error` in the same transaction.
+    /// Either both commits land or neither does — the AC contract is
+    /// "rows and last_fired_at commit together".
+    pub fn insert_dedup_and_touch_last_fired(
+        &self,
+        records: &[PaperRecord],
+        source_query: &str,
+    ) -> Result<Vec<PaperRecord>, ArxivError> {
+        let guard = self.conn.lock().unwrap();
+        let tx = guard
+            .unchecked_transaction()
+            .map_err(|e| ArxivError::Sqlite(format!("tx begin: {e}")))?;
+        let mut inserted: Vec<PaperRecord> = Vec::new();
+        for r in records {
+            let cutoff = unix_now_secs() - DEDUP_WINDOW_DAYS * 86400;
+            let cutoff_iso = iso8601_from_unix(cutoff);
+            let exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM daily_recommendations WHERE arxiv_id = ? AND fetched_at >= ?",
+                    rusqlite::params![r.arxiv_id, cutoff_iso],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if exists {
+                continue;
+            }
+            let authors_str = r.authors.join("; ");
+            let fetched = now_iso8601();
+            tx.execute(
+                "INSERT INTO daily_recommendations (arxiv_id, title, authors, abstract_snippet, pdf_url, abs_url, source_query, source, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    r.arxiv_id,
+                    r.title,
+                    authors_str,
+                    r.abstract_snippet,
+                    r.pdf_url,
+                    r.abs_url,
+                    source_query,
+                    r.source,
+                    fetched,
+                ],
+            )
+            .map_err(|e| ArxivError::Sqlite(format!("insert: {e}")))?;
+            inserted.push(PaperRecord {
+                fetched_at: fetched,
+                starred: false,
+                read_at: None,
+                ..r.clone()
+            });
+        }
+        tx.execute(
+            "UPDATE scheduler_state SET last_fired_at = ?, last_error = NULL WHERE id = 1",
+            rusqlite::params![now_iso8601()],
+        )
+        .map_err(|e| ArxivError::Sqlite(format!("touch_last_fired in tx: {e}")))?;
+        tx.commit()
+            .map_err(|e| ArxivError::Sqlite(format!("tx commit: {e}")))?;
+        Ok(inserted)
     }
 
     pub fn last_fired_at_unix(&self) -> Result<Option<u64>, ArxivError> {
@@ -726,6 +859,84 @@ fn days_to_ymd(mut days: i64) -> (i64, u32, u32) {
     (year, month, (days + 1) as u32)
 }
 
+/// Single arXiv entry point — every caller (scheduler, host Tauri
+/// commands, host RPC bridge, sidecar MCP `tools/call`) routes through
+/// here so opt-in, rate-limit, retry, dedup, transactional state and
+/// `last_error` persistence are enforced in one place.
+///
+/// Steps:
+///   1. Verify `scheduler_state.opt_in_enabled = 1`. Returns
+///      `ArxivError::NotOptedIn` for both `NULL` (first-run) and `0`.
+///   2. Check the 3 s rate-limit gate; return `RateLimited` if too soon.
+///   3. Mark the rate-limit timestamp BEFORE the HTTP call so a slow
+///      response cannot let a concurrent caller slip through.
+///   4. Build the URL + run `fetch_arxiv_with_retry` (3 attempts,
+///      exponential backoff).
+///   5. Parse Atom XML into `PaperRecord`s, stamp `source`.
+///   6. `insert_dedup_and_touch_last_fired` in one transaction — rows
+///      and `last_fired_at` commit together.
+///   7. On any failure after the opt-in check, persist a concise
+///      message to `scheduler_state.last_error` so the UI can surface it.
+pub fn fetch_papers_gated(
+    store: &PapersStore,
+    arxiv_fetcher: &dyn Fn(&str) -> Result<String, ArxivError>,
+    api_base: &str,
+    query: &str,
+    source: &str,
+) -> Result<Vec<PaperRecord>, ArxivError> {
+    if query.trim().is_empty() {
+        return Err(ArxivError::Parse("empty query".to_string()));
+    }
+    match store.get_opt_in()? {
+        Some(true) => {}
+        _ => return Err(ArxivError::NotOptedIn),
+    }
+    if let Some(wait) = store.rate_limit_wait()? {
+        return Err(ArxivError::RateLimited { wait_secs: wait });
+    }
+    store.touch_rate_limit()?;
+    let url = build_arxiv_url(api_base, query, 10);
+    let body = match arxiv_fetcher(&url) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = store.record_last_error(&format!("fetch: {e}"));
+            return Err(e);
+        }
+    };
+    let parsed = match parse_arxiv_atom(&body, 10) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = store.record_last_error(&format!("parse: {e}"));
+            return Err(e);
+        }
+    };
+    let stamped: Vec<PaperRecord> = parsed
+        .into_iter()
+        .map(|r| PaperRecord {
+            source: source.to_string(),
+            ..r
+        })
+        .collect();
+    match store.insert_dedup_and_touch_last_fired(&stamped, query) {
+        Ok(inserted) => Ok(inserted),
+        Err(e) => {
+            let _ = store.record_last_error(&format!("storage: {e}"));
+            Err(e)
+        }
+    }
+}
+
+/// Reusable arXiv-fetcher backed by a blocking `reqwest::Client` with
+/// the configured retry budget. Suitable for use as the `arxiv_fetcher`
+/// argument to `fetch_papers_gated`.
+pub fn make_blocking_arxiv_fetcher() -> Result<reqwest::blocking::Client, ArxivError> {
+    reqwest::blocking::Client::builder()
+        .user_agent(concat!("papers-plugin/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| ArxivError::Http(format!("client build: {e}")))
+}
+
 /// Pure dispatch for MCP `tools/call`. The caller passes the parsed
 /// arguments and (for tools that need them) a reference to the SQLite
 /// store. Returns a JsonRpcResponse ready for `encode_message`.
@@ -758,7 +969,13 @@ pub fn handle_tool_call(
                     .unwrap_or("scheduled")
                     .to_string()
             };
-            do_fetch(store, arxiv_fetcher, &query, &source)
+            let api_base = resolve_arxiv_api_base();
+            fetch_papers_gated(store, arxiv_fetcher, &api_base, &query, &source).map(|inserted| {
+                json!({
+                    "new_count": inserted.len(),
+                    "papers": inserted,
+                })
+            })
         }
         "papers.list_recent" => {
             let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10);
@@ -776,6 +993,14 @@ pub fn handle_tool_call(
             store
                 .toggle_star(&arxiv_id, starred)
                 .map(|_| json!({ "ok": true }))
+        }
+        "papers.mark_read" => {
+            let arxiv_id = args
+                .get("arxiv_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            store.mark_read(&arxiv_id).map(|_| json!({ "ok": true }))
         }
         "papers.set_opt_in" => {
             let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -818,34 +1043,11 @@ pub fn handle_tool_call(
     }
 }
 
-fn do_fetch(
-    store: &PapersStore,
-    arxiv_fetcher: &dyn Fn(&str) -> Result<String, ArxivError>,
-    query: &str,
-    source: &str,
-) -> Result<Value, ArxivError> {
-    if query.trim().is_empty() {
-        return Err(ArxivError::Parse("empty query".to_string()));
-    }
-    if let Some(wait) = store.rate_limit_wait()? {
-        return Err(ArxivError::RateLimited { wait_secs: wait });
-    }
-    let url = build_arxiv_url(ARXIV_API_DEFAULT, query, 10);
-    store.touch_rate_limit()?;
-    let body = arxiv_fetcher(&url)?;
-    let parsed = parse_arxiv_atom(&body, 10)?;
-    let stamped: Vec<PaperRecord> = parsed
-        .into_iter()
-        .map(|r| PaperRecord {
-            source: source.to_string(),
-            ..r
-        })
-        .collect();
-    let inserted = store.insert_dedup(&stamped, query)?;
-    Ok(json!({
-        "new_count": inserted.len(),
-        "papers": inserted,
-    }))
+/// Resolves the effective arXiv API base URL. Honours
+/// `PAPERS_ARXIV_BASE_OVERRIDE` so the binary boundary integration
+/// test can point at a wiremock server without recompiling.
+pub fn resolve_arxiv_api_base() -> String {
+    std::env::var("PAPERS_ARXIV_BASE_OVERRIDE").unwrap_or_else(|_| ARXIV_API_DEFAULT.to_string())
 }
 
 /// MCP request dispatcher: handles initialize, tools/list, tools/call,
@@ -1026,6 +1228,8 @@ mod tests {
             abs_url: "".to_string(),
             source: "scheduled".to_string(),
             fetched_at: now_iso8601(),
+            starred: false,
+            read_at: None,
         };
         let first = store.insert_dedup(&[r.clone()], "q").unwrap();
         assert_eq!(first.len(), 1);
@@ -1048,6 +1252,8 @@ mod tests {
                         abs_url: "".to_string(),
                         source: "scheduled".to_string(),
                         fetched_at: now_iso8601(),
+                        starred: false,
+                        read_at: None,
                     }],
                     "q",
                 )
@@ -1149,8 +1355,84 @@ mod tests {
     }
 
     #[test]
+    fn fetch_papers_gated_rejects_when_opt_in_null() {
+        let (store, _t) = setup_store();
+        let fetcher = |_: &str| Ok::<String, ArxivError>("<feed/>".to_string());
+        let err = fetch_papers_gated(&store, &fetcher, "https://x/", "q", "scheduled").unwrap_err();
+        assert!(matches!(err, ArxivError::NotOptedIn));
+    }
+
+    #[test]
+    fn fetch_papers_gated_rejects_when_opt_in_false() {
+        let (store, _t) = setup_store();
+        store.set_opt_in(false).unwrap();
+        let fetcher = |_: &str| Ok::<String, ArxivError>("<feed/>".to_string());
+        let err = fetch_papers_gated(&store, &fetcher, "https://x/", "q", "scheduled").unwrap_err();
+        assert!(matches!(err, ArxivError::NotOptedIn));
+    }
+
+    #[test]
+    fn fetch_papers_gated_records_last_error_on_http_failure() {
+        let (store, _t) = setup_store();
+        store.set_opt_in(true).unwrap();
+        let fetcher = |_: &str| Err::<String, ArxivError>(ArxivError::Http("boom".to_string()));
+        let _ = fetch_papers_gated(&store, &fetcher, "https://x/", "q", "scheduled");
+        let recorded = store.last_error().unwrap();
+        assert!(recorded.is_some());
+        assert!(recorded.unwrap().contains("fetch"));
+    }
+
+    #[test]
+    fn fetch_papers_gated_commits_rows_and_last_fired_together() {
+        let (store, _t) = setup_store();
+        store.set_opt_in(true).unwrap();
+        let body =
+            r#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><entry><id>http://arxiv.org/abs/x.1</id><title>T</title><summary>S</summary><link href="http://arxiv.org/pdf/x.1" type="application/pdf"/></entry></feed>"#
+                .to_string();
+        let fetcher = move |_: &str| Ok::<String, ArxivError>(body.clone());
+        let before_fired = store.last_fired_at_unix().unwrap();
+        let inserted =
+            fetch_papers_gated(&store, &fetcher, "https://x/", "q", "scheduled").unwrap();
+        assert_eq!(inserted.len(), 1);
+        // last_fired_at advanced (was None before the very first successful fire).
+        let after_fired = store.last_fired_at_unix().unwrap();
+        assert!(before_fired.is_none() || after_fired > before_fired);
+        assert!(after_fired.is_some());
+        // last_error is cleared by the transaction.
+        assert!(store.last_error().unwrap().is_none());
+    }
+
+    #[test]
+    fn list_recent_hydrates_starred_and_read_state() {
+        let (store, _t) = setup_store();
+        store.set_opt_in(true).unwrap();
+        let r = PaperRecord {
+            arxiv_id: "2401.zzz".to_string(),
+            title: "T".to_string(),
+            authors: vec![],
+            abstract_snippet: "".to_string(),
+            pdf_url: "".to_string(),
+            abs_url: "".to_string(),
+            source: "scheduled".to_string(),
+            fetched_at: now_iso8601(),
+            starred: false,
+            read_at: None,
+        };
+        store.insert_dedup(&[r.clone()], "q").unwrap();
+        store.toggle_star("2401.zzz", true).unwrap();
+        store.mark_read("2401.zzz").unwrap();
+        let listed = store.list_recent(10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].starred);
+        assert!(listed[0].read_at.is_some());
+    }
+
+    #[test]
     fn handle_fetch_through_dispatch() {
         let (store, _t) = setup_store();
+        // fetch_papers_gated requires explicit opt-in; the centralized
+        // gate is exactly what this dispatch test exercises.
+        store.set_opt_in(true).unwrap();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: JsonRpcId::Number(2),

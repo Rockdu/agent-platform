@@ -997,6 +997,42 @@ mod tests {
     }
 
     #[test]
+    fn tauri_conf_bundles_all_three_sidecars() {
+        // The dev path discovery in `dev_diagnostics::resolve_expected_paths`
+        // covers running from `target/{debug,release}`, but production
+        // bundles need `bundle.externalBin` so Tauri copies each
+        // sidecar into the packaged app. The papers plugin must be in
+        // this list; we assert all three sidecars are listed for
+        // symmetry so a future sidecar drop is caught at build time.
+        let conf = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json"),
+        )
+        .expect("read tauri.conf.json");
+        let v: serde_json::Value =
+            serde_json::from_str(&conf).expect("tauri.conf.json valid JSON");
+        let bins: Vec<String> = v
+            .get("bundle")
+            .and_then(|b| b.get("externalBin"))
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(|x| x.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for expected in [
+            "terminal-mesh-sidecar",
+            "notes-plugin",
+            "papers-plugin",
+        ] {
+            assert!(
+                bins.iter().any(|b| b.ends_with(expected)),
+                "tauri.conf.json bundle.externalBin missing `{expected}` (current: {bins:?})"
+            );
+        }
+    }
+
+    #[test]
     fn standard_config_excludes_papers_sidecar() {
         let app_data = tempfile::TempDir::new().unwrap();
         let workspace_root = tempfile::TempDir::new().unwrap();

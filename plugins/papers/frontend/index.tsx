@@ -1,13 +1,15 @@
 // Papers tab frontend.
 //
-// Renders the daily digest (from the host's papers SQLite), a manual
-// search form whose results are labelled with `source: "manual"`, a
-// star toggle per paper persisted to `user_paper_state`, and a
-// "refresh now" button gated by the same rate-limit window the
-// scheduler uses (3s between arXiv calls).
+// Renders the daily digest (from the host's papers SQLite — fields
+// `starred` and `readAt` hydrated via LEFT JOIN), a manual search
+// form whose results are labelled with `source: "manual"`, a star
+// toggle per paper persisted to `user_paper_state`, a mark-read
+// affordance, and a "refresh now" button gated by the persistent
+// rate-limit cooldown returned by `papers_get_cooldown_state` so the
+// button reflects the real cooldown window even after restart.
 
 import { invoke } from "@tauri-apps/api/core";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePluginCapabilityValue } from "../../../src/plugin-lifecycle";
 import type { PaperRecord } from "../types";
 
@@ -17,13 +19,20 @@ interface OptInState {
   enabled: boolean | null;
 }
 
+interface CooldownState {
+  lastFetchedAt: string | null;
+  lastError: string | null;
+  secondsUntilReady: number;
+  rateLimitSeconds: number;
+}
+
 export default function PapersPanel() {
-  // Establish plugin capability subscription (also unmount-safe).
   usePluginCapabilityValue();
   const [digest, setDigest] = useState<PaperRecord[]>([]);
   const [manual, setManual] = useState<PaperRecord[]>([]);
   const [query, setQuery] = useState("");
   const [optIn, setOptIn] = useState<boolean | null>(null);
+  const [cooldown, setCooldown] = useState<CooldownState | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
@@ -50,10 +59,42 @@ export default function PapersPanel() {
     }
   }, []);
 
+  const refreshCooldown = useCallback(async () => {
+    try {
+      const r = await invoke<CooldownState>("papers_get_cooldown_state");
+      setCooldown(r);
+    } catch (err) {
+      setError(stringify(err));
+    }
+  }, []);
+
   useEffect(() => {
     void refreshDigest();
     void refreshOptIn();
-  }, [refreshDigest, refreshOptIn]);
+    void refreshCooldown();
+  }, [refreshDigest, refreshOptIn, refreshCooldown]);
+
+  // Poll the cooldown state once per second while there is an active
+  // cooldown so the button re-enables when the window expires.
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  useEffect(() => {
+    if (cooldown && cooldown.secondsUntilReady > 0) {
+      if (intervalRef.current === null) {
+        intervalRef.current = setInterval(() => {
+          void refreshCooldown();
+        }, 1000);
+      }
+    } else if (intervalRef.current !== null) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+    return () => {
+      if (intervalRef.current !== null) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    };
+  }, [cooldown, refreshCooldown]);
 
   const setOptInEnabled = useCallback(
     async (enabled: boolean) => {
@@ -85,8 +126,9 @@ export default function PapersPanel() {
       setError(stringify(err));
     } finally {
       setBusy(false);
+      void refreshCooldown();
     }
-  }, [query, busy]);
+  }, [query, busy, refreshCooldown]);
 
   const onRefreshNow = useCallback(async () => {
     if (busy) return;
@@ -100,8 +142,9 @@ export default function PapersPanel() {
       setError(stringify(err));
     } finally {
       setBusy(false);
+      void refreshCooldown();
     }
-  }, [busy, refreshDigest]);
+  }, [busy, refreshDigest, refreshCooldown]);
 
   const onToggleStar = useCallback(
     async (arxivId: string, currentlyStarred: boolean) => {
@@ -117,6 +160,29 @@ export default function PapersPanel() {
     },
     [refreshDigest],
   );
+
+  const onMarkRead = useCallback(
+    async (arxivId: string) => {
+      try {
+        await invoke<void>("papers_mark_read", { arxivId });
+        await refreshDigest();
+      } catch (err) {
+        setError(stringify(err));
+      }
+    },
+    [refreshDigest],
+  );
+
+  const cooldownDisabled = !!cooldown && cooldown.secondsUntilReady > 0;
+  const fetchDisabled = busy || cooldownDisabled || optIn !== true;
+
+  const refreshTitle = useMemo(() => {
+    if (optIn !== true) return "需要先开启每日推荐";
+    if (cooldownDisabled) {
+      return `速率限制：${cooldown!.secondsUntilReady} 秒后可再拉取`;
+    }
+    return "立即拉取";
+  }, [optIn, cooldownDisabled, cooldown]);
 
   const optInBanner = useMemo(() => {
     if (optIn === null) {
@@ -158,15 +224,26 @@ export default function PapersPanel() {
           <button
             type="button"
             onClick={() => void onRefreshNow()}
-            disabled={busy || optIn !== true}
-            title={optIn !== true ? "需要先开启每日推荐" : "立即拉取（受 3 秒速率限制）"}
+            disabled={fetchDisabled}
+            title={refreshTitle}
           >
-            立即刷新
+            立即刷新{cooldownDisabled ? ` (${cooldown!.secondsUntilReady}s)` : ""}
           </button>
         </div>
       </header>
 
       {optInBanner}
+
+      {cooldown?.lastError && (
+        <aside className="papers__error" role="alert">
+          上次拉取失败：{cooldown.lastError}
+        </aside>
+      )}
+      {cooldown?.lastFetchedAt && (
+        <aside className="papers__info" role="status">
+          上次拉取：{cooldown.lastFetchedAt}
+        </aside>
+      )}
 
       <form
         className="papers__search"
@@ -180,8 +257,9 @@ export default function PapersPanel() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="关键词，如 transformer attention"
+          disabled={optIn !== true}
         />
-        <button type="submit" disabled={busy || !query.trim()}>
+        <button type="submit" disabled={fetchDisabled || !query.trim()}>
           搜索
         </button>
       </form>
@@ -210,6 +288,7 @@ export default function PapersPanel() {
                 key={p.arxivId}
                 paper={p}
                 onToggleStar={onToggleStar}
+                onMarkRead={onMarkRead}
               />
             ))}
           </ul>
@@ -225,6 +304,7 @@ export default function PapersPanel() {
                 key={p.arxivId}
                 paper={p}
                 onToggleStar={onToggleStar}
+                onMarkRead={onMarkRead}
                 manualBadge
               />
             ))}
@@ -238,28 +318,40 @@ export default function PapersPanel() {
 interface PaperCardProps {
   paper: PaperRecord;
   onToggleStar: (arxivId: string, currentlyStarred: boolean) => void;
+  onMarkRead: (arxivId: string) => void;
   manualBadge?: boolean;
 }
 
-function PaperCard({ paper, onToggleStar, manualBadge }: PaperCardProps) {
-  const [starred, setStarred] = useState(false);
+function PaperCard({ paper, onToggleStar, onMarkRead, manualBadge }: PaperCardProps) {
+  // Initialise from the record — NOT from local default. After refresh /
+  // remount / restart the persisted state in `user_paper_state` is the
+  // source of truth.
+  const starred = paper.starred;
+  const read = paper.readAt !== null;
   return (
-    <li className="papers__card">
+    <li className={`papers__card${read ? " papers__card--read" : ""}`}>
       <div className="papers__card-head">
         <code className="papers__arxiv-id">{paper.arxivId}</code>
         {manualBadge && <span className="papers__source-badge">手动</span>}
+        {read && <span className="papers__read-badge" title={`已读于 ${paper.readAt}`}>已读</span>}
         <button
           type="button"
           className={`papers__star${starred ? " papers__star--on" : ""}`}
-          onClick={() => {
-            const next = !starred;
-            setStarred(next);
-            onToggleStar(paper.arxivId, starred);
-          }}
+          onClick={() => onToggleStar(paper.arxivId, starred)}
           aria-label={starred ? "取消收藏" : "收藏"}
         >
           {starred ? "★" : "☆"}
         </button>
+        {!read && (
+          <button
+            type="button"
+            className="papers__mark-read"
+            onClick={() => onMarkRead(paper.arxivId)}
+            aria-label="标记已读"
+          >
+            标记已读
+          </button>
+        )}
       </div>
       <p className="papers__title">{paper.title}</p>
       <p className="papers__authors">{(paper.authors ?? []).join(", ")}</p>

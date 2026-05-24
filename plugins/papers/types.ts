@@ -14,6 +14,10 @@ export interface PaperRecord {
   absUrl: string;
   fetchedAt: string;
   source: "scheduled" | "manual";
+  /** Hydrated from user_paper_state via LEFT JOIN. */
+  starred: boolean;
+  /** Hydrated from user_paper_state via LEFT JOIN. Null if unread. */
+  readAt: string | null;
 }
 
 export interface ListRecentArgs {

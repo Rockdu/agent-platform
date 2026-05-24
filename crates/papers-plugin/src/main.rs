@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use mcp_stdio::{decode_line, encode_message, JsonRpcMessage};
 use papers_plugin::{
-    fetch_arxiv_with_retry, handle_mcp_message, parse_args, resolve_papers_db_path, ArxivError,
-    PapersStore, MAX_RETRY_ATTEMPTS,
+    fetch_arxiv_with_retry, handle_mcp_message, make_blocking_arxiv_fetcher, parse_args,
+    resolve_papers_db_path, ArxivError, PapersStore, MAX_RETRY_ATTEMPTS,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -58,17 +58,14 @@ async fn main() -> ExitCode {
         }
     };
 
-    let http_client = match reqwest::blocking::Client::builder()
-        .user_agent(concat!("papers-plugin/", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            tracing::error!(error = %e, "papers-plugin: reqwest build failed");
-            return ExitCode::from(5);
-        }
-    };
+    // NOTE: the blocking reqwest client is constructed INSIDE each
+    // spawn_blocking closure rather than once at startup. reqwest's
+    // blocking client owns an internal tokio runtime that must be
+    // dropped on a blocking thread, never inside the async runtime.
+    // Constructing it per-request keeps the lifetime entirely within
+    // the spawn_blocking task. Cost: one client init per MCP call (~ms);
+    // negligible given the once-per-day scheduler cadence and the
+    // manual-search granularity.
 
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
@@ -94,10 +91,18 @@ async fn main() -> ExitCode {
             }
         };
         let store_clone = store.clone();
-        let http_clone = http_client.clone();
         let resp = tokio::task::spawn_blocking(move || {
+            // Build and drop the blocking client entirely within this
+            // thread; see the note at the top of `main` for why.
+            let client = match make_blocking_arxiv_fetcher() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(error = %e, "papers-plugin: reqwest build failed in worker");
+                    return None;
+                }
+            };
             let fetcher = |url: &str| -> Result<String, ArxivError> {
-                fetch_arxiv_with_retry(&http_clone, url, MAX_RETRY_ATTEMPTS)
+                fetch_arxiv_with_retry(&client, url, MAX_RETRY_ATTEMPTS)
             };
             handle_mcp_message(msg, store_clone.as_ref(), &fetcher)
         })

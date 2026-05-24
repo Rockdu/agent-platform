@@ -158,6 +158,7 @@ impl NotificationService {
         title: String,
         body: String,
         entries: Vec<PapersTrayEntry>,
+        app_handle: Option<tauri::AppHandle>,
     ) {
         if entries.is_empty() {
             return;
@@ -178,6 +179,21 @@ impl NotificationService {
         // Best-effort native notification. Permission denial is logged
         // by the sink itself; the entry is already in the ring.
         self.inner.sink.fire(&title, &body);
+        if let Some(handle) = app_handle {
+            // Notify any already-open tray window to refresh — the
+            // same channel existing tray entries use.
+            use tauri::Emitter;
+            if let Err(err) = handle.emit("tray://updated", ()) {
+                tracing::warn!(%err, "push_papers_digest: emit tray://updated failed");
+            }
+            // Notification activation surface: tauri-plugin-notification
+            // v2 doesn't surface OS-level click events directly back
+            // through to the app on macOS. The functional equivalent
+            // is to pop the tray ourselves so the user lands on the
+            // paper cards immediately. The user can dismiss via the
+            // menubar icon (same toggle handler) afterwards.
+            show_tray_window(&handle);
+        }
     }
 
     /// Snapshot of the recent papers tray entries (newest first).
@@ -371,6 +387,32 @@ pub fn compute_tray_toggle_action(currently_visible: bool) -> TrayToggleAction {
         TrayToggleAction::Hide
     } else {
         TrayToggleAction::Show
+    }
+}
+
+/// Position the tray window at `TrayBottomCenter` and show it. Shared
+/// between the tray-icon click handler and the notification activation
+/// handler so a notification click always lands the user on the same
+/// surface as clicking the menubar icon.
+///
+/// Returns `Ok(())` on success; logs and discards individual stage
+/// failures (the window must always be best-effort visible — partial
+/// success is preferable to bailing out).
+pub fn show_tray_window(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    use tauri_plugin_positioner::{Position, WindowExt};
+    let Some(window) = app.get_webview_window("tray") else {
+        tracing::warn!("show_tray_window: tray webview window missing");
+        return;
+    };
+    if let Err(err) = window.move_window(Position::TrayBottomCenter) {
+        tracing::warn!(%err, "show_tray_window: move_window failed");
+    }
+    if let Err(err) = window.show() {
+        tracing::warn!(%err, "show_tray_window: show failed");
+    }
+    if let Err(err) = window.set_focus() {
+        tracing::warn!(%err, "show_tray_window: set_focus failed");
     }
 }
 

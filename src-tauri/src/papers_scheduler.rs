@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use papers_plugin::{
-    build_arxiv_url, fetch_arxiv_with_retry, parse_arxiv_atom, ArxivError, PaperRecord,
-    PapersStore, ARXIV_API_DEFAULT, MAX_RETRY_ATTEMPTS,
+    fetch_arxiv_with_retry, fetch_papers_gated, make_blocking_arxiv_fetcher,
+    resolve_arxiv_api_base, PaperRecord, PapersStore, MAX_RETRY_ATTEMPTS,
 };
 
 use crate::notification::{NotificationService, PapersTrayEntry};
@@ -35,7 +35,10 @@ pub const DAILY_FIRE_HOUR_LOCAL: u32 = 10;
 /// triggered (i.e. the daily cycle ran too long ago).
 pub const BACKFILL_THRESHOLD_HOURS: u64 = 20;
 
-/// Maximum number of papers the digest stores per fire.
+/// Maximum number of papers the digest stores per fire. Currently
+/// enforced inside `fetch_papers_gated` via the arXiv `max_results`
+/// query parameter (hard-coded to 10 in the URL builder).
+#[allow(dead_code)]
 pub const MAX_RESULTS_PER_FIRE: usize = 10;
 
 /// Compute seconds from `now_unix_secs` until the next occurrence of
@@ -53,7 +56,10 @@ pub fn duration_until_next_fire_local(
     let local_now_secs = now_unix_secs + local_offset_secs;
     let secs_today = local_now_secs.rem_euclid(86400);
     let target_secs = (hour_local as i64) * 3600;
-    let delta = if secs_today <= target_secs {
+    // Strict `<`: at exactly hour:00:00, sleep a full day rather than
+    // returning 0. A zero-delta wake-up inside the loop would race
+    // with `fire()` and could re-fire within the same second.
+    let delta = if secs_today < target_secs {
         target_secs - secs_today
     } else {
         86400 - (secs_today - target_secs)
@@ -79,6 +85,7 @@ pub struct PapersScheduler {
     pub notification: Arc<NotificationService>,
     pub in_flight: Arc<AtomicBool>,
     pub api_base: String,
+    pub app_handle: Option<tauri::AppHandle>,
 }
 
 impl PapersScheduler {
@@ -86,13 +93,15 @@ impl PapersScheduler {
         store: Arc<PapersStore>,
         workspaces: WorkspaceRegistry,
         notification: Arc<NotificationService>,
+        app_handle: Option<tauri::AppHandle>,
     ) -> Self {
         Self {
             store,
             workspaces,
             notification,
             in_flight: Arc::new(AtomicBool::new(false)),
-            api_base: ARXIV_API_DEFAULT.to_string(),
+            api_base: resolve_arxiv_api_base(),
+            app_handle,
         }
     }
 
@@ -146,17 +155,25 @@ impl PapersScheduler {
     }
 
     async fn fire_inner(&self) -> Result<usize, FireError> {
+        // The opt-in gate is enforced once and authoritatively inside
+        // `fetch_papers_gated`. Repeating it here would only widen the
+        // window where the user could disable opt-in between this
+        // check and the actual HTTP call. Skip the early bail-out and
+        // let the centralised gate decide.
+        //
+        // Context extraction still respects opt-in implicitly: it
+        // never runs unless we are about to call `fetch_papers_gated`.
         let opt_in = self
             .store
             .get_opt_in()
             .map_err(|e| FireError::Storage(e.to_string()))?;
-        let Some(true) = opt_in else {
+        if !matches!(opt_in, Some(true)) {
             tracing::info!(
                 opt_in = ?opt_in,
                 "papers-scheduler: skipping fire — opt-in not enabled"
             );
             return Err(FireError::NotOptedIn);
-        };
+        }
 
         // Extract context off the tokio reactor (file IO + git subprocess).
         let workspaces = self.workspaces.clone();
@@ -180,25 +197,17 @@ impl PapersScheduler {
         let api_base = self.api_base.clone();
         let store = self.store.clone();
         let inserted: Vec<PaperRecord> = tokio::task::spawn_blocking(move || {
-            if let Some(wait) = store.rate_limit_wait()? {
-                return Err(ArxivError::RateLimited { wait_secs: wait });
-            }
-            store.touch_rate_limit()?;
-            let url = build_arxiv_url(&api_base, &query, MAX_RESULTS_PER_FIRE);
-            let client = reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .map_err(|e| ArxivError::Http(format!("client build: {e}")))?;
-            let body = fetch_arxiv_with_retry(&client, &url, MAX_RETRY_ATTEMPTS)?;
-            let parsed = parse_arxiv_atom(&body, MAX_RESULTS_PER_FIRE)?;
-            store.insert_dedup(&parsed, &query)
+            let client = make_blocking_arxiv_fetcher()?;
+            let fetcher = |url: &str| fetch_arxiv_with_retry(&client, url, MAX_RETRY_ATTEMPTS);
+            fetch_papers_gated(&store, &fetcher, &api_base, &query, "scheduled")
         })
         .await
         .map_err(|e| FireError::Join(e.to_string()))?
         .map_err(|e| FireError::Storage(e.to_string()))?;
 
         let count = inserted.len();
-        let _ = self.store.touch_last_fired();
+        // last_fired_at was already advanced inside the transaction
+        // owned by `fetch_papers_gated::insert_dedup_and_touch_last_fired`.
         if count > 0 {
             let entries: Vec<PapersTrayEntry> = inserted
                 .iter()
@@ -214,6 +223,7 @@ impl PapersScheduler {
                 "每日论文推荐".to_string(),
                 format!("{count} papers found based on your recent work"),
                 entries,
+                self.app_handle.clone(),
             );
         }
         Ok(count)
@@ -295,11 +305,14 @@ mod tests {
     }
 
     #[test]
-    fn fire_time_handles_local_offset() {
-        // 02:00 UTC = 10:00 +0800 local → fire now (0s)
+    fn fire_time_at_exact_target_returns_full_day_to_prevent_spin() {
+        // 02:00 UTC = 10:00 +0800 local. At exact equality the loop
+        // MUST treat the next fire as a full day away — returning 0
+        // would race the in-flight atomic and re-fire within the same
+        // second. Startup backfill handles the "should fire now" case.
         let now_unix = 86400 * 1000 + 2 * 3600;
         let wait = duration_until_next_fire_local(now_unix, 10, 8 * 3600);
-        assert_eq!(wait.as_secs(), 0);
+        assert_eq!(wait.as_secs(), 86400);
     }
 
     #[test]

@@ -41,6 +41,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": []
+    "icon": [],
+    "externalBin": [
+      "../target/release/terminal-mesh-sidecar",
+      "../target/release/notes-plugin",
+      "../target/release/papers-plugin"
+    ]
   }
 }

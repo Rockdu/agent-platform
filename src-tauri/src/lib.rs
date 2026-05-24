@@ -928,6 +928,7 @@ pub fn run() {
                             store.clone(),
                             workspaces_handle,
                             notification_service_arc.clone(),
+                            Some(app.handle().clone()),
                         );
                         scheduler.clone().start();
                         app.manage(papers_commands::PapersHandle {
@@ -973,14 +974,6 @@ pub fn run() {
                                 tracing::warn!("tray click: tray webview window missing");
                                 return;
                             };
-                            // Reposition first so the window appears
-                            // at the right spot when shown.
-                            use tauri_plugin_positioner::{Position, WindowExt};
-                            if let Err(err) =
-                                window.move_window(Position::TrayBottomCenter)
-                            {
-                                tracing::warn!(%err, "tray click: move_window failed");
-                            }
                             let visible = window.is_visible().unwrap_or(false);
                             match notification::compute_tray_toggle_action(visible) {
                                 notification::TrayToggleAction::Hide => {
@@ -989,12 +982,12 @@ pub fn run() {
                                     }
                                 }
                                 notification::TrayToggleAction::Show => {
-                                    if let Err(err) = window.show() {
-                                        tracing::warn!(%err, "tray window show failed");
-                                    }
-                                    if let Err(err) = window.set_focus() {
-                                        tracing::warn!(%err, "tray window set_focus failed");
-                                    }
+                                    // Shared with papers notification
+                                    // activation in `push_papers_digest`
+                                    // so the menubar click and a
+                                    // notification fire land the user
+                                    // on the same surface.
+                                    notification::show_tray_window(&app);
                                 }
                             }
                         })
@@ -1069,8 +1062,10 @@ pub fn run() {
             papers_commands::papers_get_opt_in,
             papers_commands::papers_set_opt_in,
             papers_commands::papers_toggle_star,
+            papers_commands::papers_mark_read,
             papers_commands::papers_search,
             papers_commands::papers_refresh_now,
+            papers_commands::papers_get_cooldown_state,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

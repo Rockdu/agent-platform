@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use papers_plugin::{
-    build_arxiv_url, fetch_arxiv_with_retry, parse_arxiv_atom, PaperRecord, PapersStore,
-    ARXIV_API_DEFAULT, MAX_RETRY_ATTEMPTS,
+    fetch_arxiv_with_retry, fetch_papers_gated, make_blocking_arxiv_fetcher,
+    resolve_arxiv_api_base, PaperRecord, PapersStore, RATE_LIMIT_SECONDS, MAX_RETRY_ATTEMPTS,
 };
 use serde::Serialize;
 use tauri::State;
@@ -71,39 +71,59 @@ pub fn papers_toggle_star(
 }
 
 #[tauri::command]
+pub fn papers_mark_read(
+    handle: State<'_, PapersHandle>,
+    arxiv_id: String,
+) -> Result<(), String> {
+    handle
+        .store
+        .mark_read(&arxiv_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn papers_search(
     handle: State<'_, PapersHandle>,
     query: String,
 ) -> Result<Vec<PaperRecord>, String> {
     let store = handle.store.clone();
-    let q = query.clone();
-    let result: Result<Vec<PaperRecord>, String> = tokio::task::spawn_blocking(move || {
-        if q.trim().is_empty() {
-            return Err("empty query".to_string());
-        }
-        if let Some(wait) = store
-            .rate_limit_wait()
-            .map_err(|e| e.to_string())?
-        {
-            return Err(format!("rate limited: wait {wait}s"));
-        }
-        store.touch_rate_limit().map_err(|e| e.to_string())?;
-        let url = build_arxiv_url(ARXIV_API_DEFAULT, &q, 10);
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| e.to_string())?;
-        let body = fetch_arxiv_with_retry(&client, &url, MAX_RETRY_ATTEMPTS)
-            .map_err(|e| e.to_string())?;
-        let mut parsed = parse_arxiv_atom(&body, 10).map_err(|e| e.to_string())?;
-        for r in parsed.iter_mut() {
-            r.source = "manual".to_string();
-        }
-        store.insert_dedup(&parsed, &q).map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(move || {
+        let api_base = resolve_arxiv_api_base();
+        let client = make_blocking_arxiv_fetcher().map_err(|e| e.to_string())?;
+        let fetcher = |url: &str| fetch_arxiv_with_retry(&client, url, MAX_RETRY_ATTEMPTS);
+        fetch_papers_gated(&store, &fetcher, &api_base, &query, "manual")
+            .map_err(|e| e.to_string())
     })
     .await
-    .map_err(|e| e.to_string())?;
-    result
+    .map_err(|e| e.to_string())?
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CooldownStateDto {
+    pub last_fetched_at: Option<String>,
+    pub last_error: Option<String>,
+    pub seconds_until_ready: u64,
+    pub rate_limit_seconds: u64,
+}
+
+#[tauri::command]
+pub fn papers_get_cooldown_state(
+    handle: State<'_, PapersHandle>,
+) -> Result<CooldownStateDto, String> {
+    let store = &handle.store;
+    let wait = store.rate_limit_wait().map_err(|e| e.to_string())?;
+    let last_error = store.last_error().map_err(|e| e.to_string())?;
+    // Convert last_fired_at to ISO 8601 for display via list_recent's
+    // existing wire shape; the UI just renders it textually.
+    let last_fetched_unix = store.last_fired_at_unix().map_err(|e| e.to_string())?;
+    let last_fetched_at = last_fetched_unix.map(papers_plugin::iso8601_from_unix);
+    Ok(CooldownStateDto {
+        last_fetched_at,
+        last_error,
+        seconds_until_ready: wait.unwrap_or(0),
+        rate_limit_seconds: RATE_LIMIT_SECONDS,
+    })
 }
 
 /// Trigger an immediate scheduler fire (the "Refresh now" button).
