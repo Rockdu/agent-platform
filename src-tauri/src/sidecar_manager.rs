@@ -49,6 +49,15 @@ use tokio::task::JoinHandle;
 use crate::dev_diagnostics;
 use crate::generated::plugin_registry::PLUGINS;
 
+/// Plugin ids whose `command_bin` is intentionally invoked on demand
+/// (e.g. by the host scheduler / Tauri commands spawning transient
+/// subprocesses per request) and MUST NOT be auto-spawned as a
+/// long-lived host-UI subprocess by `SidecarAwarePluginBody`. The
+/// generic auto-spawn passes no argv and no env, so a binary that
+/// requires `--client-id` / `--workspace` / `APP_DATA_DIR` (papers)
+/// exits immediately and pushes the manager into crash/restart/backoff.
+const HOST_UI_ON_DEMAND_ONLY_PLUGINS: &[&str] = &["papers"];
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -445,6 +454,28 @@ impl SidecarManager {
         workspace_root: &Path,
     ) -> Result<(), SidecarError> {
         let plugin_id = client_id.plugin_id().to_string();
+        // Some plugins ship a sidecar binary that is intentionally
+        // on-demand: it is spawned per-fetch by a host-side client
+        // (e.g. papers' scheduler / Tauri commands spawn transient
+        // sidecars via `papers_sidecar_client::fetch_via_sidecar` for
+        // each arXiv call) and is NEVER intended to run as a
+        // long-lived host-UI subprocess. Without this guard the
+        // generic `SidecarAwarePluginBody.useEffect` would launch
+        // `papers-plugin` with no argv / no `APP_DATA_DIR`, the
+        // binary would exit immediately, the manager would enter
+        // crash/restart/backoff, and the user would see the
+        // `SidecarRestartPanel` on every Papers tab open. Returning
+        // Ok without spawning leaves the slot absent so
+        // `sidecar_status` returns `None` and the restart panel
+        // stays hidden — exactly the intended behaviour. The
+        // Claude/MCP spawn path (`ClientId::Claude`) is unaffected;
+        // that runs through Claude's MCP subprocess machinery, not
+        // this manager.
+        if matches!(client_id, ClientId::HostUi { .. })
+            && HOST_UI_ON_DEMAND_ONLY_PLUGINS.contains(&plugin_id.as_str())
+        {
+            return Ok(());
+        }
         let manifest = PLUGINS
             .iter()
             .find(|p| p.plugin_id == plugin_id)
@@ -1517,6 +1548,77 @@ mod tests {
             }
             other => panic!("expected MissingBinary; got {other}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_from_manifest_for_host_ui_papers_is_noop() {
+        // The papers sidecar binary requires --client-id, --workspace,
+        // and APP_DATA_DIR to run. The generic SidecarAwarePluginBody
+        // calls spawn_sidecar_from_manifest with none of those, so
+        // without the on-demand-only guard the binary would exit
+        // immediately and the manager would enter crash/restart/
+        // backoff — showing the SidecarRestartPanel on every Papers
+        // tab open. The guard short-circuits to Ok(()) for
+        // ClientId::HostUi { plugin_id: "papers" } so no slot is ever
+        // registered. sidecar_status returns None ⇒ restart panel
+        // stays hidden.
+        let mgr = mgr_arc();
+        let cid = client_host_ui("papers");
+        // Use a temp workspace so even if the guard regressed we'd
+        // hit MissingBinary (visible failure), not actually spawn
+        // anything.
+        let temp = tempfile::TempDir::new().unwrap();
+        mgr.spawn_from_manifest(cid.clone(), temp.path())
+            .await
+            .expect("host_ui:papers manifest spawn must short-circuit to Ok(())");
+        assert!(
+            mgr.lookup(&cid).is_none(),
+            "host_ui:papers must NOT register a slot — sidecar_status must return None so the restart panel stays hidden"
+        );
+        assert!(
+            mgr.status(&cid).is_none(),
+            "status(host_ui:papers) must be None when the guard skipped spawn"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_from_manifest_for_host_ui_example_notes_still_attempts_spawn() {
+        // Sanity: the on-demand-only guard is narrow. Other host-UI
+        // plugins still go through binary resolution; a missing
+        // binary surfaces MissingBinary, NOT the silent Ok(()) skip.
+        let mgr = mgr_arc();
+        let cid = client_host_ui("example-notes");
+        let temp = tempfile::TempDir::new().unwrap();
+        let err = mgr
+            .spawn_from_manifest(cid, temp.path())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SidecarError::MissingBinary { ref plugin_id, .. } if plugin_id == "example-notes"),
+            "guard must NOT apply to example-notes; expected MissingBinary, got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_from_manifest_for_claude_papers_still_attempts_spawn() {
+        // The on-demand-only guard ONLY targets ClientId::HostUi.
+        // The Claude/MCP path (ClientId::Claude) runs through Claude's
+        // own MCP subprocess machinery — not this manager — but if
+        // anyone ever called spawn_from_manifest with a Claude
+        // client_id for papers, it must still go through binary
+        // resolution (MissingBinary in this test fixture), NOT the
+        // silent Ok(()) skip.
+        let mgr = mgr_arc();
+        let cid = client_claude("papers");
+        let temp = tempfile::TempDir::new().unwrap();
+        let err = mgr
+            .spawn_from_manifest(cid, temp.path())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SidecarError::MissingBinary { ref plugin_id, .. } if plugin_id == "papers"),
+            "guard must NOT apply to ClientId::Claude even for `papers`; expected MissingBinary, got {err:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
