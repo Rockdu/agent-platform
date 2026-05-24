@@ -36,6 +36,9 @@ Thumbs.db
 # Per-machine Claude Code settings (don't share between machines)
 .claude/settings.local.json
 
+# Per-machine Codex CLI config (absolute paths; don't share)
+.codex/
+
 # Humanize local loop state (user policy reversal 2026-05-16: complied
 # with plugin hook after the conflict made the loop unworkable).
 .humanize/
