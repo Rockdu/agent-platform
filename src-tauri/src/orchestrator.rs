@@ -43,6 +43,17 @@ pub struct OrchestratorSession {
     /// terminal-mesh sidecar without re-minting.
     #[serde(skip)]
     pub terminal_mesh_capability: Option<String>,
+    /// Unforgeable capability token for the orchestrator's papers
+    /// sidecar host-RPC arms (`papers.listRecent`, `papers.search`).
+    /// Minted at spawn time, embedded into the orchestrator's papers
+    /// MCP-config entry as `PAPERS_CAPABILITY=<token>` (env, not argv,
+    /// to keep it out of `ps`). The host RPC bridge requires the
+    /// caller to PRESENT this token in the request body alongside
+    /// the `clientId` — `clientId` alone is forgeable by any local
+    /// process that knows the socket path. `#[serde(skip)]` — never
+    /// crosses the React IPC boundary, never appears in any DTO.
+    #[serde(skip)]
+    pub papers_capability: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +307,13 @@ pub(crate) fn spawn_orchestrator_claude(
             }
         };
 
+    // Mint an unforgeable random token for the papers host-RPC arms.
+    // The host RPC bridge requires the caller to PRESENT this token
+    // alongside the (otherwise forgeable) clientId. Embedded into
+    // the orchestrator's papers MCP-config entry via env (`PAPERS_CAPABILITY`)
+    // so only the orchestrator-spawned papers sidecar ever sees it.
+    let papers_capability = Some(Uuid::new_v4().to_string());
+
     let doc = mcp_config::generate_config_with_host_rpc_sock(
         &tab_id,
         agent_platform_root,
@@ -304,6 +322,7 @@ pub(crate) fn spawn_orchestrator_claude(
         &workspace_root_for_dev_path,
         host_rpc_sock,
         terminal_mesh_capability.as_deref(),
+        papers_capability.as_deref(),
     )
     .map_err(|e| OrchestratorError::McpConfigFailed {
         message: e.to_string(),
@@ -347,6 +366,7 @@ pub(crate) fn spawn_orchestrator_claude(
             tab_id,
             mcp_config_path,
             terminal_mesh_capability,
+            papers_capability,
         }),
         Err(e) => {
             // Clean up the just-written MCP config so the next
@@ -435,6 +455,7 @@ mod tests {
             tab_id: "tab-abc".into(),
             mcp_config_path: PathBuf::from("/tmp/orch.json"),
             terminal_mesh_capability: None,
+            papers_capability: None,
         };
         s.record_session(session.clone());
         let snap = s.snapshot().expect("present after record");
@@ -459,6 +480,7 @@ mod tests {
                 tab_id: "t".into(),
                 mcp_config_path: PathBuf::from("/tmp/x"),
                 terminal_mesh_capability: None,
+            papers_capability: None,
             },
         };
         let v: serde_json::Value = serde_json::to_value(&s).unwrap();
@@ -502,6 +524,7 @@ mod tests {
             tab_id: "tab-race".into(),
             mcp_config_path: PathBuf::from("/tmp/race.json"),
             terminal_mesh_capability: None,
+            papers_capability: None,
         };
 
         let mut handles = Vec::new();
@@ -551,6 +574,7 @@ mod tests {
                     tab_id: "tab-1".into(),
                     mcp_config_path: PathBuf::from("/tmp/1.json"),
                     terminal_mesh_capability: None,
+            papers_capability: None,
                 })
             })
             .expect("first launch ok");
@@ -570,6 +594,7 @@ mod tests {
                     tab_id: "tab-2".into(),
                     mcp_config_path: PathBuf::from("/tmp/2.json"),
                     terminal_mesh_capability: None,
+            papers_capability: None,
                 })
             })
             .expect("second launch ok");
@@ -605,6 +630,7 @@ mod tests {
             tab_id: tab_id.into(),
             mcp_config_path: config_path.clone(),
             terminal_mesh_capability: None,
+            papers_capability: None,
         });
         assert!(state.snapshot().is_some());
 
@@ -645,6 +671,7 @@ mod tests {
             tab_id: "tab-stale".into(),
             mcp_config_path: PathBuf::from("/tmp/stale.json"),
             terminal_mesh_capability: None,
+            papers_capability: None,
         });
         let registry = TerminalMeshRegistry::new(); // empty — stale_id not registered
         let discovery = DiscoveryCache::empty();
@@ -677,6 +704,7 @@ mod tests {
             tab_id: "tab-live".into(),
             mcp_config_path: PathBuf::from("/tmp/live.json"),
             terminal_mesh_capability: None,
+            papers_capability: None,
         });
         let registry = TerminalMeshRegistry::new();
         // Insert via the internal path: tests in this module are in

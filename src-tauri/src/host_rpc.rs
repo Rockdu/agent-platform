@@ -514,9 +514,10 @@ pub fn dispatch_method(
                     message: format!("invalid params: {e}"),
                     data: None,
                 })?;
-            require_orchestrator_plugin_client(
+            require_orchestrator_papers_capability(
                 state,
                 &parsed.client_id,
+                &parsed.papers_capability,
                 "papers",
                 "papers.listRecent",
             )?;
@@ -529,9 +530,10 @@ pub fn dispatch_method(
                     message: format!("invalid params: {e}"),
                     data: None,
                 })?;
-            require_orchestrator_plugin_client(
+            require_orchestrator_papers_capability(
                 state,
                 &parsed.client_id,
+                &parsed.papers_capability,
                 "papers",
                 "papers.search",
             )?;
@@ -547,12 +549,25 @@ pub fn dispatch_method(
 
 /// Defense-in-depth gate for papers methods. The MCP config exclusion
 /// in `mcp_config.rs` already prevents non-orchestrator tabs from
-/// even seeing the papers sidecar; this gate rejects direct calls
-/// to the host RPC bridge that try to forge a non-orchestrator
-/// clientId for a papers method.
-fn require_orchestrator_plugin_client(
+/// even seeing the papers sidecar. This gate adds two more layers:
+///
+/// 1. `clientId` parsing + tab/plugin check — same as before. Catches
+///    a non-orchestrator clientId. NOTE: by itself this is forgeable,
+///    because the clientId is JSON in the request body and not bound
+///    to the Unix-socket connection.
+///
+/// 2. **Capability check.** The caller MUST present a `papers_capability`
+///    token matching the host-minted token stored on
+///    `OrchestratorSession.papers_capability`. The host embeds the
+///    token into the orchestrator-only papers MCP-config entry via
+///    the `PAPERS_CAPABILITY` env var, so only the host-spawned
+///    orchestrator papers sidecar can present a matching value.
+///    A local process that knows the socket path cannot pass this
+///    gate even if it knows the orchestrator's tab id.
+fn require_orchestrator_papers_capability(
     state: &HostRpcState,
     client_id: &str,
+    presented_capability: &str,
     expected_plugin_id: &str,
     method: &str,
 ) -> Result<String, JsonRpcError> {
@@ -581,14 +596,31 @@ fn require_orchestrator_plugin_client(
         });
     }
     let snapshot = state.orchestrator.snapshot();
-    let is_orchestrator = snapshot
-        .as_ref()
-        .map(|s| s.tab_id == caller_tab_id)
-        .unwrap_or(false);
-    if !is_orchestrator {
+    let session = snapshot.as_ref().ok_or_else(|| JsonRpcError {
+        code: ERR_PERMISSION_DENIED,
+        message: format!("{method} is orchestrator-only (no orchestrator session)"),
+        data: None,
+    })?;
+    if session.tab_id != caller_tab_id {
         return Err(JsonRpcError {
             code: ERR_PERMISSION_DENIED,
             message: format!("{method} is orchestrator-only"),
+            data: None,
+        });
+    }
+    // Capability check — clientId alone is forgeable so the
+    // orchestrator tab id check above is necessary but not sufficient.
+    // The presented token must byte-match the stashed value the host
+    // embedded into the orchestrator's papers sidecar's env.
+    let stored = session.papers_capability.as_deref().ok_or_else(|| JsonRpcError {
+        code: ERR_PERMISSION_DENIED,
+        message: format!("{method}: orchestrator session has no papers_capability"),
+        data: None,
+    })?;
+    if presented_capability.is_empty() || presented_capability != stored {
+        return Err(JsonRpcError {
+            code: ERR_PERMISSION_DENIED,
+            message: format!("{method}: papers_capability missing or mismatched"),
             data: None,
         });
     }
@@ -600,6 +632,8 @@ fn require_orchestrator_plugin_client(
 struct PapersListRecentParams {
     client_id: String,
     #[serde(default)]
+    papers_capability: String,
+    #[serde(default)]
     limit: Option<i64>,
 }
 
@@ -607,6 +641,8 @@ struct PapersListRecentParams {
 #[serde(rename_all = "camelCase")]
 struct PapersSearchParams {
     client_id: String,
+    #[serde(default)]
+    papers_capability: String,
     query: String,
 }
 
@@ -910,6 +946,7 @@ mod tests {
             tab_id: orch_tab_id.to_string(),
             mcp_config_path: std::path::PathBuf::from("/tmp/orch.json"),
             terminal_mesh_capability: Some(resp.handle.clone()),
+            papers_capability: Some("test-papers-cap-token".to_string()),
         });
 
         let state = HostRpcState {
@@ -1209,6 +1246,7 @@ mod tests {
             tab_id: orch_tab_id.to_string(),
             mcp_config_path: std::path::PathBuf::from("/tmp/orch.json"),
             terminal_mesh_capability: Some(resp.handle.clone()),
+            papers_capability: Some("test-papers-cap-token".to_string()),
         });
 
         let state = HostRpcState {
@@ -1276,6 +1314,7 @@ mod tests {
             tab_id: orch_tab.to_string(),
             mcp_config_path: std::path::PathBuf::from("/tmp/orch.json"),
             terminal_mesh_capability: None,
+            papers_capability: None,
         });
         let state = HostRpcState {
             orchestrator,
@@ -1490,6 +1529,13 @@ mod tests {
         }
     }
 
+    /// Capability token the `bridge_state_with_two_tabs` test fixture
+    /// stashes on the OrchestratorSession.papers_capability field.
+    /// Tests that want to pass the orchestrator-only gate present
+    /// THIS value; tests that want to prove the capability check
+    /// fires present a different (or empty) value.
+    const TEST_PAPERS_CAPABILITY: &str = "test-papers-cap-token";
+
     #[test]
     fn papers_list_recent_rejects_non_orchestrator_client_id() {
         let orch_tab = make_uuid_tab_id();
@@ -1497,6 +1543,7 @@ mod tests {
         let workspace_tab = make_uuid_tab_id();
         let params = json!({
             "clientId": format!("claude:{workspace_tab}:papers"),
+            "papersCapability": TEST_PAPERS_CAPABILITY,
         });
         let err = dispatch_method(&state, "papers.listRecent", params)
             .expect_err("non-orchestrator must be denied");
@@ -1510,6 +1557,7 @@ mod tests {
         let (state, _handle) = bridge_state_with_two_tabs(&orch_tab, &make_uuid_tab_id());
         let params = json!({
             "clientId": "host_ui:papers",
+            "papersCapability": TEST_PAPERS_CAPABILITY,
             "query": "transformers",
         });
         let err = dispatch_method(&state, "papers.search", params)
@@ -1523,6 +1571,7 @@ mod tests {
         let (state, _handle) = bridge_state_with_two_tabs(&orch_tab, &make_uuid_tab_id());
         let params = json!({
             "clientId": format!("claude:{orch_tab}:terminal-mesh"),
+            "papersCapability": TEST_PAPERS_CAPABILITY,
         });
         let err = dispatch_method(&state, "papers.listRecent", params)
             .expect_err("wrong plugin_id must be rejected");
@@ -1536,10 +1585,60 @@ mod tests {
         let (state, _handle) = bridge_state_with_two_tabs(&orch_tab, &make_uuid_tab_id());
         let params = json!({
             "clientId": format!("claude:{orch_tab}:papers"),
+            "papersCapability": TEST_PAPERS_CAPABILITY,
         });
         let err = dispatch_method(&state, "papers.listRecent", params)
             .expect_err("orchestrator passes gate but store missing");
         assert_eq!(err.code, ERR_NOT_FOUND);
         assert!(err.message.contains("papers store"));
+    }
+
+    #[test]
+    fn papers_list_recent_rejects_orchestrator_client_id_without_capability() {
+        // Regression: clientId alone is forgeable; without the
+        // capability the gate must reject even an otherwise-correct
+        // orchestrator claim.
+        let orch_tab = make_uuid_tab_id();
+        let (state, _handle) = bridge_state_with_two_tabs(&orch_tab, &make_uuid_tab_id());
+        let params = json!({
+            "clientId": format!("claude:{orch_tab}:papers"),
+            // papersCapability omitted entirely
+        });
+        let err = dispatch_method(&state, "papers.listRecent", params)
+            .expect_err("missing capability must be denied");
+        assert_eq!(err.code, ERR_PERMISSION_DENIED);
+        assert!(
+            err.message.contains("papers_capability"),
+            "error must reference papers_capability; got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn papers_list_recent_rejects_wrong_capability() {
+        let orch_tab = make_uuid_tab_id();
+        let (state, _handle) = bridge_state_with_two_tabs(&orch_tab, &make_uuid_tab_id());
+        let params = json!({
+            "clientId": format!("claude:{orch_tab}:papers"),
+            "papersCapability": "this-is-the-wrong-token",
+        });
+        let err = dispatch_method(&state, "papers.listRecent", params)
+            .expect_err("wrong capability must be denied");
+        assert_eq!(err.code, ERR_PERMISSION_DENIED);
+        assert!(err.message.contains("papers_capability"));
+    }
+
+    #[test]
+    fn papers_search_rejects_wrong_capability() {
+        let orch_tab = make_uuid_tab_id();
+        let (state, _handle) = bridge_state_with_two_tabs(&orch_tab, &make_uuid_tab_id());
+        let params = json!({
+            "clientId": format!("claude:{orch_tab}:papers"),
+            "papersCapability": "",
+            "query": "transformers",
+        });
+        let err = dispatch_method(&state, "papers.search", params)
+            .expect_err("empty capability must be denied");
+        assert_eq!(err.code, ERR_PERMISSION_DENIED);
     }
 }

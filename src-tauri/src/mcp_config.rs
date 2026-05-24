@@ -181,6 +181,7 @@ pub fn generate_config(
         workspace_root_for_dev,
         None,
         None,
+        None,
     )
 }
 
@@ -206,6 +207,13 @@ pub fn generate_config_with_host_rpc_sock(
     //
     // env (not argv) keeps the handle out of `ps` output.
     orchestrator_terminal_mesh_capability: Option<&str>,
+    // Orchestrator's unforgeable papers capability token.
+    // When Some AND the plugin being generated is the orchestrator's
+    // `papers` entry, embed it as `PAPERS_CAPABILITY`. The host RPC
+    // bridge requires the caller to PRESENT this token alongside
+    // the clientId on every papers.* method, so a non-orchestrator
+    // process with the socket path cannot forge `claude:<orch>:papers`.
+    orchestrator_papers_capability: Option<&str>,
 ) -> Result<McpConfigDocument, McpConfigError> {
     validate_tab_id(tab_id)?;
 
@@ -275,8 +283,18 @@ pub fn generate_config_with_host_rpc_sock(
                 env.insert("TERMINAL_MESH_CAPABILITY".to_string(), handle.to_string());
             }
         }
+        if kind == McpConfigKind::Orchestrator && plugin_id == "papers" {
+            if let Some(token) = orchestrator_papers_capability {
+                env.insert("PAPERS_CAPABILITY".to_string(), token.to_string());
+            }
+        }
 
-        // Defensive: refuse to ship any env key that looks like a secret.
+        // Defensive: refuse to ship any env key that looks like a
+        // user secret. The host-issued capability handles
+        // (`TERMINAL_MESH_CAPABILITY`, `PAPERS_CAPABILITY`) are
+        // not blocked because the substring filters target
+        // user-credential patterns, not the capability naming
+        // convention.
         for key in env.keys() {
             let lower = key.to_ascii_lowercase();
             if lower.contains("token")
@@ -491,6 +509,9 @@ pub async fn generate_mcp_config(
         // capability — the orchestrator is the only caller that
         // mints + embeds the handle.
         None,
+        // Same story for the orchestrator's papers capability —
+        // regular tabs do not even spawn the papers sidecar.
+        None,
     )
     .map_err(|e| McpConfigErrorDto::from(&e))?;
     let final_path = write_atomic(&app_data, &tab_id, &doc).map_err(|e| McpConfigErrorDto::from(&e))?;
@@ -676,6 +697,7 @@ mod tests {
             workspace_root.path(),
             Some(std::path::Path::new("/tmp/host.sock")),
             None,
+            None,
         )
         .expect("generate");
         let entry = doc
@@ -719,6 +741,7 @@ mod tests {
             app_data.path(),
             workspace_root.path(),
             Some(std::path::Path::new("/tmp/host-std.sock")),
+            None,
             None,
         )
         .expect("generate");
@@ -921,6 +944,7 @@ mod tests {
             workspace_root.path(),
             Some(std::path::Path::new("/tmp/host.sock")),
             Some("orch-handle-XYZ"),
+            None,
         )
         .expect("generate");
         let entry = doc
@@ -954,6 +978,7 @@ mod tests {
             workspace_root.path(),
             Some(std::path::Path::new("/tmp/host-std.sock")),
             Some("attacker-supplied-handle"),
+            None,
         )
         .expect("generate");
         let entry = doc
@@ -983,6 +1008,7 @@ mod tests {
             app_data.path(),
             workspace_root.path(),
             Some(std::path::Path::new("/tmp/host.sock")),
+            None,
             None,
         )
         .expect("generate");
@@ -1098,6 +1124,7 @@ mod tests {
             workspace_root.path(),
             Some(std::path::Path::new("/tmp/host.sock")),
             None,
+            None,
         )
         .expect("generate");
         assert!(
@@ -1122,6 +1149,7 @@ mod tests {
             app_data.path(),
             workspace_root.path(),
             Some(std::path::Path::new("/tmp/host.sock")),
+            None,
             None,
         )
         .expect("generate");
