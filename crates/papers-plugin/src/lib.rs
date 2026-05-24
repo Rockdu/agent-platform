@@ -422,7 +422,23 @@ pub struct PapersStore {
     conn: Mutex<rusqlite::Connection>,
 }
 
+/// Embedded copy of the papers plugin's initial schema. Applied
+/// unconditionally by `PapersStore::open` so a packaged install
+/// (which does not ship the source-tree `plugins/papers/migrations`
+/// directory) gets the same schema as a dev checkout. All statements
+/// are idempotent (`CREATE TABLE IF NOT EXISTS`, `INSERT OR IGNORE`)
+/// so reapplication is a no-op.
+const EMBEDDED_SCHEMA_SQL: &str =
+    include_str!("../../../plugins/papers/migrations/0001_init.sql");
+
 impl PapersStore {
+    /// Open the papers SQLite at `db_path`, configure WAL + busy
+    /// timeout, and apply the embedded schema. The schema apply is
+    /// idempotent: every CREATE uses `IF NOT EXISTS` and the
+    /// singleton row uses `INSERT OR IGNORE`. If schema apply fails,
+    /// the store fails to open — the host must then disable the
+    /// papers feature rather than continue with an unmigrated DB
+    /// that would error on every subsequent SELECT.
     pub fn open(db_path: &std::path::Path) -> Result<Self, ArxivError> {
         let conn = rusqlite::Connection::open(db_path)
             .map_err(|e| ArxivError::Sqlite(format!("open: {e}")))?;
@@ -430,6 +446,8 @@ impl PapersStore {
             .map_err(|e| ArxivError::Sqlite(format!("busy_timeout: {e}")))?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| ArxivError::Sqlite(format!("WAL: {e}")))?;
+        conn.execute_batch(EMBEDDED_SCHEMA_SQL)
+            .map_err(|e| ArxivError::Sqlite(format!("embedded schema: {e}")))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1228,6 +1246,54 @@ mod tests {
         drop(conn);
         let store = PapersStore::open(&db_path).unwrap();
         (store, tmp)
+    }
+
+    #[test]
+    fn papers_store_open_initialises_schema_on_fresh_db() {
+        // Packaged-install regression: the source-tree `migrations/`
+        // directory is absent, so PapersStore::open MUST embed and
+        // apply the schema itself. A fresh empty DB file plus
+        // PapersStore::open must give us a usable store where
+        // SELECTs against scheduler_state and daily_recommendations
+        // succeed.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("fresh.sqlite");
+        // Touch the file but do NOT pre-apply any schema.
+        std::fs::File::create(&db_path).unwrap();
+        let store = PapersStore::open(&db_path).expect("open must succeed");
+        // Opt-in starts as NULL — proves scheduler_state exists AND
+        // the singleton row was inserted.
+        assert_eq!(store.get_opt_in().unwrap(), None);
+        // list_recent on an empty daily_recommendations table must
+        // return an empty Vec, not error with `no such table`.
+        let recent = store.list_recent(10).expect("list_recent must succeed");
+        assert!(recent.is_empty());
+        // user_paper_state operations succeed.
+        store.toggle_star("2024.fresh", true).expect("toggle_star must succeed");
+    }
+
+    #[test]
+    fn embedded_schema_is_idempotent() {
+        // Reopening PapersStore on the same DB file must be a no-op
+        // for the schema (every CREATE uses IF NOT EXISTS; the
+        // singleton INSERT uses INSERT OR IGNORE). The second open
+        // must NOT duplicate the scheduler_state row.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("repeat.sqlite");
+        let s1 = PapersStore::open(&db_path).unwrap();
+        s1.set_opt_in(true).unwrap();
+        drop(s1);
+        let s2 = PapersStore::open(&db_path).unwrap();
+        // Opt-in value from the first open must survive reopen.
+        assert_eq!(s2.get_opt_in().unwrap(), Some(true));
+        // Verify there is still exactly one scheduler_state row.
+        let count: i64 = s2
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM scheduler_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

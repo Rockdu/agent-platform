@@ -23,12 +23,18 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub const CONTEXT_BUDGET_BYTES_TOTAL: usize = 256 * 1024;
 pub const MAX_TOKENS_PER_QUERY: usize = 30;
 pub const GIT_LOG_TIMEOUT_MS: u64 = 1500;
 pub const MAX_GIT_COMMITS: usize = 20;
+/// Workspaces whose `.claude/` (or, if absent, workspace dir) has had
+/// no filesystem activity within this window are skipped entirely —
+/// no `.claude` read, no git mine. The plan's privacy contract is to
+/// only surface recent work; stale workspace tokens must not enter
+/// the arXiv query.
+pub const STALE_WORKSPACE_THRESHOLD_SECS: u64 = 30 * 86400;
 /// Wall-clock deadline for the entire `extract_workspace_keywords()` run
 /// across all workspaces. Chosen comfortably below the plan's "<2 seconds
 /// total" context-extraction contract so a slow git or filesystem read
@@ -37,6 +43,33 @@ pub const CONTEXT_TOTAL_TIMEOUT_MS: u64 = 1800;
 /// Below this many remaining ms it is not worth spawning a `git log`
 /// subprocess — the spawn + drain overhead alone can exceed the budget.
 const GIT_SPAWN_FLOOR_MS: u64 = 150;
+
+/// Returns true when the workspace has had no recent Claude or
+/// filesystem activity within `threshold_secs`. Pure function so the
+/// stale-filter behavior is unit-testable without time-mocking.
+///
+/// Probe order:
+///   1. `<ws>/.claude` mtime — the documented signal.
+///   2. workspace directory mtime — fallback when `.claude/` doesn't
+///      exist (a freshly-created workspace still gets a chance to
+///      contribute git history).
+///   3. If neither can be stat'd → return `true` (skip).
+pub fn workspace_is_stale(ws: &Path, now: SystemTime, threshold_secs: u64) -> bool {
+    let probe = ws.join(".claude");
+    let mtime = match std::fs::metadata(&probe).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => match std::fs::metadata(ws).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(_) => return true,
+        },
+    };
+    match now.duration_since(mtime) {
+        Ok(age) => age.as_secs() > threshold_secs,
+        // mtime is in the future (clock skew). Treat as fresh — better
+        // a false negative than over-aggressive redaction here.
+        Err(_) => false,
+    }
+}
 
 /// Decides how to schedule the next `mine_git_commits` call given the
 /// wall-clock ms remaining before the global extraction deadline.
@@ -111,6 +144,7 @@ pub fn extract_workspace_keywords_with_git<P: AsRef<Path>>(
     let deadline = Instant::now() + Duration::from_millis(CONTEXT_TOTAL_TIMEOUT_MS);
 
     let mut all_tokens: HashSet<String> = HashSet::new();
+    let now_for_age = SystemTime::now();
     for ws in workspaces {
         let ws = ws.as_ref();
         if remaining_budget == 0 {
@@ -118,6 +152,13 @@ pub fn extract_workspace_keywords_with_git<P: AsRef<Path>>(
         }
         if Instant::now() >= deadline {
             break;
+        }
+        // Stale-workspace filter: skip both `.claude` extraction AND
+        // git mining when the workspace has no recent activity
+        // signal. This honours the plan's privacy contract and
+        // matches the doc-comment promise on this function.
+        if workspace_is_stale(ws, now_for_age, STALE_WORKSPACE_THRESHOLD_SECS) {
+            continue;
         }
         let take = per_workspace_target.min(remaining_budget).max(
             per_workspace_floor.min(remaining_budget),
@@ -984,5 +1025,98 @@ mod tests {
             elapsed < Duration::from_millis(2_000),
             "extract_workspace_keywords exceeded the 2-second context budget under no-git-load; elapsed = {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn workspace_is_stale_returns_true_when_claude_older_than_threshold() {
+        let tmp = TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        // Pretend `now` is 100 days after the directory was created.
+        let now = SystemTime::now() + Duration::from_secs(100 * 86400);
+        assert!(workspace_is_stale(
+            tmp.path(),
+            now,
+            STALE_WORKSPACE_THRESHOLD_SECS,
+        ));
+    }
+
+    #[test]
+    fn workspace_is_stale_returns_false_when_claude_fresh() {
+        let tmp = TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let now = SystemTime::now();
+        assert!(!workspace_is_stale(
+            tmp.path(),
+            now,
+            STALE_WORKSPACE_THRESHOLD_SECS,
+        ));
+    }
+
+    #[test]
+    fn workspace_is_stale_falls_back_to_workspace_dir_when_no_claude() {
+        let tmp = TempDir::new().unwrap();
+        // No `.claude` directory. Workspace dir just created (fresh).
+        let now = SystemTime::now();
+        assert!(!workspace_is_stale(
+            tmp.path(),
+            now,
+            STALE_WORKSPACE_THRESHOLD_SECS,
+        ));
+        // 100 days in the future → workspace dir's mtime is "old".
+        let later = SystemTime::now() + Duration::from_secs(100 * 86400);
+        assert!(workspace_is_stale(
+            tmp.path(),
+            later,
+            STALE_WORKSPACE_THRESHOLD_SECS,
+        ));
+    }
+
+    #[test]
+    fn extract_workspace_keywords_skips_stale_workspace_entirely() {
+        // One workspace with fresh `.claude` containing UNIQUE_FRESH
+        // tokens; one workspace with `.claude` whose mtime is moved
+        // far into the past (older than the threshold) containing
+        // UNIQUE_STALE tokens. Only the fresh workspace's tokens
+        // must appear in the output.
+        let fresh = TempDir::new().unwrap();
+        let stale = TempDir::new().unwrap();
+        write_claude_fixture(
+            fresh.path(),
+            "transformerfresh attentionfresh diffusionfresh",
+        );
+        write_claude_fixture(
+            stale.path(),
+            "transformerstale attentionstale diffusionstale",
+        );
+        // Backdate the stale workspace's `.claude` mtime to 100 days ago.
+        let claude_stale = stale.path().join(".claude");
+        let backdate = SystemTime::now() - Duration::from_secs(100 * 86400);
+        let file_time = filetime::FileTime::from_system_time(backdate);
+        filetime::set_file_mtime(&claude_stale, file_time).expect(
+            "set_file_mtime; if `filetime` crate is unavailable swap to a manual touch",
+        );
+
+        // Also backdate the stale workspace dir itself so the
+        // fallback in workspace_is_stale won't rescue it.
+        filetime::set_file_mtime(stale.path(), file_time).expect("set_file_mtime");
+
+        let paths: Vec<&std::path::Path> = vec![fresh.path(), stale.path()];
+        let tokens: Vec<String> = extract_workspace_keywords(&paths, 64 * 1024)
+            .into_iter()
+            .map(|t| t.to_ascii_lowercase())
+            .collect();
+
+        assert!(
+            tokens.iter().any(|t| t == "transformerfresh"),
+            "fresh-workspace token missing; tokens={tokens:?}"
+        );
+        for leaked in ["transformerstale", "attentionstale", "diffusionstale"] {
+            assert!(
+                !tokens.iter().any(|t| t == leaked),
+                "stale-workspace token `{leaked}` leaked through filter; tokens={tokens:?}"
+            );
+        }
     }
 }

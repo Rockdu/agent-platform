@@ -865,24 +865,47 @@ pub fn run() {
                     // (resolved from `app_data_root`). Otherwise host
                     // reads and sidecar writes go to different files
                     // and the UI never sees scheduled/manual results.
+                    //
+                    // Schema is now embedded in `PapersStore::open` via
+                    // `include_str!` so a packaged install (which does
+                    // not ship `plugins/papers/migrations`) still gets
+                    // the tables created. If `PapersStore::open`
+                    // returns an error, the papers feature is disabled
+                    // — opening an empty, unmigrated DB would surface
+                    // as `no such table` on every subsequent SELECT.
                     let papers_plugins_root = app_data_root.join("plugins");
                     let papers_store_arc: Option<std::sync::Arc<papers_plugin::PapersStore>> = (|| {
-                        let _ = std::fs::create_dir_all(&papers_plugins_root);
+                        std::fs::create_dir_all(&papers_plugins_root).ok()?;
                         let plugin_dir = papers_plugins_root.join("papers");
-                        let _ = std::fs::create_dir_all(&plugin_dir);
+                        std::fs::create_dir_all(&plugin_dir).ok()?;
                         let db_path = plugin_dir.join("state.sqlite");
-                        let migrations_dir = dev_diagnostics::workspace_root_for_dev()
-                            .join("plugins")
-                            .join("papers")
-                            .join("migrations");
+                        // Best-effort: also run the source-tree migration
+                        // runner so `_plugin_migrations` audit rows are
+                        // populated in dev. Failure here is fine — the
+                        // embedded schema below is the authoritative
+                        // source.
                         if let Ok(storage) =
                             plugin_sqlite::PluginStorage::open(&papers_plugins_root, "papers")
                         {
+                            let migrations_dir = dev_diagnostics::workspace_root_for_dev()
+                                .join("plugins")
+                                .join("papers")
+                                .join("migrations");
                             if migrations_dir.is_dir() {
                                 let _ = storage.run_migrations(&migrations_dir);
                             }
                         }
-                        papers_plugin::PapersStore::open(&db_path).ok().map(std::sync::Arc::new)
+                        match papers_plugin::PapersStore::open(&db_path) {
+                            Ok(store) => Some(std::sync::Arc::new(store)),
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    db_path = %db_path.display(),
+                                    "papers feature disabled: schema init failed"
+                                );
+                                None
+                            }
+                        }
                     })();
                     let host_rpc_sock_path = match host_rpc::prepare_socket_path(&app_data_root) {
                         Ok(p) => {
