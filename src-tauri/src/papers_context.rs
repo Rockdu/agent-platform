@@ -29,6 +29,28 @@ pub const CONTEXT_BUDGET_BYTES_TOTAL: usize = 256 * 1024;
 pub const MAX_TOKENS_PER_QUERY: usize = 30;
 pub const GIT_LOG_TIMEOUT_MS: u64 = 1500;
 pub const MAX_GIT_COMMITS: usize = 20;
+/// Wall-clock deadline for the entire `extract_workspace_keywords()` run
+/// across all workspaces. Chosen comfortably below the plan's "<2 seconds
+/// total" context-extraction contract so a slow git or filesystem read
+/// on workspace N cannot push the aggregate past 2 s.
+pub const CONTEXT_TOTAL_TIMEOUT_MS: u64 = 1800;
+/// Below this many remaining ms it is not worth spawning a `git log`
+/// subprocess — the spawn + drain overhead alone can exceed the budget.
+const GIT_SPAWN_FLOOR_MS: u64 = 150;
+
+/// Decides how to schedule the next `mine_git_commits` call given the
+/// wall-clock ms remaining before the global extraction deadline.
+/// Returns `None` when the remaining budget is too small to be worth
+/// spawning a git subprocess, or `Some(timeout_ms)` otherwise. The
+/// returned timeout is the smaller of the remaining budget and the
+/// per-call `GIT_LOG_TIMEOUT_MS` ceiling.
+pub fn git_timeout_for_remaining(remaining_ms: u64) -> Option<u64> {
+    if remaining_ms < GIT_SPAWN_FLOOR_MS {
+        None
+    } else {
+        Some(remaining_ms.min(GIT_LOG_TIMEOUT_MS))
+    }
+}
 
 /// Stop-word allow-list. Tokens that match are dropped before the
 /// keyword set is returned. Kept short and lowercase; intentionally
@@ -67,10 +89,22 @@ pub fn extract_workspace_keywords<P: AsRef<Path>>(
     let per_workspace_target = total_budget_bytes / workspaces.len().max(1);
     let mut remaining_budget = total_budget_bytes;
 
+    // Wall-clock deadline for the entire run. Even if each
+    // `mine_git_commits` call respects `GIT_LOG_TIMEOUT_MS` per
+    // subprocess, N slow workspaces × 1.5 s would blow past the
+    // plan's "<2 seconds total" contract. We enforce a single
+    // deadline at the top of every iteration and again before
+    // every git spawn; the git timeout passed in is the smaller
+    // of the per-call cap and the remaining wall-clock budget.
+    let deadline = Instant::now() + Duration::from_millis(CONTEXT_TOTAL_TIMEOUT_MS);
+
     let mut all_tokens: HashSet<String> = HashSet::new();
     for ws in workspaces {
         let ws = ws.as_ref();
         if remaining_budget == 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
             break;
         }
         let take = per_workspace_target.min(remaining_budget).max(
@@ -84,7 +118,17 @@ pub fn extract_workspace_keywords<P: AsRef<Path>>(
         if all_tokens.len() >= MAX_TOKENS_PER_QUERY * 2 {
             break;
         }
-        if let Ok(subjects) = mine_git_commits(ws, MAX_GIT_COMMITS, GIT_LOG_TIMEOUT_MS) {
+        // Compute remaining wall-clock budget before spawning git.
+        // Skip git entirely if there is not enough headroom for the
+        // spawn + drain cycle.
+        let remaining_ms = deadline
+            .checked_duration_since(Instant::now())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let Some(git_timeout) = git_timeout_for_remaining(remaining_ms) else {
+            break;
+        };
+        if let Ok(subjects) = mine_git_commits(ws, MAX_GIT_COMMITS, git_timeout) {
             for s in subjects {
                 let redacted = redact_sensitive_spans(&s);
                 for t in tokenize(&redacted) {
@@ -196,6 +240,16 @@ pub fn redact_sensitive_spans(input: &str) -> String {
             r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b",
             // Windows drive paths.
             r"\b[A-Za-z]:[\\/][^\s]+",
+            // UNC paths: \\server\share\path\to\file (≥2 backslash
+            // segments after the leading `\\`). Matches in raw-string
+            // regex `\\\\` = two literal `\`, then non-space non-`\`
+            // segments separated by single `\`.
+            r"\\\\[^\s\\]+(?:\\[^\s\\]+)+",
+            // Multi-segment backslash relative paths
+            // (`src\secretProject\file.rs`): alphanumeric segment,
+            // then ≥1 `\<segment>` chunks. Mirrors the forward-slash
+            // multi-segment rule below.
+            r"[A-Za-z0-9_\-]+(?:\\[A-Za-z0-9_.\-]+)+",
             // Relative paths starting with `./` or `../`.
             r"\.{1,2}/[^\s]+",
             // Absolute / repository-rooted paths: any token containing
@@ -648,5 +702,137 @@ mod tests {
                 "research term `{kept}` was wrongly dropped; tokens={tokens:?}"
             );
         }
+    }
+
+    #[test]
+    fn redact_sensitive_spans_removes_unc_paths() {
+        // Input chosen so the only place the components below appear is
+        // inside the UNC path itself; otherwise the test would be
+        // proving the redactor strips ordinary prose words.
+        let input =
+            r"alpha \\srvhost\netshare\secretProject\src\model_loader.rs omega";
+        let out = redact_sensitive_spans(input);
+        let lower = out.to_ascii_lowercase();
+        for must_be_gone in [
+            r"\\srvhost",
+            "srvhost",
+            "netshare",
+            "secretproject",
+            "model_loader",
+        ] {
+            assert!(
+                !lower.contains(must_be_gone),
+                "redaction missed `{must_be_gone}` in `{out}`"
+            );
+        }
+        // Sanity: surrounding non-sensitive words are preserved.
+        assert!(lower.contains("alpha"));
+        assert!(lower.contains("omega"));
+    }
+
+    #[test]
+    fn extract_workspace_keywords_drops_unc_path_components() {
+        let tmp = TempDir::new().unwrap();
+        write_claude_fixture(
+            tmp.path(),
+            r"shared net mount \\server\share\secretProject\src\model_loader.rs notes",
+        );
+        let tokens = lower_tokens(tmp.path());
+        for leaked in [
+            "server",
+            "share",
+            "secretproject",
+            "model_loader",
+            "modelloader",
+        ] {
+            assert!(
+                !tokens.iter().any(|t| t == leaked),
+                "UNC path component `{leaked}` leaked into tokens={tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_workspace_keywords_drops_backslash_relative_path_components() {
+        let tmp = TempDir::new().unwrap();
+        write_claude_fixture(
+            tmp.path(),
+            r"tracing src\secretProject\model_loader.rs and components\widget\index.tsx",
+        );
+        let tokens = lower_tokens(tmp.path());
+        for leaked in [
+            "secretproject",
+            "model_loader",
+            "modelloader",
+            "widget",
+        ] {
+            assert!(
+                !tokens.iter().any(|t| t == leaked),
+                "backslash path component `{leaked}` leaked into tokens={tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_timeout_for_remaining_skips_when_below_floor() {
+        // When less than the spawn floor remains, the next git call
+        // must be skipped entirely — the spawn + drain overhead alone
+        // can exceed the remaining budget and push past the global
+        // extraction deadline.
+        assert_eq!(git_timeout_for_remaining(0), None);
+        assert_eq!(git_timeout_for_remaining(50), None);
+        assert_eq!(git_timeout_for_remaining(GIT_SPAWN_FLOOR_MS - 1), None);
+        // Exactly at the floor we still spawn (and pass the small
+        // remaining as the per-call timeout).
+        assert_eq!(
+            git_timeout_for_remaining(GIT_SPAWN_FLOOR_MS),
+            Some(GIT_SPAWN_FLOOR_MS)
+        );
+    }
+
+    #[test]
+    fn git_timeout_for_remaining_caps_at_per_call_ceiling() {
+        // Above the per-call ceiling, the returned timeout is the
+        // ceiling, not the remaining wall-clock — that way slow
+        // subprocesses still time out at the per-call boundary even
+        // when there is plenty of overall budget left.
+        assert_eq!(
+            git_timeout_for_remaining(GIT_LOG_TIMEOUT_MS + 500),
+            Some(GIT_LOG_TIMEOUT_MS)
+        );
+        // Below the per-call ceiling but above the spawn floor, the
+        // remaining budget caps the timeout.
+        assert_eq!(git_timeout_for_remaining(800), Some(800));
+    }
+
+    #[test]
+    fn extract_workspace_keywords_meets_two_second_contract_under_no_git_load() {
+        // Sanity check on the happy path. Many workspaces with small
+        // `.claude/` fixtures and real (fast) git on non-repo dirs
+        // must complete well inside the global deadline. The
+        // wall-clock-deadline test path that intentionally hangs git
+        // would race other parallel tests via PATH mutation, so the
+        // deadline arithmetic itself is covered by the two
+        // `git_timeout_for_remaining_*` tests above; this test just
+        // confirms the production happy path stays inside the
+        // contract.
+        let dirs: Vec<TempDir> = (0..40).map(|_| TempDir::new().unwrap()).collect();
+        for d in &dirs {
+            let claude = d.path().join(".claude");
+            fs::create_dir_all(&claude).unwrap();
+            fs::write(
+                claude.join("a.jsonl"),
+                "transformer attention diffusion gradient research notes",
+            )
+            .unwrap();
+        }
+        let paths: Vec<&std::path::Path> = dirs.iter().map(|d| d.path()).collect();
+        let start = Instant::now();
+        let _ = extract_workspace_keywords(&paths, 64 * 1024);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "extract_workspace_keywords exceeded the 2-second context budget under no-git-load; elapsed = {elapsed:?}"
+        );
     }
 }
