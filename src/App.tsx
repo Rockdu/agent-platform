@@ -1588,7 +1588,8 @@ function MultiTerminalContainer() {
   // whose openTabId is still set (app was quit without closing the tabs).
   // On a clean tab-close the backend clears openTabId, so only workspaces
   // that were open when the app last quit (or crashed) are restored.
-  // tmux -A in the auto-launch command reattaches to any surviving session.
+  // Auto-launch spawns claude with `--continue` when a prior transcript
+  // exists so the conversation history is picked up on restart.
   // Show the real error from failed auto-launches instead of
   // the generic "asyncSpawnFailed → Disconnected".
   useEffect(() => {

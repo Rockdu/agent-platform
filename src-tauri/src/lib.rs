@@ -432,110 +432,19 @@ impl LaunchExecutor for RealLaunchExecutor {
                 terminal_mesh_core::transport::WorkspaceLocation::Local { path } => path.clone(),
                 terminal_mesh_core::transport::WorkspaceLocation::Remote { .. } => None,
             };
-            // Wrap local workspace launches in tmux so the claude
-            // session survives app restarts. `tmux new-session -A`
-            // creates the session on first launch and reattaches to
-            // an existing one on restart (if claude is still running).
-            // SSH/Docker remote workspaces use the remote host's own
-            // process model and don't get tmux wrapping here.
-            let tmux_wrapped = matches!(
+            // Spawn claude directly under xterm.js's PTY — no tmux wrapper.
+            // The previous tmux layer bought "app close-and-reopen keeps
+            // the live claude process attached" but at the cost of nested
+            // PTY rendering bugs (column-1 residue on wheel), mouse mode
+            // conflicts, and stray tmux config to maintain. Conversation
+            // continuity across app restart AND machine reboot is now
+            // fully covered by `claude --continue` off the on-disk
+            // transcript, gated on that transcript existing so a fresh
+            // workspace does not die on the empty-project exit-1.
+            let (launch_command, launch_args) = if matches!(
                 routing,
                 workspace_launch_scheduler::TransportRouting::Local
-            ) && crate::ide_handoff::which_in_path("tmux").is_some();
-
-            let (launch_command, launch_args) = if tmux_wrapped {
-                let tmux_path = crate::ide_handoff::which_in_path("tmux").unwrap();
-                // Stable session name derived from the workspace UUID.
-                // Uses the first 16 hex chars (64-bit collision space)
-                // to stay well within tmux's name-length limits.
-                let uuid_hex = workspace_id.simple().to_string();
-                let session = format!("ap-{}", &uuid_hex[..16]);
-                let claude_cmd = auto_launch_command_for_routing(routing, &path)
-                    .display()
-                    .to_string();
-                // Enable mouse scrollback before creating/attaching to
-                // the session. tmux chains commands separated by ";".
-                // Mouse mode lets the user scroll up through tmux's
-                // scrollback buffer with the mouse wheel.
-                //
-                // Also bind copy-mode mouse drag to pbcopy so that
-                // selecting text with the mouse writes to the macOS
-                // system clipboard. Without this, tmux stores the
-                // selection in its internal buffer only, making it
-                // impossible to paste outside the terminal.
-                let mut args = vec![
-                    // Match the outer xterm.js frontend's declared TERM so
-                    // claude's TUI does not draw its left-column vertical bar
-                    // against tmux's screen fallback terminfo, which causes
-                    // the first-column garbling when the pane scrolls or
-                    // redraws. Pair with truecolor override so 24-bit color
-                    // survives the tmux hop.
-                    "set-option".to_string(),
-                    "-g".to_string(),
-                    "default-terminal".to_string(),
-                    "xterm-256color".to_string(),
-                    ";".to_string(),
-                    "set-option".to_string(),
-                    "-ga".to_string(),
-                    "terminal-overrides".to_string(),
-                    ",xterm-256color:Tc".to_string(),
-                    ";".to_string(),
-                    // Drop tmux's 500 ms Escape-sequence wait so redraws
-                    // triggered by ESC-prefixed sequences (claude's TUI
-                    // cursor/insertion codes) do not lag and leave residual
-                    // glyphs on the leftmost column.
-                    "set-option".to_string(),
-                    "-sg".to_string(),
-                    "escape-time".to_string(),
-                    "0".to_string(),
-                    ";".to_string(),
-                    "set-option".to_string(),
-                    "-g".to_string(),
-                    "mouse".to_string(),
-                    "on".to_string(),
-                    ";".to_string(),
-                    // vi copy-mode (used when mode-keys is vi)
-                    "bind-key".to_string(),
-                    "-T".to_string(), "copy-mode-vi".to_string(),
-                    "MouseDragEnd1Pane".to_string(),
-                    "send-keys".to_string(), "-X".to_string(),
-                    "copy-pipe-and-cancel".to_string(), "pbcopy".to_string(),
-                    ";".to_string(),
-                    // emacs copy-mode (default mode-keys)
-                    "bind-key".to_string(),
-                    "-T".to_string(), "copy-mode".to_string(),
-                    "MouseDragEnd1Pane".to_string(),
-                    "send-keys".to_string(), "-X".to_string(),
-                    "copy-pipe-and-cancel".to_string(), "pbcopy".to_string(),
-                    ";".to_string(),
-                    "new-session".to_string(),
-                    "-A".to_string(), // attach if exists, create if not
-                    "-s".to_string(),
-                    session,
-                    "--".to_string(), // end of tmux options
-                    claude_cmd,
-                ];
-                args.extend(launch.claude_argv.iter().cloned());
-                // Resume the workspace's most recent claude conversation
-                // when tmux creates a fresh session (first launch or after a
-                // machine reboot that killed the tmux server). On a normal
-                // app restart `new-session -A` reattaches to the live session
-                // and ignores this command, so `--continue` is a no-op there.
-                // Gate on an existing transcript: `claude --continue` exits
-                // non-zero when there is nothing to resume, which would kill
-                // a brand-new workspace's terminal on creation.
-                let has_history = cwd_for_spec
-                    .as_deref()
-                    .map(claude_has_prior_conversation)
-                    .unwrap_or(false);
-                if has_history && !args.iter().any(|a| a == "--continue" || a == "-c") {
-                    args.push("--continue".to_string());
-                }
-                (tmux_path, args)
-            } else if matches!(routing, workspace_launch_scheduler::TransportRouting::Local) {
-                // Local without tmux: same host-side transcript gate as the
-                // tmux path. Add `--continue` only when a prior conversation
-                // exists, so a brand-new workspace's terminal does not die.
+            ) {
                 let mut args = launch.claude_argv.clone();
                 let has_history = cwd_for_spec
                     .as_deref()

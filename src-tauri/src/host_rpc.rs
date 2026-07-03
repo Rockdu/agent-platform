@@ -329,7 +329,8 @@ fn handle_open_workspace(
         })?;
 
     // Emit an event so the frontend adopts this workspace as a new tab
-    // and triggers auto-launch (with tmux + --continue).
+    // and triggers auto-launch (which spawns claude with `--continue`
+    // when a prior transcript exists in the workspace cwd).
     if let Some(ref handle) = state.app_handle {
         if let Err(e) = handle.emit("workspace://agent-opened", &opened) {
             tracing::warn!(error = %e, "failed to emit workspace://agent-opened");

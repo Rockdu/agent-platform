@@ -2,7 +2,6 @@
 //!
 //! Required:
 //!   - Homebrew     (package manager)
-//!   - tmux         (session persistence)
 //!   - Claude Code  (core AI agent)
 
 use std::path::{Path, PathBuf};
@@ -17,7 +16,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub enum DepKind {
     Homebrew,
-    Tmux,
     Claude,
     /// Docker CLI (no daemon). Required for DOCKER_HOST=ssh:// tunneling so
     /// the Dev Containers extension can open remote containers in Cursor.
@@ -106,9 +104,6 @@ pub fn check_all() -> Vec<DepInfo> {
     let docker_ok = crate::ide_handoff::which_in_path("docker").is_some();
     let docker_ver = simple_version("docker", "--version");
 
-    let tmux_ok = crate::ide_handoff::which_in_path("tmux").is_some();
-    let tmux_ver = simple_version("tmux", "-V");
-
     let claude_ok = crate::ide_handoff::which_in_path("claude").is_some()
         || Path::new("/usr/local/bin/claude").exists()
         || Path::new("/opt/homebrew/bin/claude").exists();
@@ -132,15 +127,6 @@ pub fn check_all() -> Vec<DepInfo> {
             version: claude_ver,
             required: true,
             post_install_note: Some("安装后需要运行：claude login".into()),
-        },
-        DepInfo {
-            kind: DepKind::Tmux,
-            label: "tmux".into(),
-            description: "终端复用器，保证 app 重启后 claude 会话不丢失".into(),
-            installed: tmux_ok,
-            version: tmux_ver,
-            required: true,
-            post_install_note: None,
         },
         DepInfo {
             kind: DepKind::DockerCli,
@@ -175,7 +161,6 @@ pub async fn install_dependency(kind: DepKind) -> InstallResult {
     let kind_clone = kind.clone();
     let (success, output) = tokio::task::spawn_blocking(move || match kind_clone {
         DepKind::Homebrew   => install_homebrew(),
-        DepKind::Tmux       => brew_install("tmux", false),
         DepKind::Claude     => brew_install("claude", false),
         DepKind::DockerCli  => brew_install("docker", false),
     })

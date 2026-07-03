@@ -231,44 +231,6 @@ export function TerminalMeshView({
     termRef.current = term;
     fitRef.current = fit;
 
-    // Wheel handling in alt-screen (claude's TUI):
-    //   1. Debounce: coalesce a fast wheel burst into ONE scroll action
-    //      so a single flick doesn't page through a screenful at a time.
-    //   2. Send a discrete PageUp/PageDown key sequence (never the raw
-    //      SGR mouse report — that gets literal-printed by TUIs without
-    //      mouse tracking and is the root of the column-1 residue).
-    //   3. After a short settle window, force xterm.js to fully repaint
-    //      the visible rows. This overpaints any residue left by
-    //      xterm.js's render-cache reuse across the alt-screen redraw
-    //      that claude emits in response to PageUp/PageDown.
-    // Normal-buffer panes (shells) keep xterm.js's native scrollback.
-    let wheelAccumulator = 0;
-    let wheelFlushTimer: ReturnType<typeof setTimeout> | null = null;
-    term.attachCustomWheelEventHandler((event) => {
-      if (term.buffer.active.type !== "alternate") return true;
-      event.preventDefault();
-      const id = terminalIdRef.current;
-      if (!id) return false;
-      wheelAccumulator += event.deltaY;
-      if (wheelFlushTimer) return false;
-      wheelFlushTimer = setTimeout(() => {
-        wheelFlushTimer = null;
-        const delta = wheelAccumulator;
-        wheelAccumulator = 0;
-        if (delta === 0) return;
-        const seq = delta < 0 ? "\x1b[5~" : "\x1b[6~";
-        void writeTerminalStdin(id, seq).catch(() => {});
-        setTimeout(() => {
-          try {
-            term.refresh(0, term.rows - 1);
-          } catch {
-            // Refresh is a best-effort overpaint; a throw from a torn-
-            // down terminal is safe to ignore.
-          }
-        }, 80);
-      }, 60);
-      return false;
-    });
 
     (async () => {
       try {

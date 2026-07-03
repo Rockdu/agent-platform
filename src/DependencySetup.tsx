@@ -31,7 +31,6 @@ function kindToRust(kind: string): string {
   const map: Record<string, string> = {
     Homebrew: "Homebrew",
     Claude: "Claude",
-    Tmux: "Tmux",
     DockerCli: "DockerCli",
     MacFuse: "MacFuse",
     Sshfs: "Sshfs",
