@@ -34,6 +34,71 @@ use crate::transport::{
     TransportSpawnRequest, TransportStdinSink, WorkspaceLocation,
 };
 
+/// Return `true` when `chunk` contains any character a user would
+/// perceive as terminal output — printable ASCII or a UTF-8
+/// continuation byte, with ANSI CSI/OSC/DCS/APC/SOS/PM sequences and
+/// bare control bytes stripped. Used by the quiescence detector so a
+/// TUI heartbeat that only pokes the cursor (`ESC[?25h`, `ESC[H`,
+/// cursor-position queries, etc.) does not reset the idle debounce.
+/// Newlines and tabs are treated as non-visible on their own so a
+/// stray `\n` between cursor pokes still counts as idle; when claude
+/// prints anything meaningful the chunk carries printable bytes and
+/// the debounce resets as intended.
+pub(crate) fn chunk_has_visible_content(chunk: &[u8]) -> bool {
+    let mut i = 0;
+    while i < chunk.len() {
+        let b = chunk[i];
+        if b == 0x1b {
+            // ESC — skip the whole escape sequence.
+            i += 1;
+            if i >= chunk.len() {
+                return false;
+            }
+            let intro = chunk[i];
+            i += 1;
+            match intro {
+                b']' | b'P' | b'^' | b'X' | b'_' => {
+                    // OSC / DCS / APC / SOS / PM: terminate on BEL
+                    // (0x07) or ST (ESC \).
+                    while i < chunk.len() {
+                        let c = chunk[i];
+                        i += 1;
+                        if c == 0x07 {
+                            break;
+                        }
+                        if c == 0x1b && i < chunk.len() && chunk[i] == b'\\' {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                b'[' => {
+                    // CSI: params (0x30..=0x3f) + intermediates
+                    // (0x20..=0x2f) then a final byte in 0x40..=0x7e.
+                    while i < chunk.len() {
+                        let c = chunk[i];
+                        i += 1;
+                        if (0x40..=0x7e).contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    // Two-byte escape (`ESC c`, `ESC =`, `ESC 7`,
+                    // etc.) — already consumed.
+                }
+            }
+        } else if (0x20..=0x7e).contains(&b) || b >= 0x80 {
+            // Printable ASCII (excluding DEL 0x7f) or UTF-8 high byte.
+            return true;
+        } else {
+            // Bare control (BEL, BS, HT, LF, VT, FF, CR, DEL, C0/C1).
+            i += 1;
+        }
+    }
+    false
+}
+
 const READ_CHUNK_BYTES: usize = 16 * 1024;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const STATUS_CHANNEL_CAPACITY: usize = 64;
@@ -415,8 +480,23 @@ async fn processor_task(
                             };
                             emit_attention(terminal_id, &events_tx, kind).await;
                         }
-                        let tail = ring.read_scrollback(PROMPT_TAIL_BYTES);
-                        if prompt.poll(&tail, Instant::now()).is_some() {
+                        // Only reset the quiescence debounce on chunks
+                        // that carry visible content. A TUI heartbeat
+                        // consisting of pure cursor/ANSI manipulations
+                        // would otherwise keep resetting the timer
+                        // forever, preventing PromptWaiting from ever
+                        // firing and leaving the tab stuck in 运行区.
+                        if chunk_has_visible_content(&bytes) {
+                            let tail = ring.read_scrollback(PROMPT_TAIL_BYTES);
+                            if prompt.poll(&tail, Instant::now()).is_some() {
+                                emit_attention(
+                                    terminal_id,
+                                    &events_tx,
+                                    AttentionKind::PromptWaiting,
+                                )
+                                .await;
+                            }
+                        } else if prompt.tick(Instant::now()).is_some() {
                             emit_attention(
                                 terminal_id,
                                 &events_tx,
@@ -575,6 +655,59 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn chunk_has_visible_content_treats_printable_ascii_as_visible() {
+        assert!(chunk_has_visible_content(b"hello"));
+    }
+
+    #[test]
+    fn chunk_has_visible_content_treats_utf8_high_byte_as_visible() {
+        assert!(chunk_has_visible_content("你好".as_bytes()));
+    }
+
+    #[test]
+    fn chunk_has_visible_content_strips_csi_show_cursor() {
+        assert!(!chunk_has_visible_content(b"\x1b[?25h"));
+    }
+
+    #[test]
+    fn chunk_has_visible_content_strips_csi_home_and_cursor_pos_query() {
+        assert!(!chunk_has_visible_content(b"\x1b[H"));
+        assert!(!chunk_has_visible_content(b"\x1b[6n"));
+    }
+
+    #[test]
+    fn chunk_has_visible_content_strips_osc_terminated_by_bel() {
+        assert!(!chunk_has_visible_content(b"\x1b]0;title\x07"));
+    }
+
+    #[test]
+    fn chunk_has_visible_content_strips_osc_terminated_by_st() {
+        assert!(!chunk_has_visible_content(b"\x1b]0;title\x1b\\"));
+    }
+
+    #[test]
+    fn chunk_has_visible_content_returns_true_when_printable_follows_escape() {
+        // Cursor to home, then a real character — the character makes
+        // the chunk visible.
+        assert!(chunk_has_visible_content(b"\x1b[Ha"));
+    }
+
+    #[test]
+    fn chunk_has_visible_content_treats_lone_newline_and_tab_as_non_visible() {
+        // A lone newline or tab between escapes is still just
+        // whitespace-only spacing; the real content, if any, arrives
+        // with printable bytes in the same or a later chunk.
+        assert!(!chunk_has_visible_content(b"\n"));
+        assert!(!chunk_has_visible_content(b"\t"));
+        assert!(!chunk_has_visible_content(b"\r"));
+    }
+
+    #[test]
+    fn chunk_has_visible_content_returns_false_for_empty_chunk() {
+        assert!(!chunk_has_visible_content(b""));
+    }
 
     fn shell_spec(script: &str) -> TerminalSpec {
         TerminalSpec {
