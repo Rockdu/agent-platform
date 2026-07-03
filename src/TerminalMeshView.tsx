@@ -231,6 +231,22 @@ export function TerminalMeshView({
     termRef.current = term;
     fitRef.current = fit;
 
+    // Drop mouse-wheel events while the pane runs an alt-screen program
+    // (claude's TUI, vim, etc.). tmux with `mouse on` forwards the raw
+    // SGR wheel report through to the inner program, which does not
+    // enable mouse tracking — the escape sequence bleeds into the next
+    // redraw and leaves column-1 residue every time the user scrolls.
+    // Consuming the wheel event at the frontend means neither the PTY
+    // nor tmux sees it, so nothing corrupts the alt-screen buffer.
+    // Normal-buffer panes (shells) keep xterm.js's native scrollback.
+    term.attachCustomWheelEventHandler((event) => {
+      if (term.buffer.active.type === "alternate") {
+        event.preventDefault();
+        return false;
+      }
+      return true;
+    });
+
     (async () => {
       try {
         // The orchestrator path bypasses spawn — the host already
