@@ -464,6 +464,31 @@ impl LaunchExecutor for RealLaunchExecutor {
                 // selection in its internal buffer only, making it
                 // impossible to paste outside the terminal.
                 let mut args = vec![
+                    // Match the outer xterm.js frontend's declared TERM so
+                    // claude's TUI does not draw its left-column vertical bar
+                    // against tmux's screen fallback terminfo, which causes
+                    // the first-column garbling when the pane scrolls or
+                    // redraws. Pair with truecolor override so 24-bit color
+                    // survives the tmux hop.
+                    "set-option".to_string(),
+                    "-g".to_string(),
+                    "default-terminal".to_string(),
+                    "xterm-256color".to_string(),
+                    ";".to_string(),
+                    "set-option".to_string(),
+                    "-ga".to_string(),
+                    "terminal-overrides".to_string(),
+                    ",xterm-256color:Tc".to_string(),
+                    ";".to_string(),
+                    // Drop tmux's 500 ms Escape-sequence wait so redraws
+                    // triggered by ESC-prefixed sequences (claude's TUI
+                    // cursor/insertion codes) do not lag and leave residual
+                    // glyphs on the leftmost column.
+                    "set-option".to_string(),
+                    "-sg".to_string(),
+                    "escape-time".to_string(),
+                    "0".to_string(),
+                    ";".to_string(),
                     "set-option".to_string(),
                     "-g".to_string(),
                     "mouse".to_string(),
