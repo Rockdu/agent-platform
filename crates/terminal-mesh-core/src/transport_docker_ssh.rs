@@ -114,6 +114,26 @@ fn build_docker_wrapper_script(
         script.push_str(&format!(
             "AM_REMOTE_CWD={escaped}\nif ! cd \"$AM_REMOTE_CWD\" 2>/dev/null; then status=$?; fi\n",
         ));
+        // Reap claude-code processes orphaned by a prior disconnected
+        // session in this same workspace dir. `docker exec -it` does
+        // NOT forward client disconnects into the container, and the
+        // claude child runs under `runuser` (its own session, detached
+        // from the controlling TTY), so neither a TTY hangup nor the
+        // process-group `kill` in `compose_docker_cleanup_command`
+        // reaches it when the local app restarts or the machine
+        // reboots. The previous session's claude therefore lingers as
+        // an orphan and accumulates across reconnects. We match by the
+        // process cwd so only THIS workspace's stale claude is reaped;
+        // the current session's claude has not been launched yet, so
+        // nothing live is touched. Best-effort: skipped if /proc or the
+        // userland tools are unavailable.
+        script.push_str(
+            "if [ \"$status\" -eq 0 ] && [ -d /proc ]; then \
+for d in /proc/[0-9]*; do p=${d#/proc/}; [ \"$p\" = \"$$\" ] && continue; \
+grep -qa claude-code/bin/claude \"$d/cmdline\" 2>/dev/null || continue; \
+[ \"$(readlink \"$d/cwd\" 2>/dev/null)\" = \"$AM_REMOTE_CWD\" ] && kill -KILL \"$p\" 2>/dev/null; \
+done; fi\n",
+        );
     }
     match optional_exec {
         None => {
@@ -671,8 +691,8 @@ mod tests {
     fn compose_docker_remote_command_starts_with_docker_exec() {
         let cmd = compose_docker_remote_command("my-container", "sess-1", Some("/srv"), None);
         assert!(
-            cmd.starts_with("docker exec -i 'my-container' /bin/sh -lc '"),
-            "cmd should start with docker exec -i (no -t); got {cmd}"
+            cmd.starts_with("docker exec -it 'my-container' /bin/sh -lc '"),
+            "cmd should start with docker exec -it (TTY required for isatty); got {cmd}"
         );
         assert!(cmd.ends_with('\''), "cmd should end with closing quote");
     }
@@ -693,6 +713,33 @@ mod tests {
         assert_ne!(a, b, "different session ids must yield different commands");
         assert!(a.contains("session-A"));
         assert!(b.contains("session-B"));
+    }
+
+    /// The wrapper must reap claude-code orphans from prior
+    /// disconnected sessions in the same cwd before launching, since
+    /// `docker exec -it` does not forward client disconnects and the
+    /// runuser-detached claude survives a local reboot otherwise.
+    #[test]
+    fn compose_docker_remote_command_reaps_stale_claude_by_cwd() {
+        let cmd = compose_docker_remote_command("c", "s", Some("/srv/work"), None);
+        // Reaper matches claude-code processes and gates on the cwd
+        // matching AM_REMOTE_CWD so only this workspace's stale claude
+        // is killed.
+        assert!(cmd.contains("claude-code/bin/claude"), "got {cmd}");
+        assert!(cmd.contains("/cwd"), "must compare process cwd; got {cmd}");
+        assert!(cmd.contains("kill -KILL"), "got {cmd}");
+    }
+
+    /// The reaper requires a cwd to scope the kill; without
+    /// `canonical_remote_path` there is no AM_REMOTE_CWD to match, so
+    /// the wrapper must NOT emit an unscoped claude kill.
+    #[test]
+    fn compose_docker_remote_command_without_cwd_does_not_reap() {
+        let cmd = compose_docker_remote_command("c", "s", None, None);
+        assert!(
+            !cmd.contains("kill -KILL"),
+            "no cwd means no scoped reaper; got {cmd}"
+        );
     }
 
     #[test]

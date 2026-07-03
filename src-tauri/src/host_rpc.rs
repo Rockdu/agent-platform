@@ -145,6 +145,14 @@ struct ListTabsResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SendMessageParams {
+    client_id: String,
+    target_tab_id: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OpenWorkspaceParams {
     client_id: String,
     /// Path to open. Formats supported:
@@ -893,6 +901,72 @@ fn handle_list_tabs(
         }
     }
     Ok(json!(ListTabsResult { tabs }))
+}
+
+fn handle_send_message(
+    state: &HostRpcState,
+    params: SendMessageParams,
+) -> Result<Value, JsonRpcError> {
+    let caller = ClientId::parse(&params.client_id).map_err(|e| JsonRpcError {
+        code: ERR_INVALID_CLIENT_ID,
+        message: format!("invalid clientId: {e:?}"),
+        data: None,
+    })?;
+    let (caller_tab_id, plugin_id) = match caller {
+        ClientId::Claude { tab_id, plugin_id } => (tab_id.to_string(), plugin_id),
+        ClientId::HostUi { .. } => {
+            return Err(JsonRpcError {
+                code: ERR_INVALID_REQUEST,
+                message: "host_ui clientId cannot call terminalMesh.sendMessage".into(),
+                data: None,
+            });
+        }
+    };
+    if plugin_id != "terminal-mesh" {
+        return Err(JsonRpcError {
+            code: ERR_INVALID_REQUEST,
+            message: format!(
+                "terminalMesh.sendMessage requires plugin_id=terminal-mesh; got `{plugin_id}`"
+            ),
+            data: None,
+        });
+    }
+
+    // Orchestrator may send to any tab; regular tabs may only send to themselves.
+    let orch_snapshot = state.orchestrator.snapshot();
+    let is_orchestrator = orch_snapshot
+        .as_ref()
+        .map(|s| s.tab_id == caller_tab_id)
+        .unwrap_or(false);
+
+    if !is_orchestrator && caller_tab_id != params.target_tab_id {
+        return Err(JsonRpcError {
+            code: ERR_PERMISSION_DENIED,
+            message: format!(
+                "regular tab `{caller_tab_id}` may not cross-tab send to `{}` (orchestrator-only)",
+                params.target_tab_id
+            ),
+            data: None,
+        });
+    }
+
+    state
+        .terminal_registry
+        .write_tab_stdin(&params.target_tab_id, params.message.into_bytes())
+        .map_err(|e| match e {
+            TerminalMeshError::NotFound { terminal_id } => JsonRpcError {
+                code: ERR_NOT_FOUND,
+                message: format!("tab/terminal not found: {terminal_id}"),
+                data: None,
+            },
+            other => JsonRpcError {
+                code: ERR_BOUNDED_READ_FAILED,
+                message: other.to_string(),
+                data: None,
+            },
+        })?;
+
+    Ok(json!({}))
 }
 
 #[cfg(test)]

@@ -225,6 +225,60 @@ pub(crate) fn auto_launch_command_for_routing(
     }
 }
 
+/// Whether a prior claude conversation exists for a LOCAL launch cwd.
+///
+/// Claude Code stores per-project transcripts under
+/// `~/.claude/projects/<slug>/<uuid>.jsonl`, where `<slug>` is the
+/// launch cwd's absolute path with every non-`[A-Za-z0-9]` character
+/// replaced by `-` (verified against the on-disk layout). `claude
+/// --continue` exits non-zero when no transcript exists, which would
+/// immediately kill a freshly-created workspace's terminal. Callers
+/// use this to add `--continue` ONLY when there is something to
+/// resume. On any uncertainty (no `$HOME`, unreadable dir) it returns
+/// `false` so a brand-new terminal starts fresh rather than dying.
+pub(crate) fn claude_has_prior_conversation(cwd: &std::path::Path) -> bool {
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    let slug = claude_project_slug(&cwd.to_string_lossy());
+    let dir = std::path::Path::new(&home)
+        .join(".claude")
+        .join("projects")
+        .join(slug);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
+}
+
+/// Map an absolute cwd to Claude Code's project-dir slug: every
+/// non-`[A-Za-z0-9]` character becomes `-` (e.g.
+/// `/Users/x/AgentPlatform/workspaces/coding_arena` ->
+/// `-Users-x-AgentPlatform-workspaces-coding-arena`).
+pub(crate) fn claude_project_slug(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// POSIX single-quote a string for safe embedding in a remote
+/// `sh -c '...'` command line.
+fn shell_single_quote_arg(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Surface an auto-launch async failure to the frontend so a
 /// queued tab does not stay parked forever in the waiting /
 /// pending pane. Drains any pending placeholder for the tab and
@@ -437,12 +491,53 @@ impl LaunchExecutor for RealLaunchExecutor {
                     claude_cmd,
                 ];
                 args.extend(launch.claude_argv.iter().cloned());
+                // Resume the workspace's most recent claude conversation
+                // when tmux creates a fresh session (first launch or after a
+                // machine reboot that killed the tmux server). On a normal
+                // app restart `new-session -A` reattaches to the live session
+                // and ignores this command, so `--continue` is a no-op there.
+                // Gate on an existing transcript: `claude --continue` exits
+                // non-zero when there is nothing to resume, which would kill
+                // a brand-new workspace's terminal on creation.
+                let has_history = cwd_for_spec
+                    .as_deref()
+                    .map(claude_has_prior_conversation)
+                    .unwrap_or(false);
+                if has_history && !args.iter().any(|a| a == "--continue" || a == "-c") {
+                    args.push("--continue".to_string());
+                }
                 (tmux_path, args)
+            } else if matches!(routing, workspace_launch_scheduler::TransportRouting::Local) {
+                // Local without tmux: same host-side transcript gate as the
+                // tmux path. Add `--continue` only when a prior conversation
+                // exists, so a brand-new workspace's terminal does not die.
+                let mut args = launch.claude_argv.clone();
+                let has_history = cwd_for_spec
+                    .as_deref()
+                    .map(claude_has_prior_conversation)
+                    .unwrap_or(false);
+                if has_history && !args.iter().any(|a| a == "--continue" || a == "-c") {
+                    args.push("--continue".to_string());
+                }
+                (auto_launch_command_for_routing(routing, &path), args)
             } else {
-                (
-                    auto_launch_command_for_routing(routing, &path),
-                    launch.claude_argv.clone(),
-                )
+                // Remote (SSH / Docker-over-SSH): the transcript lives on
+                // the remote host, so we cannot FS-check it from here. Run
+                // claude through a shell that resumes the prior conversation
+                // when one exists and falls back to a fresh session when
+                // there is nothing to continue (`claude --continue` exits
+                // non-zero on an empty project). Without the fallback a
+                // brand-new remote workspace's terminal would die on the
+                // `--continue` error.
+                let bare = auto_launch_command_for_routing(routing, &path);
+                let qprog = shell_single_quote_arg(&bare.display().to_string());
+                let qargs: String = launch
+                    .claude_argv
+                    .iter()
+                    .map(|a| format!(" {}", shell_single_quote_arg(a)))
+                    .collect();
+                let inner = format!("{qprog}{qargs} --continue || {qprog}{qargs}");
+                (PathBuf::from("sh"), vec!["-c".to_string(), inner])
             };
 
             let spec = terminal_mesh_core::TerminalSpec {
@@ -697,7 +792,52 @@ fn bootstrap_status() -> Result<BootstrapPaths, BootstrapErrorDto> {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Prepend Homebrew's standard prefixes to `PATH` if missing. Pure
+/// transform extracted so the dedup + prepend logic is unit-testable
+/// without touching the real environment.
+pub(crate) fn brew_prefixed_path(current: &str) -> String {
+    let prefixes = ["/opt/homebrew/bin", "/opt/homebrew/sbin"];
+    let existing: std::collections::HashSet<&str> =
+        current.split(':').filter(|s| !s.is_empty()).collect();
+    let mut out = String::new();
+    for p in prefixes {
+        if !existing.contains(p) {
+            if !out.is_empty() {
+                out.push(':');
+            }
+            out.push_str(p);
+        }
+    }
+    if out.is_empty() {
+        current.to_string()
+    } else if current.is_empty() {
+        out
+    } else {
+        format!("{out}:{current}")
+    }
+}
+
+fn ensure_brew_on_path() {
+    let current = std::env::var("PATH").unwrap_or_default();
+    let updated = brew_prefixed_path(&current);
+    if updated != current {
+        // SAFETY: called at the very top of `run()` before any threads
+        // are spawned, so no other thread can race on the env block.
+        unsafe {
+            std::env::set_var("PATH", updated);
+        }
+    }
+}
+
 pub fn run() {
+    // GUI-launched processes on macOS inherit PATH from launchd, not from
+    // the user's shell rc, so Homebrew's `/opt/homebrew/{bin,sbin}` is
+    // typically missing — every child the app spawns (tmux panes, sh
+    // wrappers, `claude` and the commands it shells out to, ssh) then
+    // fails to find brew-installed tools. Prepend the brew prefixes once
+    // here so the whole process tree inherits a working PATH. Idempotent:
+    // skipped for any prefix already present.
+    ensure_brew_on_path();
     // Structured JSON logging with sensitive-value redaction (AC-9.5). The
     // RedactingMakeWriter masks `refresh_token`, `access_token`, `password`,
     // `bearer`, and `email_body` field values before they reach stderr.
@@ -1163,6 +1303,61 @@ mod tests {
             std::path::PathBuf::from("claude"),
             "Remote Docker routing uses bare `claude` so remote PATH resolves"
         );
+    }
+
+    #[test]
+    fn claude_project_slug_matches_on_disk_layout() {
+        // Verified against ~/.claude/projects: every non-alphanumeric
+        // char (slash, underscore, space, CJK) collapses to a single '-'.
+        assert_eq!(
+            claude_project_slug("/Users/x/AgentPlatform/workspaces/coding_arena"),
+            "-Users-x-AgentPlatform-workspaces-coding-arena"
+        );
+        assert_eq!(
+            claude_project_slug("/Users/x/claude_workspace"),
+            "-Users-x-claude-workspace"
+        );
+        // Two CJK chars -> two dashes (e.g. "leanote迁移").
+        assert_eq!(claude_project_slug("/a/leanote迁移"), "-a-leanote--");
+    }
+
+    #[test]
+    fn brew_prefixed_path_prepends_both_prefixes_when_missing() {
+        assert_eq!(
+            brew_prefixed_path("/usr/bin:/bin"),
+            "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin"
+        );
+    }
+
+    #[test]
+    fn brew_prefixed_path_is_idempotent() {
+        let already = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin";
+        assert_eq!(brew_prefixed_path(already), already);
+    }
+
+    #[test]
+    fn brew_prefixed_path_adds_only_the_missing_one() {
+        // sbin missing but bin already present: only sbin is added, and
+        // the bin entry is not duplicated.
+        assert_eq!(
+            brew_prefixed_path("/opt/homebrew/bin:/usr/bin"),
+            "/opt/homebrew/sbin:/opt/homebrew/bin:/usr/bin"
+        );
+    }
+
+    #[test]
+    fn brew_prefixed_path_handles_empty_current() {
+        assert_eq!(
+            brew_prefixed_path(""),
+            "/opt/homebrew/bin:/opt/homebrew/sbin"
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_arg_escapes_embedded_quote() {
+        assert_eq!(shell_single_quote_arg("--flag"), "'--flag'");
+        // The POSIX '\'' idiom: close, escaped quote, reopen.
+        assert_eq!(shell_single_quote_arg("a'b"), "'a'\\''b'");
     }
 
     /// An async auto-launch failure MUST leave a retained Done

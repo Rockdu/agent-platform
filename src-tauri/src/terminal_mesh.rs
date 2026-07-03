@@ -539,6 +539,27 @@ impl TerminalMeshRegistry {
         guard.get(&id).map(|s| s.command_tx.clone())
     }
 
+    /// Send bytes to a tab's terminal stdin via the live actor channel.
+    /// Looks up by `tab_id` (UUID string), returns `NotFound` if the tab
+    /// has no live session, or `Io` if the channel is full or closed.
+    /// Uses `try_send` so callers do not need an async context.
+    pub fn write_tab_stdin(&self, tab_id: &str, data: Vec<u8>) -> Result<(), TerminalMeshError> {
+        let terminal_id = self.lookup_terminal_by_tab(tab_id).ok_or_else(|| {
+            TerminalMeshError::NotFound {
+                terminal_id: tab_id.to_string(),
+            }
+        })?;
+        let tx = self.lookup_command_tx(terminal_id).ok_or_else(|| {
+            TerminalMeshError::NotFound {
+                terminal_id: tab_id.to_string(),
+            }
+        })?;
+        tx.try_send(ActorCommand::WriteStdin(data)).map_err(|e| TerminalMeshError::Io {
+            context: "write_tab_stdin".into(),
+            message: e.to_string(),
+        })
+    }
+
     pub(crate) fn lookup_scrollback(&self, id: Uuid) -> Option<Arc<StdMutex<String>>> {
         let guard = self.inner.lock().expect("TerminalMeshRegistry poisoned");
         guard.get(&id).map(|s| s.scrollback.clone())

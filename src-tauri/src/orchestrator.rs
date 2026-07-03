@@ -347,15 +347,26 @@ pub(crate) fn spawn_orchestrator_claude(
             }
         })?;
 
+    // Resume the orchestrator's prior conversation in
+    // `agent_platform_root`. The orchestrator is re-spawned fresh on
+    // every app start (it is not tmux-wrapped because each launch
+    // mints new privileged MCP capability tokens that a reattached
+    // old process would not carry), so without `--continue` its
+    // context is lost on every restart and after every machine reboot.
+    // Gate on an existing transcript: `claude --continue` exits
+    // non-zero when there is nothing to resume, which would kill the
+    // orchestrator terminal on a first-ever launch.
+    let mut args: Vec<String> = vec!["--dangerously-skip-permissions".into()];
+    if crate::claude_has_prior_conversation(agent_platform_root) {
+        args.push("--continue".into());
+    }
+    args.push("--strict-mcp-config".into());
+    args.push("--mcp-config".into());
+    args.push(mcp_config_path.display().to_string());
     let spec = TerminalSpec {
         terminal_id: Uuid::new_v4(),
         command: claude_path.to_path_buf(),
-        args: vec![
-            "--dangerously-skip-permissions".into(),
-            "--strict-mcp-config".into(),
-            "--mcp-config".into(),
-            mcp_config_path.display().to_string(),
-        ],
+        args,
         cwd: Some(agent_platform_root.to_path_buf()),
         env: vec![(
             "APP_DATA_DIR".into(),
