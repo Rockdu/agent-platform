@@ -98,15 +98,4 @@ claude auth login      # 浏览器 OAuth；或设 ANTHROPIC_API_KEY 用 API key
 
 ---
 
-## 架构与开发文档
-
-- 架构 & MVP 计划：[`docs/plan.md`](docs/plan.md)
-- 插件规格：[`docs/specs/`](docs/specs/)
-
-技术形态：Tauri v2 + Rust + React/TypeScript，macOS 优先；插件是进程隔离的
-MCP server sidecar（stdio 传输），每个 `claude` 实例各自 fork 一份；托盘窗口
-用 `tauri-plugin-positioner` 实现类"灵动岛"的通知面；UI 为 MVP 阶段中文优先。
-
-**Phase 2（暂未纳入 MVP）**：WeChat、GitHub PR review、用户可安装插件、加密
-SQLite、arXiv 个性化排序、`gmail.delete` 权限、iOS 伴侣端、更严格的 App Sandbox、
-按插件去重的 sidecar 代理。
+> 架构设计与开发文档见 [`docs/`](docs/)。
