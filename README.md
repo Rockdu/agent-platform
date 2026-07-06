@@ -1,6 +1,6 @@
 # Agent Platform
 
-一个 macOS 桌面应用：把你的**终端、AI 编排 agent、论文/笔记**集中在一个窗口里管理。基于 Tauri v2 + Rust + React 构建。
+A macOS desktop app that brings your **terminals, AI orchestrator agent, and papers/notes** together in one window. Built with Tauri v2 + Rust + React.
 
 > 每个工作区一套隔离终端，一个特权 orchestrator 标签页自动拉起 `claude` 作为编排 agent，插件以独立进程（MCP sidecar）运行，所有对外写操作都经过确认弹窗。
 
