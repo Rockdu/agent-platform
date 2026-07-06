@@ -1,6 +1,8 @@
 # Agent Platform
 
-A macOS desktop app that brings your **terminals, AI orchestrator agent, and papers/notes** together in one window. Built with Tauri v2 + Rust + React.
+中文 | [English](#english)
+
+一个 macOS 桌面应用：把你的**终端、AI 编排 agent、论文/笔记**集中在一个窗口里管理。基于 Tauri v2 + Rust + React 构建。
 
 > 每个工作区一套隔离终端，一个特权 orchestrator 标签页自动拉起 `claude` 作为编排 agent，插件以独立进程（MCP sidecar）运行，所有对外写操作都经过确认弹窗。
 
@@ -99,3 +101,116 @@ claude auth login      # 浏览器 OAuth；或设 ANTHROPIC_API_KEY 用 API key
 ---
 
 > 架构设计与开发文档见 [`docs/`](docs/)。
+
+<br>
+
+---
+
+<a id="english"></a>
+
+# Agent Platform
+
+[中文](#agent-platform) | English
+
+A macOS desktop app that brings your **terminals, AI orchestrator agent, and papers/notes** together in one window. Built with Tauri v2 + Rust + React.
+
+> Each workspace gets its own isolated terminals; a single privileged orchestrator tab auto-launches `claude` as the orchestrator agent; plugins run as isolated processes (MCP sidecars); every outbound write goes through a confirmation dialog.
+
+---
+
+## 🚀 Run it (one command)
+
+On macOS, straight from a fresh clone:
+
+```bash
+./scripts/setup.sh --with-claude --run
+```
+
+This single command **does everything**: install dependencies → build → install the `claude` CLI → log in → launch the app.
+It's idempotent, so re-running is safe.
+
+> ⚠️ **Run it from your own terminal**: the login step (`claude auth login`) opens a browser for you to authorize, so it needs a real terminal.
+
+The window opens when it's done. To go step by step, see the flags below.
+
+### Common flags
+
+```bash
+./scripts/setup.sh                 # install deps + build only
+./scripts/setup.sh --with-claude   # also install the Claude Code CLI
+./scripts/setup.sh --skip-login    # don't auto-trigger claude login
+./scripts/setup.sh --run           # build, then launch the app (dev mode)
+./scripts/setup.sh --help          # show all options
+```
+
+For day-to-day development there are finer-grained commands: `./build.sh help` (`dev` / `web` / `build` / `app` / `test` / `clippy` / `clean` …).
+
+### Prerequisites
+
+The script installs what it can and prompts you for the rest:
+
+| Dependency | Notes |
+|---|---|
+| **Xcode Command Line Tools** | Required (C toolchain). The script prompts you to install it if missing. |
+| **Node.js 20+ / npm** | Required. Install with `brew install node` if missing. |
+| **Rust (stable)** | The script installs it via [rustup](https://rustup.rs) if `cargo` is missing. |
+| **Claude Code CLI** (`claude`) | The app's core agent. `--with-claude` installs and logs it in. |
+
+---
+
+## 🖥️ Using it once it's running
+
+- **Log in to claude**: on first launch the script guides you through `claude auth login`
+  (browser auth). You can also set `ANTHROPIC_API_KEY` to skip login. Check state with
+  `claude auth status`.
+- **Orchestrator tab** (top-left, single instance): auto-launches `claude`; this is where
+  you talk to the agent and hand it tasks. Shows an onboarding card when claude isn't
+  installed / logged in.
+- **Terminal Mesh**: a set of isolated terminals (PTYs) per workspace.
+- **Papers**: Zotero + arXiv paper management. **Notes**: notes.
+- **Workspaces**: real directories under `~/AgentPlatform/workspaces/<name>/`, openable in
+  Cursor / VS Code for code review.
+- **Open in IDE**: defaults to Cursor; changeable in-app to VS Code (`code`), Zed (`zed`),
+  or any command — the app runs fine with none installed, only this button is unavailable.
+- **Write confirmation**: every write the agent makes through a plugin pops a confirmation
+  dialog for you to approve.
+
+---
+
+## 🔧 Troubleshooting
+
+- **`cargo` / `claude` not found?** Open a new terminal (so `~/.cargo/bin` and
+  `$(npm prefix -g)/bin` are on PATH), or just re-run `./scripts/setup.sh`.
+- **`npm install` reports blocked install scripts (npm 11+)?** The esbuild / fsevents
+  allowlist is committed in `package.json`'s `allowScripts`, so a plain `npm install`
+  works; the claude install uses `--allow-scripts=@anthropic-ai/claude-code`.
+- **Build fails with "C compiler cannot create executables" (libsodium)?** An occasional
+  parallel-build race — just re-run; `setup.sh` already cleans up and retries automatically.
+- **Orchestrator is empty / says claude not found?** It's not installed or not logged in:
+  `./scripts/setup.sh --with-claude`, then `claude auth login`, and restart the app.
+
+---
+
+## Manual install (what the script does under the hood)
+
+If you'd rather not use the script and do it step by step:
+
+```bash
+# 1. Rust toolchain (if cargo is missing)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+# 2. Frontend deps (esbuild/fsevents allowlist already in package.json)
+npm install
+
+# 3. Rust codegen + plugin sidecars + frontend bundle / launch
+npm run build          # tsc + vite build (prebuild runs codegen and sidecars)
+npm run tauri dev      # or build and launch the app
+
+# 4. Claude Code CLI (core agent) + login
+npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code
+claude auth login      # browser OAuth; or set ANTHROPIC_API_KEY for API-key auth
+```
+
+---
+
+> Architecture & developer docs live in [`docs/`](docs/).
