@@ -56,6 +56,7 @@ macOS，克隆下来后直接：
   下达任务的地方。没登录 / 没装 claude 时这里会显示引导卡片。
 - **Terminal Mesh**：每个工作区一组隔离的终端（PTY）。
 - **Papers**：Zotero + arXiv 论文管理。**Notes**：笔记。
+- **可视化 skills**：内置 `visualize-*` skill 集（安装时自动接入 claude）。对 orchestrator 说"可视化这个仓库 / 这个 PR / 所有 agent / 这个 agent 的来龙去脉"，生成自包含的可视化页面。详见 [`skills/`](skills/)。
 - **工作区**：真实目录，位于 `~/AgentPlatform/workspaces/<名字>/`，可以用
   Cursor / VS Code 打开做代码审查。
 - **在 IDE 里打开**：默认用 Cursor，可在应用内改成 VS Code（`code`）、Zed（`zed`）
@@ -168,6 +169,7 @@ The script installs what it can and prompts you for the rest:
   installed / logged in.
 - **Terminal Mesh**: a set of isolated terminals (PTYs) per workspace.
 - **Papers**: Zotero + arXiv paper management. **Notes**: notes.
+- **Visualization skills**: bundled `visualize-*` skill set (auto-linked into claude at setup). Ask the orchestrator to "visualize this repo / this PR / the agents / one agent's trace" to get a self-contained visual page. See [`skills/`](skills/).
 - **Workspaces**: real directories under `~/AgentPlatform/workspaces/<name>/`, openable in
   Cursor / VS Code for code review.
 - **Open in IDE**: defaults to Cursor; changeable in-app to VS Code (`code`), Zed (`zed`),
