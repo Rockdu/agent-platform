@@ -33,5 +33,10 @@
     "tsx": "^4",
     "typescript": "^5.6",
     "vite": "^5"
+  },
+  "allowScripts": {
+    "esbuild@0.21.5": true,
+    "esbuild@0.28.0": true,
+    "fsevents@2.3.3": true
   }
 }
