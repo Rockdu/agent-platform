@@ -206,6 +206,19 @@ if [ "$CLAUDE_READY" -eq 1 ]; then
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# 5d. Install the bundled visualize-* skill set for the orchestrator agent.
+# ---------------------------------------------------------------------------
+# Symlinks skills/ into ~/.claude/skills so the orchestrator (and any local
+# claude session) can visualize repos, PRs, the platform's agents, and single
+# agent traces. Idempotent; harmless when claude isn't installed yet — the
+# links simply wait for it.
+if [ -x "$ROOT/skills/install.sh" ]; then
+  "$ROOT/skills/install.sh" >/dev/null \
+    && log "skills: visualize-* skill set linked into ~/.claude/skills." \
+    || warn "skills: install failed — run skills/install.sh manually."
+fi
+
 echo
 log "Setup finished successfully."
 echo "  Run the desktop app:      npm run tauri dev   (or ./scripts/setup.sh --run)"

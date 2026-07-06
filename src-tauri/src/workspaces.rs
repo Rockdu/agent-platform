@@ -650,6 +650,7 @@ impl WorkspaceRegistry {
                 existing_name: dup.name.clone(),
             });
         }
+        seed_workspace_skills(&canonical);
         let now = now_rfc3339();
         let mut profile = WorkspaceProfile::default_local();
         profile.auto_launch_claude = auto_launch_claude;
@@ -1146,6 +1147,62 @@ fn default_workspaces_root() -> Option<PathBuf> {
             .join("workspaces")
     })
 }
+
+/// Best-effort: seed a freshly created workspace with the platform's
+/// bundled `visualize-*` skills by symlinking them into
+/// `<workspace>/.claude/skills/`. Claude Code picks up project-scoped
+/// skills from that directory, so agents launched inside the workspace
+/// can visualize repos / PRs / the platform's agents out of the box,
+/// independent of the user-global `~/.claude/skills` install.
+///
+/// Source resolution: `$AGENT_PLATFORM_SKILLS_DIR` when set (tests,
+/// custom installs), else `~/.claude/skills` as populated by
+/// `scripts/setup.sh` step 5d. Entries are canonicalized so workspace
+/// links point at the real skill dirs and keep working even if the
+/// user-global links are later removed. Never fails workspace
+/// creation: any error just skips seeding.
+fn seed_workspace_skills(workspace: &Path) {
+    let source = match std::env::var_os("AGENT_PLATFORM_SKILLS_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => match directories::BaseDirs::new() {
+            Some(b) => b.home_dir().join(".claude").join("skills"),
+            None => return,
+        },
+    };
+    seed_workspace_skills_from(workspace, &source);
+}
+
+#[cfg(unix)]
+fn seed_workspace_skills_from(workspace: &Path, source: &Path) {
+    let entries = match std::fs::read_dir(source) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let dest_root = workspace.join(".claude").join("skills");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("visualize-") {
+            continue;
+        }
+        // Resolve through the user-global symlink to the real skill dir.
+        let target = match std::fs::canonicalize(entry.path()) {
+            Ok(t) if t.is_dir() => t,
+            _ => continue,
+        };
+        let link = dest_root.join(&name);
+        // Already seeded — or the user put something there. Leave it.
+        if std::fs::symlink_metadata(&link).is_ok() {
+            continue;
+        }
+        if std::fs::create_dir_all(&dest_root).is_err() {
+            return;
+        }
+        let _ = std::os::unix::fs::symlink(&target, &link);
+    }
+}
+
+#[cfg(not(unix))]
+fn seed_workspace_skills_from(_workspace: &Path, _source: &Path) {}
 
 fn now_rfc3339() -> String {
     // Reuse the same chrono-free helper shape as claude_discovery.
@@ -1742,6 +1799,52 @@ mod tests {
         assert_eq!(rec.open_tab_id, None);
         assert!(!target.join(".git").exists(), "no auto-git-init per spec");
         assert_eq!(rec.profile, WorkspaceProfile::default_local());
+    }
+
+    /// Seeding links every bundled `visualize-*` skill into the
+    /// workspace's project-scoped `.claude/skills/`, resolves the
+    /// user-global symlink to the real dir, skips non-visualize
+    /// entries, and never overwrites an existing entry.
+    #[cfg(unix)]
+    #[test]
+    fn seed_workspace_skills_links_bundled_visualize_skills() {
+        let src = tempfile::TempDir::new().unwrap();
+        let real = src.path().join("real-home").join("visualize-anything");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("SKILL.md"), "name: visualize-anything\n").unwrap();
+        let skills = src.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        // user-global layout: a symlink (like install.sh makes) + noise
+        std::os::unix::fs::symlink(&real, skills.join("visualize-anything")).unwrap();
+        std::fs::create_dir_all(skills.join("unrelated-skill")).unwrap();
+
+        let ws = tempfile::TempDir::new().unwrap();
+        seed_workspace_skills_from(ws.path(), &skills);
+
+        let linked = ws.path().join(".claude/skills/visualize-anything");
+        assert!(
+            linked.join("SKILL.md").exists(),
+            "skill resolves through the workspace symlink"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&linked).unwrap(),
+            std::fs::canonicalize(&real).unwrap(),
+            "workspace link points at the real dir, not the global link"
+        );
+        assert!(
+            !ws.path().join(".claude/skills/unrelated-skill").exists(),
+            "non-visualize entries are not seeded"
+        );
+
+        // idempotent + non-destructive: re-seed with a different source
+        let other = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(other.path().join("visualize-anything")).unwrap();
+        seed_workspace_skills_from(ws.path(), other.path());
+        assert_eq!(
+            std::fs::canonicalize(&linked).unwrap(),
+            std::fs::canonicalize(&real).unwrap(),
+            "existing entry is left untouched"
+        );
     }
 
     #[test]
